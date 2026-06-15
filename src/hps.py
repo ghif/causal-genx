@@ -92,6 +92,13 @@ def setup_hparams(parser: argparse.ArgumentParser) -> Hparams:
 
 
 def add_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--accelerator",
+        help="Training accelerator.",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+    )
     parser.add_argument("--exp_name", help="Experiment name.", type=str, default="")
     parser.add_argument(
         "--data_dir", help="Data directory to load form.", type=str, default=""

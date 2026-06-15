@@ -14,8 +14,8 @@ from utils import linear_warmup, write_images
 
 
 def preprocess_batch(args: Hparams, batch: Dict[str, Tensor], expand_pa: bool = False):
-    batch["x"] = (batch["x"].to(args.device).float() - 127.5) / 127.5  # [-1, 1]
-    batch["pa"] = batch["pa"].to(args.device).float()
+    batch["x"] = (batch["x"].float().to(args.device) - 127.5) / 127.5  # [-1, 1]
+    batch["pa"] = batch["pa"].float().to(args.device)
     if expand_pa:  # used for HVAE parent concatenation
         batch["pa"] = batch["pa"][..., None, None].repeat(1, 1, *(args.input_res,) * 2)
     return batch

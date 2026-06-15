@@ -14,6 +14,7 @@ from utils import linear_warmup, seed_worker
 
 
 def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
+    pin_memory = args.device.type == "cuda"
     if "ukbb" in args.hps:
         datasets = ukbb(args)
     elif "morphomnist" in args.hps:
@@ -28,7 +29,7 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
     kwargs = {
         "batch_size": args.bs,
         "num_workers": os.cpu_count() // 2,
-        "pin_memory": True,
+        "pin_memory": pin_memory,
         "worker_init_fn": seed_worker,
     }
     dataloaders = {

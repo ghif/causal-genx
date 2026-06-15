@@ -17,8 +17,9 @@ sbatch <<EOT
 nvidia-smi
 
 # source conda environment
-. /anaconda3/etc/profile.d/conda.sh
-conda activate torch
+CONDA_BASE="$(conda info --base 2>/dev/null)"
+. "$CONDA_BASE/etc/profile.d/conda.sh"
+conda activate med-torch
 
 srun python main.py \
     --exp_name=$exp_name \

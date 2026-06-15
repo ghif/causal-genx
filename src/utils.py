@@ -14,13 +14,39 @@ from hps import Hparams
 
 def seed_all(seed, deterministic=True):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.cuda.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
     if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+
+def select_device(accelerator: str) -> torch.device:
+    accelerator = accelerator.lower()
+    if accelerator == "auto":
+        if torch.cuda.is_available():
+            accelerator = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            accelerator = "mps"
+        else:
+            accelerator = "cpu"
+
+    if accelerator == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available in this environment.")
+        return torch.device("cuda:0")
+    if accelerator == "mps":
+        if getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was requested but is not available in this environment.")
+        return torch.device("mps")
+    if accelerator == "cpu":
+        return torch.device("cpu")
+
+    raise ValueError(f"Unknown accelerator: {accelerator}")
 
 
 def seed_worker(worker_id):

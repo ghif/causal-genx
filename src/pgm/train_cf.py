@@ -21,7 +21,7 @@ sys.path.append("..")
 from datasets import get_attr_max_min
 from hps import Hparams
 from train_setup import setup_directories, setup_logging, setup_tensorboard
-from utils import EMA, seed_all
+from utils import EMA, seed_all, select_device
 from vae import HVAE
 
 
@@ -37,6 +37,15 @@ def inv_preprocess(pa: Dict[str, Tensor]) -> Dict[str, Tensor]:
             _max, _min = get_attr_max_min(k)
             pa[k] = pa[k] * (_max - _min) + _min
     return pa
+
+
+def move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer, device: torch.device
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
 
 
 def save_plot(
@@ -139,7 +148,7 @@ def cf_epoch(
 
     for i, batch in loader:
         bs = batch["x"].shape[0]
-        batch = preprocess(batch)
+        batch = preprocess(batch, device=args.device)
 
         with torch.no_grad():
             # randomly intervene on a single parent do(pa_k ~ p(pa_k))
@@ -150,7 +159,7 @@ def cf_epoch(
             else:
                 idx = torch.randperm(train_set[do_k].shape[0])
                 do[do_k] = train_set[do_k].clone()[idx][:bs]
-                do = preprocess(do)
+                do = preprocess(do, device=args.device)
 
         with torch.set_grad_enabled(is_train):
             # if not is_train:
@@ -222,6 +231,13 @@ def cf_epoch(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--accelerator",
+        help="Training accelerator.",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+    )
     parser.add_argument("--exp_name", help="experiment name.", type=str, default="")
     parser.add_argument(
         "--data_dir", help="data directory to load form.", type=str, default=""
@@ -282,13 +298,18 @@ if __name__ == "__main__":
         "--cf_particles", help="num counterfactual samples.", type=int, default=1
     )
     args = parser.parse_known_args()[0]
+    args.device = select_device(args.accelerator)
 
     # update hparams if loading checkpoint
     if args.load_path:
         if os.path.isfile(args.load_path):
             print(f"\nLoading checkpoint: {args.load_path}")
-            ckpt = torch.load(args.load_path)
-            ckpt_args = {k: v for k, v in ckpt["hparams"].items() if k != "load_path"}
+            ckpt = torch.load(args.load_path, map_location="cpu")
+            ckpt_args = {
+                k: v
+                for k, v in ckpt["hparams"].items()
+                if k not in {"load_path", "accelerator", "device"}
+            }
             if args.data_dir is not None:
                 ckpt_args["data_dir"] = args.data_dir
             if args.testing:
@@ -301,10 +322,11 @@ if __name__ == "__main__":
 
     # Load predictors
     print(f"\nLoading predictor checkpoint: {args.predictor_path}")
-    predictor_checkpoint = torch.load(args.predictor_path)
+    predictor_checkpoint = torch.load(args.predictor_path, map_location="cpu")
     predictor_args = Hparams()
     predictor_args.update(predictor_checkpoint["hparams"])
-    predictor = FlowPGM(predictor_args).cuda()
+    predictor_args.device = args.device
+    predictor = FlowPGM(predictor_args).to(args.device)
     predictor.load_state_dict(predictor_checkpoint["ema_model_state_dict"])
 
     # for backwards compatibility
@@ -334,10 +356,11 @@ if __name__ == "__main__":
 
     # Load PGM
     print(f"\nLoading PGM checkpoint: {args.pgm_path}")
-    pgm_checkpoint = torch.load(args.pgm_path)
+    pgm_checkpoint = torch.load(args.pgm_path, map_location="cpu")
     pgm_args = Hparams()
     pgm_args.update(pgm_checkpoint["hparams"])
-    pgm = FlowPGM(pgm_args).cuda()
+    pgm_args.device = args.device
+    pgm = FlowPGM(pgm_args).to(args.device)
     pgm.load_state_dict(pgm_checkpoint["ema_model_state_dict"])
 
     # for backwards compatibility
@@ -354,13 +377,14 @@ if __name__ == "__main__":
 
     # Load deep VAE
     print(f"\nLoading VAE checkpoint: {args.vae_path}")
-    vae_checkpoint = torch.load(args.vae_path)
+    vae_checkpoint = torch.load(args.vae_path, map_location="cpu")
     vae_args = Hparams()
     vae_args.update(vae_checkpoint["hparams"])
     if not hasattr(vae_args, "cond_prior"):  # for backwards compatibility
         vae_args.cond_prior = False
     vae_args.kl_free_bits = vae_args.free_bits
-    vae = HVAE(vae_args).cuda()
+    vae_args.device = args.device
+    vae = HVAE(vae_args).to(args.device)
     vae.load_state_dict(vae_checkpoint["ema_model_state_dict"])
 
     # vae_args.data_dir = None  # adjust data_dir as needed
@@ -376,12 +400,12 @@ if __name__ == "__main__":
 
         for i, batch in loader:
             # preprocessing
-            batch["x"] = (batch["x"].cuda().float() - 127.5) / 127.5  # [-1, 1]
+            batch["x"] = (batch["x"].float().to(args.device) - 127.5) / 127.5  # [-1, 1]
             batch["pa"] = (
                 batch["pa"][..., None, None]
                 .repeat(1, 1, args.input_res, args.input_res)
-                .cuda()
                 .float()
+                .to(args.device)
             )
             # forward pass
             out = vae(batch["x"], batch["pa"], beta=args.beta)
@@ -415,8 +439,8 @@ if __name__ == "__main__":
         args.dataset = "ukbb"
     model = DSCM(args, pgm, predictor, vae)
     ema = EMA(model, beta=args.ema_rate)
-    model.cuda()
-    ema.cuda()
+    model.to(args.device)
+    ema.to(args.device)
 
     # setup data
     pgm_args.concat_pa = False
@@ -466,6 +490,8 @@ if __name__ == "__main__":
                 ema.ema_model.load_state_dict(ckpt["ema_model_state_dict"])
                 optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                 lagrange_opt.load_state_dict(ckpt["lagrange_opt_state_dict"])
+                move_optimizer_state_to_device(optimizer, args.device)
+                move_optimizer_state_to_device(lagrange_opt, args.device)
             else:
                 print("Checkpoint not found: {}".format(args.load_path))
         else:
