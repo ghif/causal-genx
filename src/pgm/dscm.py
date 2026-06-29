@@ -126,9 +126,8 @@ def vae_preprocess(args: Hparams, pa: Dict[str, Tensor]) -> Tensor:
         [pa[k] if len(pa[k].shape) > 1 else pa[k][..., None] for k in args.parents_x],
         dim=1,
     )
-    concat_pa = (
-        concat_pa[..., None, None].repeat(1, 1, *(args.input_res,) * 2).cuda().float()
-    )
+    device = getattr(args, "device", torch.device("cpu"))
+    concat_pa = concat_pa[..., None, None].repeat(1, 1, *(args.input_res,) * 2).to(device).float()
     return concat_pa
 
 

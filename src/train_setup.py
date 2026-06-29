@@ -10,10 +10,19 @@ from torch.utils.tensorboard import SummaryWriter
 
 from datasets import cmnist, mimic, morphomnist, ukbb
 from hps import Hparams
-from utils import linear_warmup, seed_worker
+from utils import (
+    ensure_dir,
+    is_remote_path,
+    linear_warmup,
+    local_staging_path,
+    path_exists,
+    remove_path,
+    seed_worker,
+)
 
 
 def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
+    pin_memory = args.device.type == "cuda"
     if "ukbb" in args.hps:
         datasets = ukbb(args)
     elif "morphomnist" in args.hps:
@@ -28,7 +37,7 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
     kwargs = {
         "batch_size": args.bs,
         "num_workers": os.cpu_count() // 2,
-        "pin_memory": True,
+        "pin_memory": pin_memory,
         "worker_init_fn": seed_worker,
     }
     dataloaders = {
@@ -55,26 +64,42 @@ def setup_optimizer(
 
 def setup_directories(args: Hparams, ckpt_dir: str = "../checkpoints") -> str:
     parents_folder = "_".join([k[0] for k in args.parents_x])
-    save_dir = os.path.join(ckpt_dir, parents_folder, args.exp_name)
-    if os.path.isdir(save_dir):
+    args.parents_folder = parents_folder
+    remote_save_dir = os.path.join(ckpt_dir, parents_folder, args.exp_name)
+    args.remote_save_dir = remote_save_dir
+    save_dir = remote_save_dir
+    if is_remote_path(remote_save_dir):
+        save_dir = local_staging_path(remote_save_dir)
+
+    if path_exists(remote_save_dir):
         if (
-            input(f"\nSave directory '{save_dir}' already exists, overwrite? [y/N]: ")
+            input(
+                f"\nSave directory '{remote_save_dir}' already exists, overwrite? [y/N]: "
+            )
             == "y"
         ):
-            if input(f"Send '{save_dir}', to Trash? [y/N]: ") == "y":
-                send2trash.send2trash(save_dir)
+            if is_remote_path(remote_save_dir):
+                remove_path(remote_save_dir)
                 print("Done.\n")
             else:
-                exit()
+                if input(f"Send '{save_dir}', to Trash? [y/N]: ") == "y":
+                    send2trash.send2trash(save_dir)
+                    print("Done.\n")
+                else:
+                    exit()
         else:
             if (
-                input(f"\nResume training with save directory '{save_dir}'? [y/N]: ")
+                input(
+                    f"\nResume training with save directory '{remote_save_dir}'? [y/N]: "
+                )
                 == "y"
             ):
                 pass
             else:
                 exit()
-    os.makedirs(save_dir, exist_ok=True)
+    ensure_dir(save_dir)
+    if is_remote_path(remote_save_dir):
+        ensure_dir(remote_save_dir)
     return save_dir
 
 
@@ -122,7 +147,7 @@ def setup_logging(args: Hparams) -> logging.Logger:
     # info logger for saving command line outputs during training
     logging.basicConfig(
         handlers=[
-            logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt")),
+            logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt"), mode="a"),
             logging.StreamHandler(),
         ],
         # filemode='a',  # append to file, 'w' for overwrite

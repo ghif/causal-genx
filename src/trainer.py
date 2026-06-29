@@ -4,6 +4,8 @@ import os
 from typing import Any, Dict
 
 import torch
+
+from utils import ensure_parent_dir, open_file, sync_file, sync_tree
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -14,8 +16,8 @@ from utils import linear_warmup, write_images
 
 
 def preprocess_batch(args: Hparams, batch: Dict[str, Tensor], expand_pa: bool = False):
-    batch["x"] = (batch["x"].to(args.device).float() - 127.5) / 127.5  # [-1, 1]
-    batch["pa"] = batch["pa"].to(args.device).float()
+    batch["x"] = (batch["x"].float().to(args.device) - 127.5) / 127.5  # [-1, 1]
+    batch["pa"] = batch["pa"].float().to(args.device)
     if expand_pa:  # used for HVAE parent concatenation
         batch["pa"] = batch["pa"][..., None, None].repeat(1, 1, *(args.input_res,) * 2)
     return batch
@@ -164,6 +166,12 @@ def trainer(
                     "hparams": vars(args),
                 }
                 ckpt_path = os.path.join(args.save_dir, "checkpoint.pt")
-                torch.save(save_dict, ckpt_path)
+                ensure_parent_dir(ckpt_path)
+                with open_file(ckpt_path, "wb") as f:
+                    torch.save(save_dict, f)
+                sync_file(ckpt_path, os.path.join(args.remote_save_dir, "checkpoint.pt"))
                 logger.info(f"Model saved: {ckpt_path}")
+        if hasattr(args, "remote_save_dir"):
+            writer.flush()
+            sync_tree(args.save_dir, args.remote_save_dir)
     return

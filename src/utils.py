@@ -1,6 +1,8 @@
 import copy
 import os
 import random
+import shutil
+import tempfile
 from typing import Dict, List, Optional
 
 import imageio
@@ -14,13 +16,39 @@ from hps import Hparams
 
 def seed_all(seed, deterministic=True):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.cuda.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
     if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        if torch.cuda.is_available():
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+
+def select_device(accelerator: str) -> torch.device:
+    accelerator = accelerator.lower()
+    if accelerator == "auto":
+        if torch.cuda.is_available():
+            accelerator = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            accelerator = "mps"
+        else:
+            accelerator = "cpu"
+
+    if accelerator == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available in this environment.")
+        return torch.device("cuda:0")
+    if accelerator == "mps":
+        if getattr(torch.backends, "mps", None) is None or not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was requested but is not available in this environment.")
+        return torch.device("mps")
+    if accelerator == "cpu":
+        return torch.device("cpu")
+
+    raise ValueError(f"Unknown accelerator: {accelerator}")
 
 
 def seed_worker(worker_id):
@@ -34,6 +62,102 @@ def linear_warmup(warmup_iters):
         return 1.0 if iter > warmup_iters else iter / warmup_iters
 
     return f
+
+
+def _remote_fs(path: str):
+    if not path.startswith("gs://"):
+        return None
+
+    try:
+        import fsspec
+    except ImportError as exc:
+        raise ImportError(
+            "GCS paths require the optional 'gcsfs' dependency."
+        ) from exc
+
+    return fsspec.filesystem("gcs")
+
+
+def is_remote_path(path: str) -> bool:
+    return path.startswith("gs://")
+
+
+def local_staging_path(remote_path: str) -> str:
+    clean = remote_path.replace("gs://", "gs__/").strip("/")
+    return os.path.join(tempfile.gettempdir(), "causal-gen-artifacts", clean)
+
+
+def open_file(path: str, mode: str = "rb"):
+    if is_remote_path(path):
+        try:
+            import fsspec
+        except ImportError as exc:
+            raise ImportError(
+                "GCS paths require the optional 'gcsfs' dependency."
+            ) from exc
+
+        return fsspec.open(path, mode=mode).open()
+    return open(path, mode)
+
+
+def path_exists(path: str) -> bool:
+    fs = _remote_fs(path)
+    if fs is None:
+        return os.path.exists(path)
+    return fs.exists(path)
+
+
+def ensure_parent_dir(path: str):
+    parent = os.path.dirname(path)
+    if not parent:
+        return
+
+    fs = _remote_fs(parent)
+    if fs is None:
+        os.makedirs(parent, exist_ok=True)
+    else:
+        fs.makedirs(parent, exist_ok=True)
+
+
+def ensure_dir(path: str):
+    fs = _remote_fs(path)
+    if fs is None:
+        os.makedirs(path, exist_ok=True)
+    else:
+        fs.makedirs(path, exist_ok=True)
+
+
+def sync_file(local_path: str, remote_path: str) -> None:
+    if local_path == remote_path or not is_remote_path(remote_path):
+        return
+
+    ensure_parent_dir(remote_path)
+    with open(local_path, "rb") as src, open_file(remote_path, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+
+
+def sync_tree(local_dir: str, remote_dir: str) -> None:
+    if local_dir == remote_dir or not is_remote_path(remote_dir):
+        return
+
+    ensure_dir(remote_dir)
+    for root, _, files in os.walk(local_dir):
+        rel_root = os.path.relpath(root, local_dir)
+        for name in files:
+            local_path = os.path.join(root, name)
+            remote_path = remote_dir
+            if rel_root != ".":
+                remote_path = os.path.join(remote_path, rel_root)
+            remote_path = os.path.join(remote_path, name)
+            sync_file(local_path, remote_path)
+
+
+def remove_path(path: str):
+    fs = _remote_fs(path)
+    if fs is None:
+        shutil.rmtree(path)
+    else:
+        fs.rm(path, recursive=True)
 
 
 def beta_anneal(beta, step, anneal_steps):
@@ -416,4 +540,7 @@ def write_images(args: Hparams, model: nn.Module, batch: Dict[str, Tensor]):
         .transpose([0, 2, 1, 3, 4])
         .reshape([n_rows * h, bs * w, c])
     )
-    imageio.imwrite(os.path.join(args.save_dir, f"viz-{args.iter}.png"), im)
+    viz_path = os.path.join(args.save_dir, f"viz-{args.iter}.png")
+    imageio.imwrite(viz_path, im)
+    if hasattr(args, "remote_save_dir"):
+        sync_file(viz_path, os.path.join(args.remote_save_dir, f"viz-{args.iter}.png"))

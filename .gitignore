@@ -1,4 +1,5 @@
-datasets/mnist_digit_colour
+checkpoints/
+datasets/
 .vscode
 .mypy_cache
 *.pyc

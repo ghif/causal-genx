@@ -1,5 +1,6 @@
 import argparse
 import gc
+import logging
 import os
 import traceback
 
@@ -16,7 +17,7 @@ from train_setup import (
     setup_tensorboard,
 )
 from trainer import trainer
-from utils import EMA, seed_all
+from utils import EMA, open_file, path_exists, seed_all, select_device, sync_tree
 from vae import HVAE
 
 
@@ -25,10 +26,15 @@ def main(args: Hparams):
     # update hyperparams if resuming from a checkpoint
     ckpt = None
     if args.resume:
-        if os.path.isfile(args.resume):
+        if path_exists(args.resume):
             print(f"\nLoading checkpoint: {args.resume}")
-            ckpt = torch.load(args.resume)
-            ckpt_args = {k: v for k, v in ckpt["hparams"].items() if k != "resume"}
+            with open_file(args.resume, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
+            ckpt_args = {
+                k: v
+                for k, v in ckpt["hparams"].items()
+                if k not in {"resume", "accelerator", "device"}
+            }
             if args.data_dir is not None:
                 ckpt_args["data_dir"] = args.data_dir
             if args.lr < ckpt_args["lr"]:
@@ -36,6 +42,8 @@ def main(args: Hparams):
             vars(args).update(ckpt_args)
         else:
             print(f"Checkpoint not found at: {args.resume}")
+
+    args.device = select_device(args.accelerator)
 
     # load data
     dataloaders = setup_dataloaders(args)
@@ -58,15 +66,15 @@ def main(args: Hparams):
 
     # setup model save directory, logging and tensorboard summaries
     assert args.exp_name != "", "No experiment name given."
-    args.save_dir = setup_directories(args)
+    args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
     writer = setup_tensorboard(args, model)
     logger = setup_logging(args)
 
     # setup optimizer
     optimizer, scheduler = setup_optimizer(args, model)
 
-    args.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_device(args.device)
+    if args.device.type == "cuda":
+        torch.cuda.set_device(args.device)
     model.to(args.device)
     ema.to(args.device)
 
@@ -75,6 +83,10 @@ def main(args: Hparams):
         model.load_state_dict(ckpt["model_state_dict"])
         ema.ema_model.load_state_dict(ckpt["ema_model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(args.device)
         # scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         # update lr of the loaded optimizer
         for p_group in optimizer.param_groups:
@@ -92,7 +104,8 @@ def main(args: Hparams):
     # train
     try:
         gc.collect()
-        torch.cuda.empty_cache()
+        if args.device.type == "cuda":
+            torch.cuda.empty_cache()
         trainer(args, model, ema, dataloaders, optimizer, scheduler, writer, logger)
     except KeyboardInterrupt:
         print(traceback.format_exc())
@@ -100,6 +113,12 @@ def main(args: Hparams):
             if input(f"Send '{args.save_dir}' to Trash? [y/N]: ") == "y":
                 send2trash.send2trash(args.save_dir)
                 print("Done.")
+    finally:
+        writer.flush()
+        writer.close()
+        logging.shutdown()
+        if hasattr(args, "remote_save_dir"):
+            sync_tree(args.save_dir, args.remote_save_dir)
 
 
 if __name__ == "__main__":

@@ -19,21 +19,34 @@ sys.path.append("..")
 from datasets import cmnist, get_attr_max_min, mimic, morphomnist, ukbb
 from hps import Hparams
 from train_setup import setup_directories, setup_logging, setup_tensorboard
-from utils import EMA, seed_all, seed_worker
+from utils import (
+    EMA,
+    ensure_parent_dir,
+    open_file,
+    path_exists,
+    seed_all,
+    seed_worker,
+    select_device,
+    sync_file,
+    sync_tree,
+)
 
 
 def preprocess(
-    batch: Dict[str, Tensor], dataset: str = "ukbb", split: str = "l"
+    batch: Dict[str, Tensor],
+    dataset: str = "ukbb",
+    split: str = "l",
+    device: torch.device = torch.device("cpu"),
 ) -> Dict[str, Tensor]:
     if "x" in batch.keys():
-        batch["x"] = (batch["x"].float().cuda() - 127.5) / 127.5  # [-1,1]
+        batch["x"] = (batch["x"].float().to(device) - 127.5) / 127.5  # [-1,1]
     # for all other variables except x
     not_x = [k for k in batch.keys() if k != "x"]
     for k in not_x:
         if split == "u":  # unlabelled
             batch[k] = None
         elif split == "l":  # labelled
-            batch[k] = batch[k].float().cuda()
+            batch[k] = batch[k].float().to(device)
             if len(batch[k].shape) < 2:
                 batch[k] = batch[k].unsqueeze(-1)
         else:
@@ -73,14 +86,18 @@ def ss_train_epoch(
     for _ in loader:
         batch = {}
         batch[outer] = next(iter_outer)
-        batch[outer] = preprocess(batch[outer], args.dataset, split=outer)
+        batch[outer] = preprocess(
+            batch[outer], args.dataset, split=outer, device=args.device
+        )
 
         try:
             batch[inner] = next(iter_inner)
         except StopIteration:
             iter_inner = iter(dataloaders[inner])  # restart inner iterator
             batch[inner] = next(iter_inner)
-        batch[inner] = preprocess(batch[inner], args.dataset, split=inner)
+        batch[inner] = preprocess(
+            batch[inner], args.dataset, split=inner, device=args.device
+        )
 
         # supervised update
         loss = elbo_fn(model.svi_model, model.guide, **batch["l"])
@@ -129,7 +146,7 @@ def sup_epoch(
     model.train(is_train)
     for i, batch in loader:
         bs = batch["x"].shape[0]
-        batch = preprocess(batch, args.dataset, split="l")
+        batch = preprocess(batch, args.dataset, split="l", device=args.device)
 
         with torch.set_grad_enabled(is_train):
             if args.setup == "sup_aux":
@@ -184,7 +201,7 @@ def eval_epoch(
         for k in targets.keys():
             targets[k].extend(copy.deepcopy(batch[k]))
         # predict
-        batch = preprocess(batch, args.dataset, split="l")
+        batch = preprocess(batch, args.dataset, split="l", device=args.device)
         out = model.predict(**batch)
 
         for k, v in out.items():
@@ -275,7 +292,7 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
     kwargs = {
         "batch_size": args.bs,
         "num_workers": 4,
-        "pin_memory": True,
+        "pin_memory": args.device.type == "cuda",
         "worker_init_fn": seed_worker,
     }
     dataloaders = {}
@@ -310,12 +327,34 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
     return dataloaders
 
 
+def move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer, device: torch.device
+) -> None:
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--accelerator",
+        help="Training accelerator.",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+    )
     parser.add_argument("--exp_name", help="Experiment name.", type=str, default="")
     parser.add_argument("--dataset", help="Dataset name.", type=str, default="ukbb")
     parser.add_argument(
         "--data_dir", help="Data directory to load form.", type=str, default=""
+    )
+    parser.add_argument(
+        "--ckpt_dir",
+        help="Directory to store checkpoints.",
+        type=str,
+        default="gs://causal-gen/checkpoints",
     )
     parser.add_argument(
         "--load_path", help="Path to load checkpoint.", type=str, default=""
@@ -383,13 +422,19 @@ if __name__ == "__main__":
     args = parser.parse_known_args()[0]
 
     seed_all(args.seed, args.deterministic)
+    args.device = select_device(args.accelerator)
 
     # update hparams if loading checkpoint
     if args.load_path:
-        if os.path.isfile(args.load_path):
+        if path_exists(args.load_path):
             print(f"\nLoading checkpoint: {args.load_path}")
-            ckpt = torch.load(args.load_path)
-            ckpt_args = {k: v for k, v in ckpt["hparams"].items() if k != "load_path"}
+            with open_file(args.load_path, "rb") as f:
+                ckpt = torch.load(f, map_location="cpu")
+            ckpt_args = {
+                k: v
+                for k, v in ckpt["hparams"].items()
+                if k not in {"load_path", "accelerator", "device"}
+            }
             if args.data_dir is not None:
                 ckpt_args["data_dir"] = args.data_dir
             if args.testing:
@@ -418,8 +463,8 @@ if __name__ == "__main__":
     else:
         NotImplementedError
     ema = EMA(model, beta=0.999)
-    model.cuda()
-    ema.cuda()
+    model.to(args.device)
+    ema.to(args.device)
 
     # Init loss & optimizer
     elbo_fn = TraceStorage_ELBO(num_particles=2)
@@ -428,7 +473,7 @@ if __name__ == "__main__":
 
     if not args.testing:
         # Train model
-        args.save_dir = setup_directories(args, ckpt_dir="../../checkpoints")
+        args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
         writer = setup_tensorboard(args, model)
         logger = setup_logging(args)
 
@@ -531,19 +576,25 @@ if __name__ == "__main__":
             if valid_stats["loss"] < args.best_loss:
                 args.best_loss = valid_stats["loss"]
                 ckpt_path = os.path.join(args.save_dir, "checkpoint.pt")
-                torch.save(
-                    {
-                        "epoch": epoch + 1,
-                        "step": steps,
-                        "best_loss": args.best_loss,
-                        "model_state_dict": model.state_dict(),
-                        "ema_model_state_dict": ema.ema_model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "hparams": vars(args),
-                    },
-                    ckpt_path,
-                )
+                ensure_parent_dir(ckpt_path)
+                with open_file(ckpt_path, "wb") as f:
+                    torch.save(
+                        {
+                            "epoch": epoch + 1,
+                            "step": steps,
+                            "best_loss": args.best_loss,
+                            "model_state_dict": model.state_dict(),
+                            "ema_model_state_dict": ema.ema_model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "hparams": vars(args),
+                        },
+                        f,
+                    )
+                sync_file(ckpt_path, os.path.join(args.remote_save_dir, "checkpoint.pt"))
                 logger.info(f"Model saved: {ckpt_path}")
+            if hasattr(args, "remote_save_dir"):
+                writer.flush()
+                sync_tree(args.save_dir, args.remote_save_dir)
 
     else:
         # test model

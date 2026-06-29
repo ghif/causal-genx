@@ -1,4 +1,5 @@
 ## Causal Generative Modelling: Image Counterfactuals
+Forked from [ghif/causal-gen](https://github.com/ghif/causal-gen).
 ### :hugs: Huggingface demos :hugs::
 
 - [Imaginable Imaging](https://huggingface.co/spaces/mira-causality/imaginable-imaging) (**NEW**✨)
@@ -72,8 +73,9 @@ Pyro enables flexible and expressive deep probabilistic modeling, for more detai
 Our HVAE-based causal mechanisms (`src/vae.py`) are trained outside of Pyro using Pytorch, and all trained mechanisms are subsequently merged into a single Pytorch module to create a DSCM. See `src/pgm/dscm.py` for an example.
 
 ### Requirements
-To run the code you will need to install the requirements listed in the `requirements.txt` file. E.g. from inside your env of choice run:
+To run the code you will need to install the requirements listed in the `requirements.txt` file. For Torch-based runs, use the `med-torch` conda environment. For example:
 ```
+conda activate med-torch
 pip install -r requirements.txt
 ```
 
@@ -91,8 +93,23 @@ To launch (local) training of the HVAE mechanism simply run the following script
 ```
 bash run_local.sh your_experiment_name
 ```
-To run in the background you can append `nohup` to the command: `bash run_local.sh your_experiment_name nohup`. Adjust the `run_command` inside the script as needed. Hyperparameters can be found in `src/hps.py`.
-If using [Slurm Workload Manager](https://slurm.schedmd.com/documentation.html), adjust `src/run_slurm.sh` as needed and launch as `bash run_slurm.sh`.
+The launcher accepts extra arguments and forwards them to `main.py`, so you can choose the accelerator explicitly:
+```
+bash run_local.sh your_experiment_name --accelerator cpu
+bash run_local.sh your_experiment_name --accelerator cuda
+bash run_local.sh your_experiment_name --accelerator mps
+bash run_local.sh your_experiment_name --accelerator auto
+```
+To run in the background you can append `nohup` to the command: `bash run_local.sh your_experiment_name nohup --accelerator mps`. The script still expects the `med-torch` conda environment for Torch-based runs.
+
+If you want to call the training entrypoint directly, use:
+```
+python main.py --exp_name your_experiment_name --accelerator mps
+```
+
+The same accelerator flag is available in `src/pgm/train_pgm.py` and `src/pgm/train_cf.py` for the PGM/counterfactual training paths. Hyperparameters can be found in `src/hps.py`.
+
+If using [Slurm Workload Manager](https://slurm.schedmd.com/documentation.html), adjust `src/run_slurm.sh` as needed and launch as `bash run_slurm.sh`. You can pass the accelerator there by editing the script or by calling the underlying Python entrypoint directly with `--accelerator`.
 
 Example (loose) steps to add your own dataset and associated SCM:
 

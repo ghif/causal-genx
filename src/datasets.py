@@ -19,6 +19,26 @@ from hps import Hparams
 from utils import log_standardize, normalize
 
 
+def _open_binary(path: str):
+    if path.startswith("gs://"):
+        try:
+            import fsspec
+        except ImportError as exc:
+            raise ImportError(
+                "Reading MorphoMNIST from GCS requires the optional 'gcsfs' dependency."
+            ) from exc
+
+        return fsspec.open(path, mode="rb").open()
+    return open(path, "rb")
+
+
+def _open_image(path: str) -> Image.Image:
+    with _open_binary(path) as f:
+        img = Image.open(f)
+        img.load()
+        return img.copy()
+
+
 class UKBBDataset(Dataset):
     def __init__(
         self,
@@ -72,7 +92,7 @@ class UKBBDataset(Dataset):
             filename = (
                 f'{int(sample["eid"])}_' + mri_seq + "_unbiased_brain_rigid_to_mni.png"
             )
-            x = Image.open(os.path.join(self.root, "thumbs_192x192", filename))
+            x = _open_image(os.path.join(self.root, "thumbs_192x192", filename))
 
             if self.transform is not None:
                 sample["x"] = self.transform(x)
@@ -157,8 +177,10 @@ def load_idx(path: str) -> np.ndarray:
     ----------
     http://yann.lecun.com/exdb/mnist/
     """
-    open_fcn = gzip.open if path.endswith(".gz") else open
-    with open_fcn(path, "rb") as f:
+    with _open_binary(path) as f:
+        if path.endswith(".gz"):
+            with gzip.GzipFile(fileobj=f, mode="rb") as gz:
+                return _load_uint8(gz)
         return _load_uint8(f)
 
 
@@ -194,7 +216,8 @@ def load_morphomnist_like(
         usecols = ["index"] + list(columns)
     else:
         usecols = columns
-    metrics = pd.read_csv(metrics_path, usecols=usecols, index_col="index")
+    with _open_binary(metrics_path) as f:
+        metrics = pd.read_csv(f, usecols=usecols, index_col="index")
     return images, labels, metrics
 
 
@@ -276,7 +299,7 @@ class MorphoMNIST(Dataset):
 def morphomnist(args: Hparams) -> Dict[str, MorphoMNIST]:
     # Load data
     if not args.data_dir:
-        args.data_dir = "../morphomnist/"
+        args.data_dir = "gs://causal-gen/datasets/morphomnist"
 
     augmentation = {
         "train": TF.Compose(
