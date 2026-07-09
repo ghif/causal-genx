@@ -176,8 +176,9 @@ PJRT_DEVICE=TPU python tpu_launcher.py benchmark.py \
 If the single-process command succeeds but the normal benchmark fails, inspect
 the startup version/topology diagnostics and verify that `torch`, `torch_xla`,
 and `libtpu` come from the same supported release. Do not manually set
-`TPU_PROCESS_BOUNDS`, `TPU_PROCESS_ADDRESSES`, `TPU_WORKER_HOSTNAMES`, or
-`TPU_ACCELERATOR_TYPE`; PJRT/libtpu discovers the Cloud TPU topology.
+`TPU_PROCESS_BOUNDS`, `TPU_PROCESS_ADDRESSES`, or `TPU_WORKER_HOSTNAMES`;
+PJRT/libtpu discovers the Cloud TPU topology, and the launcher fills in
+`ACCELERATOR_TYPE` only when the environment does not provide it.
 
 The generic launcher also supports the Pyro-based training paths:
 

@@ -6,7 +6,6 @@ from typing import Any, Dict, Iterable
 import torch
 
 _TOPOLOGY_ENV_VARS = (
-    "TPU_ACCELERATOR_TYPE",
     "TPU_PROCESS_BOUNDS",
     "TPU_PROCESS_ADDRESSES",
     "TPU_WORKER_HOSTNAMES",
@@ -28,7 +27,19 @@ class NullWriter:
         pass
 
 
+def _ensure_tpu_accelerator_type() -> None:
+    if os.environ.get("PJRT_DEVICE", "").upper() != "TPU":
+        return
+    if os.environ.get("ACCELERATOR_TYPE"):
+        return
+
+    accelerator_type = os.environ.get("TPU_ACCELERATOR_TYPE", "v6e-4")
+    os.environ["ACCELERATOR_TYPE"] = accelerator_type
+    os.environ.setdefault("TPU_ACCELERATOR_TYPE", accelerator_type)
+
+
 def _load_xla():
+    _ensure_tpu_accelerator_type()
     try:
         import torch_xla.core.xla_model as xm
     except ImportError as exc:
@@ -99,6 +110,7 @@ def runtime_diagnostics(device: torch.device) -> Dict[str, Any]:
             {
                 "torch_xla": torch_xla.__version__,
                 "libtpu": _package_version("libtpu"),
+                "accelerator_type": os.environ.get("ACCELERATOR_TYPE", "unset"),
                 "world_size": world_size(),
                 "rank": rank(),
                 "topology_overrides": ",".join(
@@ -189,6 +201,7 @@ def wrap_loader(loader: Iterable, device: torch.device) -> Iterable:
 
 
 def launch(function, args=(), debug_single_process: bool = False):
+    _ensure_tpu_accelerator_type()
     try:
         import torch_xla
     except ImportError:
