@@ -16,6 +16,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from hps import Hparams
+from xla_runtime import master_print
 from utils import log_standardize, normalize
 
 
@@ -54,18 +55,18 @@ class UKBBDataset(Dataset):
         self.transform = transform
         self.concat_pa = concat_pa  # return concatenated parents
 
-        print(f"\nLoading csv data: {csv_file}")
+        master_print(f"\nLoading csv data: {csv_file}")
         self.df = pd.read_csv(csv_file)
         self.columns = columns
         if self.columns is None:
             # ['eid', 'sex', 'age', 'brain_volume', 'ventricle_volume', 'mri_seq']
             self.columns = list(self.df.columns)  # return all
             self.columns.pop(0)  # remove redundant 'index' column
-        print(f"columns: {self.columns}")
+        master_print(f"columns: {self.columns}")
         self.samples = {i: torch.as_tensor(self.df[i]).float() for i in self.columns}
 
         for k in ["age", "brain_volume", "ventricle_volume"]:
-            print(f"{k} normalization: {norm}")
+            master_print(f"{k} normalization: {norm}")
             if k in self.columns:
                 if norm == "[-1,1]":
                     self.samples[k] = normalize(self.samples[k])
@@ -77,7 +78,7 @@ class UKBBDataset(Dataset):
                     pass
                 else:
                     NotImplementedError(f"{norm} not implemented.")
-        print(f"#samples: {len(self.df)}")
+        master_print(f"#samples: {len(self.df)}")
         self.return_x = True if "eid" in self.columns else False
 
     def __len__(self):
@@ -256,7 +257,7 @@ class MorphoMNIST(Dataset):
         }
 
         for k, v in self.samples.items():  # optional preprocessing
-            print(f"{k} normalization: {norm}")
+            master_print(f"{k} normalization: {norm}")
             if norm == "[-1,1]":
                 self.samples[k] = normalize(
                     v, x_min=self.min_max[k][0], x_max=self.min_max[k][1]
@@ -269,7 +270,7 @@ class MorphoMNIST(Dataset):
                 pass
             else:
                 NotImplementedError(f"{norm} not implemented.")
-        print(f"#samples: {len(metrics_df)}\n")
+        master_print(f"#samples: {len(metrics_df)}\n")
 
         self.samples.update({"digit": self.labels})
 

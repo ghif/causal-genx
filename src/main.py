@@ -131,6 +131,10 @@ def main(args: Hparams):
             sync_tree(args.save_dir, args.remote_save_dir)
 
 
+def _tpu_worker(_ordinal: int, args: Hparams):
+    main(args)
+
+
 if __name__ == "__main__":
     from hps import add_arguments, setup_hparams
 
@@ -144,6 +148,6 @@ if __name__ == "__main__":
             and os.environ.get("PJRT_DEVICE", "").upper() == "TPU"
         )
     ):
-        launch(main, args=(args,))
+        launch(_tpu_worker, args=(args,))
     else:
         main(args)

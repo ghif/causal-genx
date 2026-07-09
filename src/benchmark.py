@@ -1,14 +1,25 @@
 import argparse
 import time
+
 import torch
-from torch.utils.data import Subset, DataLoader
 
 from hps import add_arguments, setup_hparams
 from trainer import preprocess_batch
 from train_setup import setup_dataloaders, setup_optimizer
 from utils import EMA, seed_all, select_device
 from vae import HVAE
-from xla_runtime import autocast, mark_step, optimizer_step, synchronize
+from xla_runtime import (
+    autocast,
+    is_master,
+    is_xla_device,
+    master_print,
+    optimizer_step,
+    runtime_diagnostics,
+    synchronize,
+    world_size,
+    wrap_loader,
+)
+
 
 def run_benchmark():
     parser = argparse.ArgumentParser()
@@ -23,14 +34,13 @@ def run_benchmark():
 
     seed_all(args.seed, args.deterministic)
     args.device = select_device(args.accelerator)
-    print(f"Using device: {args.device}")
+    diagnostics = runtime_diagnostics(args.device)
+    if not is_xla_device(args.device) or is_master():
+        print("Runtime: " + ", ".join(f"{k}={v}" for k, v in diagnostics.items()))
 
     # Load dataloaders
     dataloaders = setup_dataloaders(args)
-
-    # Subset train dataset to 256 samples
-    train_subset = Subset(dataloaders["train"].dataset, list(range(256)))
-    bench_loader = DataLoader(train_subset, batch_size=args.bs, shuffle=False, num_workers=0)
+    bench_loader = wrap_loader(dataloaders["train"], args.device)
 
     # Init model
     model = HVAE(args)
@@ -58,7 +68,7 @@ def run_benchmark():
     warmup_steps = 2
     timed_steps = 6
 
-    print("Starting warmup steps...")
+    master_print("Starting warmup steps...")
     iterator = iter(bench_loader)
     for i in range(warmup_steps):
         batch = next(iterator)
@@ -69,26 +79,21 @@ def run_benchmark():
         out["elbo"].backward()
 
         # Optimizer step
-        if args.device.type == "xla":
-            grad_norm = torch.tensor(0.0, device=args.device)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.grad_clip
-            )
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer_step(optimizer, args.device)
         scheduler.step()
         ema.update()
         model.zero_grad(set_to_none=True)
-        mark_step(args.device)
-        print(f"Warmup step {i+1}/{warmup_steps} completed.")
+        master_print(f"Warmup step {i+1}/{warmup_steps} completed.")
 
-    print("Starting timed steps...")
+    synchronize(args.device)
+    master_print("Starting timed steps...")
     total_time = 0.0
     elbos = []
     for i in range(timed_steps):
         batch = next(iterator)
 
-        # Synchronization for accurate timing on MPS/CUDA
+        # Synchronize before and after each measured accelerator step.
         synchronize(args.device)
 
         start_time = time.perf_counter()
@@ -99,17 +104,11 @@ def run_benchmark():
         out["elbo"] = out["elbo"] / args.accu_steps
         out["elbo"].backward()
 
-        if args.device.type == "xla":
-            grad_norm = torch.tensor(0.0, device=args.device)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.grad_clip
-            )
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer_step(optimizer, args.device)
         scheduler.step()
         ema.update()
         model.zero_grad(set_to_none=True)
-        mark_step(args.device)
 
         synchronize(args.device)
 
@@ -118,19 +117,25 @@ def run_benchmark():
         total_time += step_time
         elbo_val = out["elbo"].item() * args.accu_steps
         elbos.append(elbo_val)
-        print(f"Timed step {i+1}/{timed_steps} completed in {step_time:.4f}s. ELBO: {elbo_val:.4f}")
+        master_print(
+            f"Timed step {i+1}/{timed_steps} completed in {step_time:.4f}s. "
+            f"ELBO: {elbo_val:.4f}"
+        )
         
     avg_elbo = sum(elbos) / len(elbos)
     seconds_per_step = total_time / timed_steps
-    samples_per_second = (timed_steps * args.bs) / total_time
+    replicas = world_size() if is_xla_device(args.device) else 1
+    samples_per_second = (timed_steps * args.bs * replicas) / total_time
     
-    print("\n--- Benchmark Results ---")
-    print(f"RESULT_ACCELERATOR={args.accelerator.upper()}")
-    print(f"RESULT_DEVICE={args.device}")
-    print(f"RESULT_TOTAL_TIME={total_time:.4f}")
-    print(f"RESULT_SECONDS_PER_STEP={seconds_per_step:.4f}")
-    print(f"RESULT_SAMPLES_PER_SECOND={samples_per_second:.2f}")
-    print(f"RESULT_AVG_ELBO={avg_elbo:.4f}")
+    master_print("\n--- Benchmark Results ---")
+    master_print(f"RESULT_ACCELERATOR={args.accelerator.upper()}")
+    master_print(f"RESULT_DEVICE={args.device}")
+    master_print(f"RESULT_REPLICAS={replicas}")
+    master_print(f"RESULT_GLOBAL_BATCH_SIZE={args.bs * replicas}")
+    master_print(f"RESULT_TOTAL_TIME={total_time:.4f}")
+    master_print(f"RESULT_SECONDS_PER_STEP={seconds_per_step:.4f}")
+    master_print(f"RESULT_SAMPLES_PER_SECOND={samples_per_second:.2f}")
+    master_print(f"RESULT_AVG_ELBO={avg_elbo:.4f}")
     
 if __name__ == "__main__":
     run_benchmark()

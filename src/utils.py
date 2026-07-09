@@ -177,7 +177,9 @@ def normalize(x, x_min=None, x_max=None, zero_one=False):
         x_min = x.min()
     if x_max is None:
         x_max = x.max()
-    print(f"max: {x_max}, min: {x_min}")
+    from xla_runtime import master_print
+
+    master_print(f"max: {x_max}, min: {x_min}")
     x = (x - x_min) / (x_max - x_min)  # [0,1]
     return x if zero_one else 2 * x - 1  # else [-1,1]
 

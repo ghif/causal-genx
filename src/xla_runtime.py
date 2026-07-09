@@ -1,8 +1,17 @@
 import contextlib
+import importlib.metadata
 import os
 from typing import Any, Dict, Iterable
 
 import torch
+
+_TOPOLOGY_ENV_VARS = (
+    "TPU_ACCELERATOR_TYPE",
+    "TPU_PROCESS_BOUNDS",
+    "TPU_PROCESS_ADDRESSES",
+    "TPU_WORKER_HOSTNAMES",
+    "TPU_CHIPS_PER_PROCESS_BOUNDS",
+)
 
 
 class NullWriter:
@@ -28,74 +37,6 @@ def _load_xla():
             "versions from requirements-tpu.txt."
         ) from exc
     return xm
-
-
-def _prepare_tpu_environment() -> None:
-    """Set TPU env defaults required by torch-xla before importing it."""
-    if os.environ.get("PJRT_DEVICE", "").upper() != "TPU":
-        return
-
-    # torch-xla consults the Cloud TPU metadata service unless this is set.
-    # On TPU VMs the metadata lookup is sometimes unavailable from the runtime
-    # environment, so we prefer env-based configuration when launching locally.
-    os.environ.setdefault("TPU_SKIP_MDS_QUERY", "1")
-
-    # torch-xla's env-based path reads TPU_ACCELERATOR_TYPE, but the import-time
-    # checks also expect ACCELERATOR_TYPE to exist. Mirror either one into the
-    # other so both code paths work.
-    accelerator_type = os.environ.get("ACCELERATOR_TYPE") or os.environ.get(
-        "TPU_ACCELERATOR_TYPE"
-    )
-    if accelerator_type is None:
-        # Conservative default for TPU VM v6e hosts. Users can override this by
-        # exporting ACCELERATOR_TYPE or TPU_ACCELERATOR_TYPE before launching.
-        accelerator_type = "v6e-8"
-
-    os.environ.setdefault("ACCELERATOR_TYPE", accelerator_type)
-    os.environ.setdefault("TPU_ACCELERATOR_TYPE", accelerator_type)
-
-    # When metadata is unavailable, torch-xla also needs topology values that
-    # are normally derived from the TPU VM environment. Use the number of local
-    # TPU chips visible in sysfs as the single-host process bound.
-    tpu_vendor = "0x1ae0"
-    tpu_device_ids = {"0x0027", "0x005e", "0x0063", "0x006f", "0x0056", "0x0062"}
-    num_chips = 0
-    try:
-        for device_name in os.listdir("/sys/bus/pci/devices"):
-            device_dir = os.path.join("/sys/bus/pci/devices", device_name)
-            vendor_file = os.path.join(device_dir, "vendor")
-            device_file = os.path.join(device_dir, "device")
-            if not os.path.isfile(vendor_file) or not os.path.isfile(device_file):
-                continue
-            with open(vendor_file) as f:
-                vendor_id = f.read().strip()
-            if vendor_id != tpu_vendor:
-                continue
-            with open(device_file) as f:
-                device_id = f.read().strip()
-            if device_id in tpu_device_ids:
-                num_chips += 1
-    except OSError:
-        num_chips = 0
-
-    if num_chips <= 0:
-        num_chips = 1
-
-    worker_host = "127.0.0.1"
-    worker_hosts = ",".join([worker_host] * num_chips)
-    os.environ.setdefault("TPU_WORKER_HOSTNAMES", worker_hosts)
-    os.environ.setdefault("TPU_WORKER_ID", "0")
-
-    # Some libtpu/PJRT builds expect an explicit worker-address list even on a
-    # single-host slice. Synthesize the local host layout with one port per chip.
-    process_ports = [8476 + i for i in range(num_chips)]
-    process_addresses = ",".join(f"{worker_host}:{port}" for port in process_ports)
-    os.environ.setdefault("TPU_PROCESS_ADDRESSES", process_addresses)
-
-    if os.environ.get("TPU_PROCESS_BOUNDS") is None:
-        os.environ["TPU_PROCESS_BOUNDS"] = f"{num_chips},1,1"
-
-    os.environ.setdefault("TPU_CHIPS_PER_PROCESS_BOUNDS", "1,1,1")
 
 
 def tpu_environment_available() -> bool:
@@ -138,6 +79,44 @@ def is_master() -> bool:
     return _load_xla().is_master_ordinal(local=False)
 
 
+def master_print(*args, **kwargs) -> None:
+    if os.environ.get("PJRT_DEVICE", "").upper() != "TPU" or is_master():
+        print(*args, **kwargs)
+
+
+def runtime_diagnostics(device: torch.device) -> Dict[str, Any]:
+    diagnostics = {
+        "torch": torch.__version__,
+        "device": str(device),
+        "world_size": 1,
+        "rank": 0,
+        "PJRT_DEVICE": os.environ.get("PJRT_DEVICE", ""),
+    }
+    if is_xla_device(device):
+        import torch_xla
+
+        diagnostics.update(
+            {
+                "torch_xla": torch_xla.__version__,
+                "libtpu": _package_version("libtpu"),
+                "world_size": world_size(),
+                "rank": rank(),
+                "topology_overrides": ",".join(
+                    key for key in _TOPOLOGY_ENV_VARS if os.environ.get(key)
+                )
+                or "none",
+            }
+        )
+    return diagnostics
+
+
+def _package_version(package: str) -> str:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return "not-installed-as-package"
+
+
 def rendezvous(tag: str) -> None:
     _load_xla().rendezvous(tag)
 
@@ -151,13 +130,16 @@ def optimizer_step(optimizer: torch.optim.Optimizer, device: torch.device) -> No
 
 def mark_step(device: torch.device) -> None:
     if is_xla_device(device):
-        _load_xla().mark_step()
+        import torch_xla
+
+        torch_xla.sync()
 
 
 def synchronize(device: torch.device) -> None:
     if is_xla_device(device):
-        _load_xla().mark_step()
-        _load_xla().wait_device_ops()
+        import torch_xla
+
+        torch_xla.sync(wait=True)
     elif device.type == "cuda":
         torch.cuda.synchronize()
     elif device.type == "mps" and hasattr(torch, "mps"):
@@ -207,14 +189,29 @@ def wrap_loader(loader: Iterable, device: torch.device) -> Iterable:
 
 
 def launch(function, args=(), debug_single_process: bool = False):
-    _prepare_tpu_environment()
     try:
         import torch_xla
     except ImportError:
         _load_xla()
+        import torch_xla
+    _validate_xla_version(torch_xla.__version__)
     return torch_xla.launch(
         function, args=args, debug_single_process=debug_single_process
     )
+
+
+def _validate_xla_version(torch_xla_version: str) -> None:
+    torch_release = torch.__version__.split("+", 1)[0]
+    xla_release = torch_xla_version.split("+", 1)[0]
+    if _major_minor(torch_release) != _major_minor(xla_release):
+        raise RuntimeError(
+            "torch and torch-xla must use the same major/minor release; "
+            f"found torch=={torch.__version__} and torch-xla=={torch_xla_version}."
+        )
+
+
+def _major_minor(version: str):
+    return tuple(version.split(".")[:2])
 
 
 def save(data: Any, path: str, device: torch.device) -> None:

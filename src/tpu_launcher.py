@@ -21,5 +21,14 @@ if __name__ == "__main__":
         "entrypoint",
         choices=["main.py", "benchmark.py", "pgm/train_pgm.py", "pgm/train_cf.py"],
     )
+    parser.add_argument(
+        "--debug_single_process",
+        action="store_true",
+        help="Run one TPU process to isolate model/compile failures from collectives.",
+    )
     known, arguments = parser.parse_known_args()
-    launch(_run, args=(known.entrypoint, arguments))
+    launch(
+        _run,
+        args=(known.entrypoint, arguments),
+        debug_single_process=known.debug_single_process,
+    )
