@@ -100,26 +100,81 @@ bash run_local.sh your_experiment_name --accelerator cuda
 bash run_local.sh your_experiment_name --accelerator mps
 bash run_local.sh your_experiment_name --accelerator auto
 ```
-On a single-host TPU v6e-4 VM, install the matched XLA environment and launch all
-four chips with:
-```
-pip install -r requirements-tpu.txt
-cd src
-bash run_tpu.sh your_experiment_name
-```
-`--bs` is the per-chip batch size, so the default global batch size is four times
-the value passed on a v6e-4 slice. TPU runs use bf16 by default; pass
-`--precision fp32` for numerical debugging.
+#### TPU v6e-4
 
-The generic launcher also supports the benchmark and Pyro-based training paths:
+On a single-host TPU v6e-4 VM, switch to the TPU branch and install the matched
+PyTorch/XLA environment:
+
+```bash
+cd /path/to/causal-gen
+git switch tpu-v6e-opt
+
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-tpu.txt
 ```
-PJRT_DEVICE=TPU python tpu_launcher.py benchmark.py --accelerator tpu
+
+Launch Morpho-MNIST training on all four TPU chips from the `src` directory:
+
+```bash
+cd src
+bash run_tpu.sh morphomnist_v6e
+```
+
+The launcher uses PJRT to create one process per chip. `--bs` is the per-chip
+batch size, so the default `--bs=32` produces a global batch size of 128 on a
+v6e-4 slice. TPU runs use bf16 by default; pass `--precision fp32` for numerical
+debugging.
+
+Additional training arguments are forwarded to `main.py`. For example:
+
+```bash
+bash run_tpu.sh morphomnist_v6e \
+  --bs 64 \
+  --epochs 500 \
+  --eval_freq 5
+```
+
+To use local data and checkpoint directories:
+
+```bash
+bash run_tpu.sh morphomnist_v6e \
+  --data_dir /path/to/datasets/morphomnist \
+  --ckpt_dir /path/to/checkpoints
+```
+
+To run training in the background:
+
+```bash
+nohup bash run_tpu.sh morphomnist_v6e \
+  > morphomnist_v6e.log 2>&1 &
+
+tail -f morphomnist_v6e.log
+```
+
+Run the TPU benchmark before a long training job to validate compilation and
+measure steady-state throughput:
+
+```bash
+PJRT_DEVICE=TPU python tpu_launcher.py benchmark.py \
+  --accelerator tpu \
+  --precision bf16 \
+  --bs 32
+```
+
+The generic launcher also supports the Pyro-based training paths:
+
+```
 PJRT_DEVICE=TPU python tpu_launcher.py pgm/train_pgm.py --accelerator tpu ...
 PJRT_DEVICE=TPU python tpu_launcher.py pgm/train_cf.py --accelerator tpu ...
 ```
+
 Only the master process writes TensorBoard events, plots, logs, and checkpoints.
-The PGM paths depend on Pyro operator coverage in the installed torch-XLA release;
-use a small smoke run before a long experiment.
+The first training steps will be slower while XLA compiles the graph, so measure
+throughput after warmup. GCS dataset and checkpoint paths require the TPU VM
+service account to have access to the configured buckets. The PGM paths also
+depend on Pyro operator coverage in the installed torch-XLA release; use a small
+smoke run before a long experiment.
 
 To run in the background you can append `nohup` to the command: `bash run_local.sh your_experiment_name nohup --accelerator mps`. The script still expects the `med-torch` conda environment for Torch-based runs.
 
