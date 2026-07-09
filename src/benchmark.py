@@ -8,6 +8,7 @@ from trainer import preprocess_batch
 from train_setup import setup_dataloaders, setup_optimizer
 from utils import EMA, seed_all, select_device
 from vae import HVAE
+from xla_runtime import autocast, optimizer_step, synchronize
 
 def run_benchmark():
     parser = argparse.ArgumentParser()
@@ -62,13 +63,14 @@ def run_benchmark():
     for i in range(warmup_steps):
         batch = next(iterator)
         batch = preprocess_batch(args, batch, expand_pa=args.expand_pa)
-        out = model(batch["x"], batch["pa"], beta=args.beta)
+        with autocast(args.device, args.precision):
+            out = model(batch["x"], batch["pa"], beta=args.beta)
         out["elbo"] = out["elbo"] / args.accu_steps
         out["elbo"].backward()
 
         # Optimizer step
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+        optimizer_step(optimizer, args.device)
         scheduler.step()
         ema.update()
         model.zero_grad(set_to_none=True)
@@ -81,30 +83,23 @@ def run_benchmark():
         batch = next(iterator)
 
         # Synchronization for accurate timing on MPS/CUDA
-        if args.device.type == "cuda":
-            torch.cuda.synchronize()
-        elif args.device.type == "mps":
-            if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
-                torch.mps.synchronize()
+        synchronize(args.device)
 
         start_time = time.perf_counter()
 
         batch = preprocess_batch(args, batch, expand_pa=args.expand_pa)
-        out = model(batch["x"], batch["pa"], beta=args.beta)
+        with autocast(args.device, args.precision):
+            out = model(batch["x"], batch["pa"], beta=args.beta)
         out["elbo"] = out["elbo"] / args.accu_steps
         out["elbo"].backward()
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+        optimizer_step(optimizer, args.device)
         scheduler.step()
         ema.update()
         model.zero_grad(set_to_none=True)
 
-        if args.device.type == "cuda":
-            torch.cuda.synchronize()
-        elif args.device.type == "mps":
-            if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
-                torch.mps.synchronize()
+        synchronize(args.device)
 
         end_time = time.perf_counter()
         step_time = end_time - start_time

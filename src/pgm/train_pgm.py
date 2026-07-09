@@ -1,5 +1,6 @@
 import argparse
 import copy
+import logging
 import os
 import sys
 from typing import Any, Dict, Optional
@@ -12,13 +13,19 @@ from layers import TraceStorage_ELBO
 from sklearn.metrics import roc_auc_score
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from utils_pgm import plot_joint, update_stats
 
 sys.path.append("..")
 from datasets import cmnist, get_attr_max_min, mimic, morphomnist, ukbb
 from hps import Hparams
-from train_setup import setup_directories, setup_logging, setup_tensorboard
+from train_setup import (
+    derive_save_directories,
+    setup_directories,
+    setup_logging,
+    setup_tensorboard,
+)
 from utils import (
     EMA,
     ensure_parent_dir,
@@ -29,6 +36,16 @@ from utils import (
     select_device,
     sync_file,
     sync_tree,
+)
+from xla_runtime import (
+    NullWriter,
+    is_master,
+    is_xla_device,
+    optimizer_step,
+    rank,
+    rendezvous,
+    save,
+    world_size,
 )
 
 
@@ -108,7 +125,7 @@ def ss_train_epoch(
         loss = loss + alpha * aux_loss
         optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        optimizer_step(optimizer, args.device)
         ema.update()
 
         stats["loss"] += loss.item()
@@ -170,7 +187,7 @@ def sup_epoch(
             optimizer.zero_grad()
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 200)
-            optimizer.step()
+            optimizer_step(optimizer, args.device)
             ema.update()
 
         stats["loss"] += loss.item() * bs
@@ -295,10 +312,29 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
         "pin_memory": args.device.type == "cuda",
         "worker_init_fn": seed_worker,
     }
+
+    def make_loader(dataset, shuffle=False, drop_last=False):
+        sampler = None
+        if args.device.type == "xla":
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size(),
+                rank=rank(),
+                shuffle=shuffle,
+                drop_last=drop_last,
+            )
+        return DataLoader(
+            dataset,
+            shuffle=shuffle and sampler is None,
+            sampler=sampler,
+            drop_last=drop_last,
+            **kwargs,
+        )
+
     dataloaders = {}
     if args.setup == "sup_pgm":
-        dataloaders["train"] = DataLoader(
-            datasets["train"], shuffle=True, drop_last=True, **kwargs
+        dataloaders["train"] = make_loader(
+            datasets["train"], shuffle=True, drop_last=True
         )
     else:
         args.n_total = len(datasets["train"])
@@ -311,19 +347,19 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
 
         if args.setup == "semi_sup":
             train_u = torch.utils.data.Subset(datasets["train"], idx[args.n_labelled :])
-            dataloaders["train_l"] = DataLoader(  # labelled
-                train_l, shuffle=True, drop_last=True, **kwargs
+            dataloaders["train_l"] = make_loader(
+                train_l, shuffle=True, drop_last=True
             )
-            dataloaders["train_u"] = DataLoader(  # unlabelled
-                train_u, shuffle=True, drop_last=True, **kwargs
+            dataloaders["train_u"] = make_loader(
+                train_u, shuffle=True, drop_last=True
             )
         elif args.setup == "sup_aux":
-            dataloaders["train"] = DataLoader(  # labelled
-                train_l, shuffle=True, drop_last=True, **kwargs
+            dataloaders["train"] = make_loader(
+                train_l, shuffle=True, drop_last=True
             )
 
-    dataloaders["valid"] = DataLoader(datasets["valid"], shuffle=False, **kwargs)
-    dataloaders["test"] = DataLoader(datasets["test"], shuffle=False, **kwargs)
+    dataloaders["valid"] = make_loader(datasets["valid"])
+    dataloaders["test"] = make_loader(datasets["test"])
     return dataloaders
 
 
@@ -343,7 +379,7 @@ if __name__ == "__main__":
         help="Training accelerator.",
         type=str,
         default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
+        choices=["auto", "cpu", "cuda", "mps", "tpu"],
     )
     parser.add_argument("--exp_name", help="Experiment name.", type=str, default="")
     parser.add_argument("--dataset", help="Dataset name.", type=str, default="ukbb")
@@ -473,9 +509,15 @@ if __name__ == "__main__":
 
     if not args.testing:
         # Train model
-        args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
-        writer = setup_tensorboard(args, model)
-        logger = setup_logging(args)
+        master = not is_xla_device(args.device) or is_master()
+        if master:
+            args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
+        else:
+            args.save_dir = derive_save_directories(args, args.ckpt_dir)
+        if is_xla_device(args.device):
+            rendezvous("pgm-experiment-directories-ready")
+        writer = setup_tensorboard(args, model) if master else NullWriter()
+        logger = setup_logging(args) if master else logging.getLogger("tpu-pgm-worker")
 
         for k in sorted(vars(args)):
             logger.info(f"--{k}={vars(args)[k]}")
@@ -487,6 +529,9 @@ if __name__ == "__main__":
         args.best_loss = float("inf")
 
         for epoch in range(args.epochs):
+            for dataloader in dataloaders.values():
+                if hasattr(dataloader.sampler, "set_epoch"):
+                    dataloader.sampler.set_epoch(epoch)
             logger.info(f"Epoch {epoch+1}:")
 
             # semi supervised training
@@ -543,7 +588,7 @@ if __name__ == "__main__":
                         is_train=False,
                     )
                     steps = (epoch + 1) * len(dataloaders["train"])
-                    if args.setup == "sup_pgm":
+                    if master and args.setup == "sup_pgm":
                         plot_joint(
                             args, ema.ema_model, dataloaders["train"].dataset, steps
                         )
@@ -573,26 +618,27 @@ if __name__ == "__main__":
                         + " - ".join(f"{k}: {v:.4f}" for k, v in metrics.items())
                     )
 
-            if valid_stats["loss"] < args.best_loss:
+            if master and valid_stats["loss"] < args.best_loss:
                 args.best_loss = valid_stats["loss"]
                 ckpt_path = os.path.join(args.save_dir, "checkpoint.pt")
                 ensure_parent_dir(ckpt_path)
-                with open_file(ckpt_path, "wb") as f:
-                    torch.save(
-                        {
-                            "epoch": epoch + 1,
-                            "step": steps,
-                            "best_loss": args.best_loss,
-                            "model_state_dict": model.state_dict(),
-                            "ema_model_state_dict": ema.ema_model.state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "hparams": vars(args),
-                        },
-                        f,
-                    )
+                checkpoint = {
+                    "epoch": epoch + 1,
+                    "step": steps,
+                    "best_loss": args.best_loss,
+                    "model_state_dict": model.state_dict(),
+                    "ema_model_state_dict": ema.ema_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "hparams": vars(args),
+                }
+                if is_xla_device(args.device):
+                    save(checkpoint, ckpt_path, args.device)
+                else:
+                    with open_file(ckpt_path, "wb") as f:
+                        save(checkpoint, f, args.device)
                 sync_file(ckpt_path, os.path.join(args.remote_save_dir, "checkpoint.pt"))
                 logger.info(f"Model saved: {ckpt_path}")
-            if hasattr(args, "remote_save_dir"):
+            if master and hasattr(args, "remote_save_dir"):
                 writer.flush()
                 sync_tree(args.save_dir, args.remote_save_dir)
 

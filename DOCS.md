@@ -31,7 +31,18 @@ pip install -r requirements.txt
 bash run_local.sh morphomnist_mps --accelerator mps
 ```
 
-Swap `mps` for `cpu`, `cuda`, or `auto` depending on your machine.
+Swap `mps` for `cpu`, `cuda`, or `auto` depending on your machine. On a TPU VM,
+install `requirements-tpu.txt`, change into `src/`, and run:
+
+```bash
+bash run_tpu.sh morphomnist_v6e
+```
+
+The TPU launcher uses PJRT to create one process per chip, shards each dataset
+with `DistributedSampler`, reduces gradients through `torch_xla`, uses bf16
+autocast by default, and restricts artifact writes to the master process. Batch
+size is per replica. Use `tpu_launcher.py` directly for `benchmark.py`,
+`pgm/train_pgm.py`, or `pgm/train_cf.py`.
 
 ## Compact Architecture
 
@@ -97,7 +108,7 @@ This is the main entrypoint for training the image mechanism.
 What it does:
 
 - parses hyperparameters from `src/hps.py`
-- selects the accelerator with `--accelerator {auto,cpu,cuda,mps}`
+- selects the accelerator with `--accelerator {auto,cpu,cuda,mps,tpu}`
 - loads data through `src/train_setup.py`
 - builds either `HVAE` or `VAE`
 - creates an EMA copy of the model

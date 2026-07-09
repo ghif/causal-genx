@@ -1,5 +1,6 @@
 import argparse
 import copy
+import logging
 import os
 import random
 import sys
@@ -20,7 +21,12 @@ from utils_pgm import plot_cf, update_stats
 sys.path.append("..")
 from datasets import get_attr_max_min
 from hps import Hparams
-from train_setup import setup_directories, setup_logging, setup_tensorboard
+from train_setup import (
+    derive_save_directories,
+    setup_directories,
+    setup_logging,
+    setup_tensorboard,
+)
 from utils import (
     EMA,
     ensure_parent_dir,
@@ -32,6 +38,14 @@ from utils import (
     sync_tree,
 )
 from vae import HVAE
+from xla_runtime import (
+    NullWriter,
+    is_master,
+    is_xla_device,
+    optimizer_step,
+    rendezvous,
+    save,
+)
 
 
 def loginfo(title: str, logger: Any, stats: Dict[str, Any]):
@@ -164,7 +178,8 @@ def cf_epoch(
             do = {}
             do_k = copy.deepcopy(args.do_pa) if args.do_pa else random.choice(dag_vars)
             if is_train:
-                do[do_k] = batch[do_k].clone()[torch.randperm(bs)]
+                permutation = torch.randperm(bs, device=batch[do_k].device)
+                do[do_k] = batch[do_k].clone()[permutation]
             else:
                 idx = torch.randperm(train_set[do_k].shape[0])
                 do[do_k] = train_set[do_k].clone()[idx][:bs]
@@ -189,8 +204,8 @@ def cf_epoch(
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             if grad_norm < args.grad_skip:
-                optimizer.step()
-                lagrange_opt.step()  # gradient ascent on lmbda
+                optimizer_step(optimizer, args.device)
+                optimizer_step(lagrange_opt, args.device)
                 model.lmbda.data.clamp_(min=0)
                 ema.update()
             else:
@@ -245,7 +260,7 @@ if __name__ == "__main__":
         help="Training accelerator.",
         type=str,
         default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
+        choices=["auto", "cpu", "cuda", "mps", "tpu"],
     )
     parser.add_argument("--exp_name", help="experiment name.", type=str, default="")
     parser.add_argument(
@@ -470,9 +485,15 @@ if __name__ == "__main__":
 
     # Train model
     if not args.testing:
-        args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
-        writer = setup_tensorboard(args, model)
-        logger = setup_logging(args)
+        master = not is_xla_device(args.device) or is_master()
+        if master:
+            args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
+        else:
+            args.save_dir = derive_save_directories(args, args.ckpt_dir)
+        if is_xla_device(args.device):
+            rendezvous("cf-experiment-directories-ready")
+        writer = setup_tensorboard(args, model) if master else NullWriter()
+        logger = setup_logging(args) if master else logging.getLogger("tpu-cf-worker")
         writer.add_custom_scalars(
             {
                 "loss": {"loss": ["Multiline", ["loss/train", "loss/valid"]]},
@@ -524,6 +545,9 @@ if __name__ == "__main__":
 
         # training loop
         for epoch in range(args.start_epoch, args.epochs):
+            for dataloader in dataloaders.values():
+                if hasattr(dataloader.sampler, "set_epoch"):
+                    dataloader.sampler.set_epoch(epoch)
             args.epoch = epoch + 1
             logger.info(f"Epoch: {args.epoch}")
             stats = cf_epoch(
@@ -555,33 +579,34 @@ if __name__ == "__main__":
                 writer.add_scalar("aux_loss/train", stats["aux_loss"], args.step)
                 writer.add_scalar("aux_loss/valid", valid_stats["aux_loss"], args.step)
 
-                if valid_stats["loss"] < args.best_loss:
+                if master and valid_stats["loss"] < args.best_loss:
                     args.best_loss = valid_stats["loss"]
                     ckpt_path = os.path.join(
                         args.save_dir,
                         f"{args.step}_checkpoint.pt",
                     )
                     ensure_parent_dir(ckpt_path)
-                    with open_file(ckpt_path, "wb") as f:
-                        torch.save(
-                            {
-                                "epoch": args.epoch,
-                                "step": args.step,
-                                "best_loss": args.best_loss,
-                                "model_state_dict": model.state_dict(),
-                                "ema_model_state_dict": ema.ema_model.state_dict(),
-                                "optimizer_state_dict": optimizer.state_dict(),
-                                "lagrange_opt_state_dict": lagrange_opt.state_dict(),
-                                "hparams": vars(args),
-                            },
-                            f,
-                        )
+                    checkpoint = {
+                        "epoch": args.epoch,
+                        "step": args.step,
+                        "best_loss": args.best_loss,
+                        "model_state_dict": model.state_dict(),
+                        "ema_model_state_dict": ema.ema_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "lagrange_opt_state_dict": lagrange_opt.state_dict(),
+                        "hparams": vars(args),
+                    }
+                    if is_xla_device(args.device):
+                        save(checkpoint, ckpt_path, args.device)
+                    else:
+                        with open_file(ckpt_path, "wb") as f:
+                            save(checkpoint, f, args.device)
                     sync_file(
                         ckpt_path,
                         os.path.join(args.remote_save_dir, f"{args.step}_checkpoint.pt"),
                     )
                     logger.info(f"Model saved: {ckpt_path}")
-                if hasattr(args, "remote_save_dir"):
+                if master and hasattr(args, "remote_save_dir"):
                     writer.flush()
                     sync_tree(args.save_dir, args.remote_save_dir)
     else:

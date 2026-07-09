@@ -100,6 +100,27 @@ bash run_local.sh your_experiment_name --accelerator cuda
 bash run_local.sh your_experiment_name --accelerator mps
 bash run_local.sh your_experiment_name --accelerator auto
 ```
+On a single-host TPU v6e-4 VM, install the matched XLA environment and launch all
+four chips with:
+```
+pip install -r requirements-tpu.txt
+cd src
+bash run_tpu.sh your_experiment_name
+```
+`--bs` is the per-chip batch size, so the default global batch size is four times
+the value passed on a v6e-4 slice. TPU runs use bf16 by default; pass
+`--precision fp32` for numerical debugging.
+
+The generic launcher also supports the benchmark and Pyro-based training paths:
+```
+PJRT_DEVICE=TPU python tpu_launcher.py benchmark.py --accelerator tpu
+PJRT_DEVICE=TPU python tpu_launcher.py pgm/train_pgm.py --accelerator tpu ...
+PJRT_DEVICE=TPU python tpu_launcher.py pgm/train_cf.py --accelerator tpu ...
+```
+Only the master process writes TensorBoard events, plots, logs, and checkpoints.
+The PGM paths depend on Pyro operator coverage in the installed torch-XLA release;
+use a small smoke run before a long experiment.
+
 To run in the background you can append `nohup` to the command: `bash run_local.sh your_experiment_name nohup --accelerator mps`. The script still expects the `med-torch` conda environment for Torch-based runs.
 
 If you want to call the training entrypoint directly, use:

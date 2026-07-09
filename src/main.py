@@ -10,6 +10,7 @@ import torch
 from hps import Hparams
 from simple_vae import VAE
 from train_setup import (
+    derive_save_directories,
     setup_dataloaders,
     setup_directories,
     setup_logging,
@@ -19,6 +20,7 @@ from train_setup import (
 from trainer import trainer
 from utils import EMA, open_file, path_exists, seed_all, select_device, sync_tree
 from vae import HVAE
+from xla_runtime import NullWriter, is_master, is_xla_device, launch, rank, rendezvous
 
 
 def main(args: Hparams):
@@ -66,9 +68,15 @@ def main(args: Hparams):
 
     # setup model save directory, logging and tensorboard summaries
     assert args.exp_name != "", "No experiment name given."
-    args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
-    writer = setup_tensorboard(args, model)
-    logger = setup_logging(args)
+    master = not is_xla_device(args.device) or is_master()
+    if master:
+        args.save_dir = setup_directories(args, ckpt_dir=args.ckpt_dir)
+    else:
+        args.save_dir = derive_save_directories(args, args.ckpt_dir)
+    if is_xla_device(args.device):
+        rendezvous("experiment-directories-ready")
+    writer = setup_tensorboard(args, model) if master else NullWriter()
+    logger = setup_logging(args) if master else logging.getLogger("tpu-worker")
 
     # setup optimizer
     optimizer, scheduler = setup_optimizer(args, model)
@@ -77,6 +85,8 @@ def main(args: Hparams):
         torch.cuda.set_device(args.device)
     model.to(args.device)
     ema.to(args.device)
+    if is_xla_device(args.device):
+        seed_all(args.seed + rank(), args.deterministic)
 
     # load checkpoint state dicts
     if ckpt is not None:
@@ -109,7 +119,7 @@ def main(args: Hparams):
         trainer(args, model, ema, dataloaders, optimizer, scheduler, writer, logger)
     except KeyboardInterrupt:
         print(traceback.format_exc())
-        if input("Training interrupted, keep logs? [Y/n]: ") == "n":
+        if master and input("Training interrupted, keep logs? [Y/n]: ") == "n":
             if input(f"Send '{args.save_dir}' to Trash? [y/N]: ") == "y":
                 send2trash.send2trash(args.save_dir)
                 print("Done.")
@@ -117,7 +127,7 @@ def main(args: Hparams):
         writer.flush()
         writer.close()
         logging.shutdown()
-        if hasattr(args, "remote_save_dir"):
+        if master and hasattr(args, "remote_save_dir"):
             sync_tree(args.save_dir, args.remote_save_dir)
 
 
@@ -127,4 +137,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = add_arguments(parser)
     args = setup_hparams(parser)
-    main(args)
+    if os.environ.get("CAUSAL_GEN_XLA_WORKER") != "1" and (
+        args.accelerator == "tpu"
+        or (
+            args.accelerator == "auto"
+            and os.environ.get("PJRT_DEVICE", "").upper() == "TPU"
+        )
+    ):
+        launch(main, args=(args,))
+    else:
+        main(args)

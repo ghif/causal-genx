@@ -6,6 +6,7 @@ import send2trash
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 from datasets import cmnist, mimic, morphomnist, ukbb
@@ -26,7 +27,7 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
 
     if args.num_workers >= 0:
         num_workers = args.num_workers
-    elif args.device.type == "cuda":
+    elif args.device.type in {"cuda", "xla"}:
         num_workers = min(8, max(2, cpu_count // 2))
     else:
         num_workers = min(4, max(0, cpu_count // 4))
@@ -37,14 +38,14 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
         pin_memory = args.pin_memory == "true"
 
     if args.persistent_workers == "auto":
-        persistent_workers = args.device.type == "cuda" and num_workers > 0
+        persistent_workers = args.device.type in {"cuda", "xla"} and num_workers > 0
     else:
         persistent_workers = args.persistent_workers == "true"
 
     if args.prefetch_factor > 0:
         prefetch_factor = args.prefetch_factor
     else:
-        prefetch_factor = 4 if args.device.type == "cuda" else 2
+        prefetch_factor = 4 if args.device.type in {"cuda", "xla"} else 2
 
     if "ukbb" in args.hps:
         datasets = ukbb(args)
@@ -66,11 +67,27 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
     if num_workers > 0:
         kwargs["persistent_workers"] = persistent_workers
         kwargs["prefetch_factor"] = prefetch_factor
-    dataloaders = {
-        "train": DataLoader(datasets["train"], shuffle=True, drop_last=True, **kwargs),
-        "valid": DataLoader(datasets["valid"], shuffle=False, **kwargs),
-        "test": DataLoader(datasets["test"], shuffle=False, **kwargs),
-    }
+    samplers = {"train": None, "valid": None, "test": None}
+    if args.device.type == "xla":
+        from xla_runtime import rank, world_size
+
+        for split in samplers:
+            samplers[split] = DistributedSampler(
+                datasets[split],
+                num_replicas=world_size(),
+                rank=rank(),
+                shuffle=split == "train",
+                drop_last=split == "train",
+            )
+    dataloaders = {}
+    for split in ("train", "valid", "test"):
+        dataloaders[split] = DataLoader(
+            datasets[split],
+            shuffle=split == "train" and samplers[split] is None,
+            sampler=samplers[split],
+            drop_last=split == "train",
+            **kwargs,
+        )
     return dataloaders
 
 
@@ -127,6 +144,15 @@ def setup_directories(args: Hparams, ckpt_dir: str = "../checkpoints") -> str:
     if is_remote_path(remote_save_dir):
         ensure_dir(remote_save_dir)
     return save_dir
+
+
+def derive_save_directories(args: Hparams, ckpt_dir: str) -> str:
+    parents_folder = "_".join([k[0] for k in args.parents_x])
+    args.parents_folder = parents_folder
+    args.remote_save_dir = os.path.join(ckpt_dir, parents_folder, args.exp_name)
+    if is_remote_path(args.remote_save_dir):
+        return local_staging_path(args.remote_save_dir)
+    return args.remote_save_dir
 
 
 def setup_tensorboard(args: Hparams, model: nn.Module) -> SummaryWriter:

@@ -15,6 +15,16 @@ from tqdm import tqdm
 
 from hps import Hparams
 from utils import linear_warmup, write_images
+from xla_runtime import (
+    autocast,
+    is_master,
+    is_xla_device,
+    mark_step,
+    optimizer_step,
+    reduce_stats,
+    save,
+    wrap_loader,
+)
 
 
 class ThroughputMeter:
@@ -96,8 +106,14 @@ def trainer(
         last_logged_step = 0
 
         mininterval = 300 if "SLURM_JOB_ID" in os.environ else 0.1
+        if training and hasattr(dataloader.sampler, "set_epoch"):
+            dataloader.sampler.set_epoch(args.epoch)
+        device_loader = wrap_loader(dataloader, args.device)
         loader = tqdm(
-            enumerate(dataloader), total=len(dataloader), mininterval=mininterval
+            enumerate(device_loader),
+            total=len(dataloader),
+            mininterval=mininterval,
+            disable=is_xla_device(args.device) and not is_master(),
         )
 
         for i, batch in loader:
@@ -116,7 +132,8 @@ def trainer(
                     )(args.iter)
                     args.beta = beta_value
 
-                out = model(batch["x"], batch["pa"], beta=beta_value)
+                with autocast(args.device, args.precision):
+                    out = model(batch["x"], batch["pa"], beta=beta_value)
                 out["elbo"] = out["elbo"] / args.accu_steps
                 out["elbo"].backward()
 
@@ -129,7 +146,7 @@ def trainer(
                     kl_nan = torch.isnan(out["kl"]).sum()
 
                     if grad_norm < args.grad_skip and nll_nan == 0 and kl_nan == 0:
-                        optimizer.step()
+                        optimizer_step(optimizer, args.device)
                         scheduler.step()
                         ema.update()
                     else:
@@ -144,13 +161,10 @@ def trainer(
                     model.zero_grad(set_to_none=True)
             else:
                 with torch.no_grad():
-                    out = ema.ema_model(batch["x"], batch["pa"], beta=args.beta)
+                    with autocast(args.device, args.precision):
+                        out = ema.ema_model(batch["x"], batch["pa"], beta=args.beta)
 
-            if args.device.type == "cuda":
-                torch.cuda.synchronize()
-            elif args.device.type == "mps":
-                if hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
-                    torch.mps.synchronize()
+            mark_step(args.device)
 
             step_time = time.perf_counter() - step_start
             meter.update(step_time, bs)
@@ -189,9 +203,11 @@ def trainer(
                     },
                     refresh=False,
                 )
+        stats["updates_skipped"] = updates_skipped
+        stats = reduce_stats(stats, args.device)
         result = {}
         for k, v in stats.items():
-            if k in {"n", "beta_n", "grad_norm_n"}:
+            if k in {"n", "beta_n", "grad_norm_n", "updates_skipped"}:
                 continue
             if k in {"beta", "grad_norm"}:
                 denom = stats[f"{k}_n"]
@@ -202,7 +218,7 @@ def trainer(
         result["samples_per_sec"] = meter.avg_samples_per_sec
         result["seconds_per_step"] = meter.avg_step_time
         result["total_time"] = meter.total_time
-        result["skipped_updates"] = updates_skipped
+        result["skipped_updates"] = int(float(stats["updates_skipped"]))
         result["logged_step"] = last_logged_step
         return result
 
@@ -214,6 +230,8 @@ def trainer(
 
     def run_epoch_artifacts(epoch: int, valid_stats: Dict[str, float]):
         n = min(args.context_dim * 5, args.bs)
+        if is_xla_device(args.device) and not is_master():
+            return
         viz_batch = next(iter(dataloaders["valid"]))
         viz_batch = {k: v[:n] for k, v in viz_batch.items()}
         viz_batch = preprocess_batch(args, viz_batch, expand_pa=args.expand_pa)
@@ -241,50 +259,56 @@ def trainer(
             }
             ckpt_path = os.path.join(args.save_dir, "checkpoint.pt")
             ensure_parent_dir(ckpt_path)
-            with open_file(ckpt_path, "wb") as f:
-                torch.save(save_dict, f)
+            if is_xla_device(args.device):
+                save(save_dict, ckpt_path, args.device)
+            else:
+                with open_file(ckpt_path, "wb") as f:
+                    save(save_dict, f, args.device)
             sync_file(ckpt_path, os.path.join(args.remote_save_dir, "checkpoint.pt"))
             logger.info(f"Model saved: {ckpt_path}")
 
     # Start training loop
+    master = not is_xla_device(args.device) or is_master()
     for epoch in range(args.start_epoch, args.epochs):
         args.epoch = epoch + 1
         logger.info(f"Epoch {args.epoch}:")
 
         stats = run_epoch(dataloaders["train"], training=True)
 
-        writer.add_scalar(f"nelbo/train", stats["elbo"], args.epoch)
-        writer.add_scalar(f"nll/train", stats["nll"], args.epoch)
-        writer.add_scalar(f"kl/train", stats["kl"], args.epoch)
-        writer.add_scalar("train/steps_per_sec", stats["steps_per_sec"], args.epoch)
-        writer.add_scalar("train/samples_per_sec", stats["samples_per_sec"], args.epoch)
-        writer.add_scalar("train/seconds_per_step", stats["seconds_per_step"], args.epoch)
-        writer.add_scalar("train/total_time", stats["total_time"], args.epoch)
-        if args.beta_warmup_steps > 0:
-            writer.add_scalar("train/beta_kl", stats["beta"], args.epoch)
-        writer.add_scalar("train/grad_norm", stats["grad_norm"], args.epoch)
-        logger.info(
-            f'=> train | nelbo: {stats["elbo"]:.4f}'
-            + f' - nll: {stats["nll"]:.4f} - kl: {stats["kl"]:.4f}'
-            + f" - steps: {args.iter}"
-            + f" - it/s: {stats['steps_per_sec']:.2f}"
-            + f" - samples/s: {stats['samples_per_sec']:.1f}"
-            + f" - step s: {stats['seconds_per_step']:.4f}"
-            + f" - skipped: {stats['skipped_updates']}"
-        )
+        if master:
+            writer.add_scalar(f"nelbo/train", stats["elbo"], args.epoch)
+            writer.add_scalar(f"nll/train", stats["nll"], args.epoch)
+            writer.add_scalar(f"kl/train", stats["kl"], args.epoch)
+            writer.add_scalar("train/steps_per_sec", stats["steps_per_sec"], args.epoch)
+            writer.add_scalar("train/samples_per_sec", stats["samples_per_sec"], args.epoch)
+            writer.add_scalar("train/seconds_per_step", stats["seconds_per_step"], args.epoch)
+            writer.add_scalar("train/total_time", stats["total_time"], args.epoch)
+            if args.beta_warmup_steps > 0:
+                writer.add_scalar("train/beta_kl", stats["beta"], args.epoch)
+            writer.add_scalar("train/grad_norm", stats["grad_norm"], args.epoch)
+            logger.info(
+                f'=> train | nelbo: {stats["elbo"]:.4f}'
+                + f' - nll: {stats["nll"]:.4f} - kl: {stats["kl"]:.4f}'
+                + f" - steps: {args.iter}"
+                + f" - it/s: {stats['steps_per_sec']:.2f}"
+                + f" - samples/s: {stats['samples_per_sec']:.1f}"
+                + f" - step s: {stats['seconds_per_step']:.4f}"
+                + f" - skipped: {stats['skipped_updates']}"
+            )
 
         if (args.epoch - 1) % args.eval_freq == 0:
             valid_stats = run_epoch(dataloaders["valid"], training=False)
 
-            writer.add_scalar(f"nelbo/valid", valid_stats["elbo"], args.epoch)
-            writer.add_scalar(f"nll/valid", valid_stats["nll"], args.epoch)
-            writer.add_scalar(f"kl/valid", valid_stats["kl"], args.epoch)
-            writer.add_scalar("valid/steps_per_sec", valid_stats["steps_per_sec"], args.epoch)
-            writer.add_scalar("valid/samples_per_sec", valid_stats["samples_per_sec"], args.epoch)
-            writer.add_scalar("valid/seconds_per_step", valid_stats["seconds_per_step"], args.epoch)
-            writer.add_scalar("valid/total_time", valid_stats["total_time"], args.epoch)
+            if master:
+                writer.add_scalar(f"nelbo/valid", valid_stats["elbo"], args.epoch)
+                writer.add_scalar(f"nll/valid", valid_stats["nll"], args.epoch)
+                writer.add_scalar(f"kl/valid", valid_stats["kl"], args.epoch)
+                writer.add_scalar("valid/steps_per_sec", valid_stats["steps_per_sec"], args.epoch)
+                writer.add_scalar("valid/samples_per_sec", valid_stats["samples_per_sec"], args.epoch)
+                writer.add_scalar("valid/seconds_per_step", valid_stats["seconds_per_step"], args.epoch)
+                writer.add_scalar("valid/total_time", valid_stats["total_time"], args.epoch)
             run_epoch_artifacts(args.epoch, valid_stats)
-        if hasattr(args, "remote_save_dir"):
+        if master and hasattr(args, "remote_save_dir"):
             writer.flush()
             sync_tree(args.save_dir, args.remote_save_dir)
     return

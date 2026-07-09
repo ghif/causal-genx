@@ -30,7 +30,11 @@ def seed_all(seed, deterministic=True):
 def select_device(accelerator: str) -> torch.device:
     accelerator = accelerator.lower()
     if accelerator == "auto":
-        if torch.cuda.is_available():
+        from xla_runtime import tpu_environment_available
+
+        if tpu_environment_available():
+            accelerator = "tpu"
+        elif torch.cuda.is_available():
             accelerator = "cuda"
         elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
             accelerator = "mps"
@@ -47,6 +51,10 @@ def select_device(accelerator: str) -> torch.device:
         return torch.device("mps")
     if accelerator == "cpu":
         return torch.device("cpu")
+    if accelerator == "tpu":
+        from xla_runtime import xla_device
+
+        return xla_device()
 
     raise ValueError(f"Unknown accelerator: {accelerator}")
 
