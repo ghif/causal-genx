@@ -22,7 +22,30 @@ from utils import (
 
 
 def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
-    pin_memory = args.device.type == "cuda"
+    cpu_count = os.cpu_count() or 1
+
+    if args.num_workers >= 0:
+        num_workers = args.num_workers
+    elif args.device.type == "cuda":
+        num_workers = min(8, max(2, cpu_count // 2))
+    else:
+        num_workers = min(4, max(0, cpu_count // 4))
+
+    if args.pin_memory == "auto":
+        pin_memory = args.device.type == "cuda"
+    else:
+        pin_memory = args.pin_memory == "true"
+
+    if args.persistent_workers == "auto":
+        persistent_workers = args.device.type == "cuda" and num_workers > 0
+    else:
+        persistent_workers = args.persistent_workers == "true"
+
+    if args.prefetch_factor > 0:
+        prefetch_factor = args.prefetch_factor
+    else:
+        prefetch_factor = 4 if args.device.type == "cuda" else 2
+
     if "ukbb" in args.hps:
         datasets = ukbb(args)
     elif "morphomnist" in args.hps:
@@ -36,10 +59,13 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
 
     kwargs = {
         "batch_size": args.bs,
-        "num_workers": os.cpu_count() // 2,
+        "num_workers": num_workers,
         "pin_memory": pin_memory,
         "worker_init_fn": seed_worker,
     }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = persistent_workers
+        kwargs["prefetch_factor"] = prefetch_factor
     dataloaders = {
         "train": DataLoader(datasets["train"], shuffle=True, drop_last=True, **kwargs),
         "valid": DataLoader(datasets["valid"], shuffle=False, **kwargs),

@@ -124,6 +124,32 @@ def add_arguments(parser: argparse.ArgumentParser):
     # training
     parser.add_argument("--epochs", help="Training epochs.", type=int, default=5000)
     parser.add_argument("--bs", help="Batch size.", type=int, default=32)
+    parser.add_argument(
+        "--num_workers",
+        help="DataLoader workers; use -1 for an accelerator-aware default.",
+        type=int,
+        default=-1,
+    )
+    parser.add_argument(
+        "--pin_memory",
+        help="Pin host memory for faster device transfers: auto/true/false.",
+        type=str,
+        default="auto",
+        choices=["auto", "true", "false"],
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        help="Keep DataLoader workers alive across epochs: auto/true/false.",
+        type=str,
+        default="auto",
+        choices=["auto", "true", "false"],
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        help="DataLoader prefetch factor; use -1 for an accelerator-aware default.",
+        type=int,
+        default=-1,
+    )
     parser.add_argument("--lr", help="Learning rate.", type=float, default=1e-3)
     parser.add_argument(
         "--lr_warmup_steps", help="lr warmup steps.", type=int, default=100
@@ -169,6 +195,12 @@ def add_arguments(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--viz_freq", help="Steps per visualisation.", type=int, default=10000
+    )
+    parser.add_argument(
+        "--speed_log_freq",
+        help="Steps between throughput updates during training.",
+        type=int,
+        default=50,
     )
     parser.add_argument(
         "--eval_freq", help="Train epochs per validation.", type=int, default=5
