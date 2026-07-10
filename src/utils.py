@@ -282,6 +282,29 @@ def postprocess(x):
     return np.clip(x, 0, 255).astype(np.uint8)
 
 
+def _ensure_nhwc(images: np.ndarray) -> np.ndarray:
+    images = np.asarray(images)
+    if images.ndim == 4 and images.shape[1] in (1, 3):
+        return np.transpose(images, (0, 2, 3, 1))
+    return images
+
+
+def _repeat_batch(value: np.ndarray, count: int) -> np.ndarray:
+    value = np.asarray(value)
+    return np.repeat(value[None, ...], count, axis=0)
+
+
+def _morphomnist_counterfactual_parents(base_pa: np.ndarray, source_idx: int, target_idx: int, context_dim: int, input_res: int) -> tuple[np.ndarray, np.ndarray]:
+    pa = _repeat_batch(base_pa[source_idx], context_dim)
+    cf_pa = pa.copy()
+    cf_pa[0, 0] = base_pa[target_idx, 0]
+    cf_pa[1, 1] = base_pa[target_idx, 1]
+    cf_pa[2:, 2:] = np.eye(10, dtype=cf_pa.dtype)
+    pa = np.repeat(np.repeat(pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
+    cf_pa = np.repeat(np.repeat(cf_pa[:, None, None, :], input_res, axis=1), input_res, axis=2)
+    return pa, cf_pa
+
+
 def make_image_grid(images: Sequence[np.ndarray], n_rows: int, n_cols: int) -> np.ndarray:
     rows = [np.asarray(img) for img in images]
     if rows[0].ndim == 3:
@@ -327,37 +350,100 @@ def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterat
 
 
 def write_images(args, model, params, batch, rng_key=None, step: Optional[int] = None):
-    import matplotlib.pyplot as plt
-
-    x = np.asarray(batch["x"])
-    pa = np.asarray(batch["pa"])
-    if x.ndim == 4 and x.shape[1] in (1, 3):
-        x = np.transpose(x, (0, 2, 3, 1))
-    if pa.ndim == 4 and pa.shape[1] in (1, 3):
-        pa = np.transpose(pa, (0, 2, 3, 1))
+    x = _ensure_nhwc(batch["x"])
     model = materialize_nnx(model, params)
-    n = min(getattr(args, "context_dim", x.shape[0]) * 5, x.shape[0])
-    x = x[:n]
-    pa = pa[:n]
+    bs = int(x.shape[0])
     rows = [postprocess(x)]
+
+    def _append_counterfactual_rows(zs, pa_ctx, cf_pa_ctx, x_ctx, alpha, t):
+        x_rec, _ = model.forward_latents(latents=zs, parents=pa_ctx, t=t)
+        x_rec = postprocess(x_rec)
+        rows.append(x_rec.astype(np.uint8))
+
+        cf_x, _ = model.forward_latents(latents=zs, parents=cf_pa_ctx, t=t)
+        cf_x = postprocess(cf_x)
+        rows.append(cf_x.astype(np.uint8))
+        rows.append((cf_x - x_rec).astype(np.uint8))
+
+        if getattr(model, "cond_prior", False):
+            # Match the Torch visualization path: re-abduct on the counterfactual parents
+            # and show the indirect and total effect rows as well.
+            cf_z = model.abduct(x=x_ctx, parents=pa_ctx, cf_parents=cf_pa_ctx, alpha=alpha, t=t)
+            indirect_zs = [z["z"] for z in cf_z]
+
+            x_indirect, _ = model.forward_latents(latents=indirect_zs, parents=pa_ctx, t=t)
+            x_indirect = postprocess(x_indirect)
+            rows.append(x_indirect.astype(np.uint8))
+            rows.append((x_indirect - x_rec).astype(np.uint8))
+
+            x_total, _ = model.forward_latents(latents=indirect_zs, parents=cf_pa_ctx, t=t)
+            x_total = postprocess(x_total)
+            rows.append(x_total.astype(np.uint8))
+            rows.append((x_total - x_rec).astype(np.uint8))
+
     try:
-        zs = model.abduct(x=batch["x"][:n], parents=batch["pa"][:n])
-        latents = [z["z"] if isinstance(z, dict) and "z" in z else z for z in zs]
-        if len(latents) > 0:
-            x_rec, _ = model.forward_latents(latents=latents, parents=batch["pa"][:n], t=0.1)
-            if x_rec.ndim == 4 and x_rec.shape[1] in (1, 3):
-                x_rec = np.transpose(np.asarray(x_rec), (0, 2, 3, 1))
+        zs = model.abduct(x=batch["x"], parents=batch["pa"])
+        n_latents_viz = 0
+        l_points = np.floor(np.linspace(0, 1, n_latents_viz + 2) * len(zs)).astype(int)[1:]
+        for l in l_points:
+            if getattr(model, "cond_prior", False):
+                latents = [zs[i]["z"] for i in range(l)]
+            else:
+                latents = zs[:l]
+            x_rec, _ = model.forward_latents(latents=latents, parents=batch["pa"], t=0.1)
             rows.append(postprocess(x_rec))
     except AttributeError:
         pass
+
     rows.append(postprocess(x * 0))
     for temp in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
-        sample, _ = model.sample(parents=batch["pa"][:n], return_loc=True, t=temp, rng=rng_key)
-        if sample.ndim == 4 and sample.shape[1] in (1, 3):
-            sample = np.transpose(np.asarray(sample), (0, 2, 3, 1))
+        sample, _ = model.sample(parents=batch["pa"], return_loc=True, t=temp, rng=rng_key)
         rows.append(postprocess(sample))
     rows.append(postprocess(x * 0))
-    grid = make_image_grid(rows, n_rows=len(rows), n_cols=n)
+
+    if "morphomnist" in getattr(args, "hps", ""):
+        base_pa = np.asarray(batch["pa"])
+        if base_pa.ndim == 4:
+            base_pa = base_pa[:, 0, 0, :]
+        idx = np.arange(bs)
+        np.random.RandomState(1).shuffle(idx)
+        alpha, t = 0.6, 0.5
+        for l in l_points:
+            rows.append(postprocess(x * 0))
+            for ii in range(bs):
+                if getattr(model, "cond_prior", False):
+                    x_ctx = _repeat_batch(x[ii], args.context_dim)
+                else:
+                    x_ctx = None
+                pa_ctx, cf_pa_ctx = _morphomnist_counterfactual_parents(
+                    base_pa=base_pa,
+                    source_idx=ii,
+                    target_idx=idx[ii],
+                    context_dim=args.context_dim,
+                    input_res=args.input_res,
+                )
+                z_i = []
+                for z in zs:
+                    if getattr(model, "cond_prior", False):
+                        z_dict = {}
+                        for k, v in z.items():
+                            z_dict[k] = _repeat_batch(np.asarray(v[ii]), args.context_dim)
+                        z_i.append(z_dict)
+                    else:
+                        z_i.append(_repeat_batch(np.asarray(z[ii]), args.context_dim))
+                if getattr(model, "cond_prior", False):
+                    latents = [z_i[j]["z"] for j in range(l)]
+                else:
+                    latents = z_i[:l]
+                _append_counterfactual_rows(latents, pa_ctx, cf_pa_ctx, x_ctx, alpha, t)
+                rows.append(postprocess(x * 0))
+
+    for j, img in enumerate(rows):
+        if img.shape[0] < bs:
+            pad = np.zeros((bs - img.shape[0], *img.shape[1:]), dtype=np.uint8)
+            rows[j] = np.concatenate([img, pad], axis=0)
+
+    grid = make_image_grid(rows, n_rows=len(rows), n_cols=bs)
     viz_step = int(step if step is not None else getattr(args, "iter", 0))
     viz_path = os.path.join(args.save_dir, f"viz-{viz_step}.png")
     imageio.imwrite(viz_path, grid)
