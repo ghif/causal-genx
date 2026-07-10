@@ -1,0 +1,16 @@
+# CPU-only JAX stack for causal-genx
+# Install into a fresh conda env, then `pip install -r causal-genx/requirements.txt`
+
+jax[cpu]
+flax
+optax
+orbax-checkpoint
+tensorboard
+numpy<2
+pandas
+pillow
+imageio
+matplotlib
+fsspec
+scipy
+gcsfs==2024.6.1
