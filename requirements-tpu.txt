@@ -1,0 +1,20 @@
+# TPU setup for causal-genx
+# Install into a fresh env, then:
+#   pip install -r causal-genx/requirements-tpu.txt
+#
+# Official JAX guidance for Google Cloud TPU:
+#   pip install -U "jax[tpu]"
+
+jax[tpu]
+flax
+optax
+orbax-checkpoint
+tensorboard
+numpy<2
+pandas
+pillow
+imageio
+matplotlib
+fsspec
+scipy
+gcsfs==2024.6.1

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+from runtime import configure_backend_from_argv
+
+configure_backend_from_argv()
 
 from typing import Dict, List, Optional
 
@@ -340,8 +341,9 @@ class Decoder(nnx.Module):
                 self.biases[str(res)] = nnx.Param(jnp.zeros((1, res, res, width), dtype=jnp.float32))
 
     def drop_cond(self, rng):
-        opt = int(jax.random.randint(rng, (), 0, 3))
-        return [(0, 1), (1, 0), (1, 1)][opt]
+        options = jnp.array([[0, 1], [1, 0], [1, 1]], dtype=jnp.int32)
+        opt = jax.random.randint(rng, (), 0, options.shape[0])
+        return options[opt, 0], options[opt, 1]
 
     def __call__(self, parents, x=None, t=None, abduct=False, latents=None, rng=None, training=False):
         if rng is None:

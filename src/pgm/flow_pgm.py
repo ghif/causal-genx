@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+from runtime import configure_backend_from_argv
+
+configure_backend_from_argv()
 
 from typing import Dict, Optional
 

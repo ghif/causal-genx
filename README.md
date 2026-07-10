@@ -39,6 +39,8 @@ Current development focus is **MorphoMNIST on Mac CPU**, which is the primary ac
 📦causal-genx
  ┣ 📜README.md                        # this file
  ┣ 📜requirements.txt                # CPU-only JAX environment dependencies
+ ┣ 📜requirements-gpu.txt             # NVIDIA GPU / A100 dependencies
+ ┣ 📜requirements-tpu.txt             # Google Cloud TPU dependencies
  ┣ 📜jax-porting.md                  # migration and parity plan
  ┗ 📂src                             # main source code directory
    ┣ 📜__init__.py
@@ -69,16 +71,30 @@ The current port is intentionally CPU-first and keeps the model and artifact lay
 
 ### Requirements
 
-Create and activate a CPU JAX environment, then install the dependencies listed in `requirements.txt`.
+Create and activate a backend-specific JAX environment, then install the matching requirements file.
 
 ```bash
 conda activate med-jax
 pip install -r requirements.txt
 ```
 
+For NVIDIA GPU / A100:
+
+```bash
+pip install -r requirements-gpu.txt
+```
+
+For Google Cloud TPU:
+
+```bash
+pip install -r requirements-tpu.txt
+```
+
 The port expects:
 
 - `jax[cpu]`
+- `jax[cuda13]` for NVIDIA GPU
+- `jax[tpu]` for TPU
 - `flax`
 - `optax`
 - `orbax-checkpoint`

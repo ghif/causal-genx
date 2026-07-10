@@ -23,6 +23,8 @@ def _make_hparams(**kwargs) -> Hparams:
 
 
 HPARAMS_REGISTRY["morphomnist"] = _make_hparams(
+    accelerator="cpu",
+    precision="fp32",
     lr=1e-3,
     bs=32,
     wd=0.01,
@@ -59,13 +61,12 @@ HPARAMS_REGISTRY["morphomnist"] = _make_hparams(
     ckpt_dir="checkpoints",
     remote_ckpt_dir="gs://medical-airnd/causal-gen/checkpoints",
     resume="",
-    precision="fp32",
 )
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    parser.add_argument("--accelerator", type=str, default="cpu", choices=["cpu"])
-    parser.add_argument("--precision", type=str, default="fp32", choices=["fp32"])
+    parser.add_argument("--accelerator", type=str, default="cpu", choices=["cpu", "gpu", "tpu"])
+    parser.add_argument("--precision", type=str, default="fp32", choices=["fp32", "bf16"])
     parser.add_argument("--exp_name", type=str, default="")
     parser.add_argument("--data_dir", type=str, default="gs://medical-airnd/causal-gen/datasets/morphomnist")
     parser.add_argument("--ckpt_dir", type=str, default="checkpoints")

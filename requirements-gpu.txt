@@ -1,0 +1,22 @@
+# GPU setup for causal-genx
+# Install into a fresh env, then:
+#   pip install -r causal-genx/requirements-gpu.txt
+#
+# Official JAX guidance for NVIDIA GPUs:
+#   pip install -U "jax[cuda13]"
+# If you need CUDA 12 instead, swap the JAX line below for:
+#   pip install -U "jax[cuda12]"
+
+jax[cuda13]
+flax
+optax
+orbax-checkpoint
+tensorboard
+numpy<2
+pandas
+pillow
+imageio
+matplotlib
+fsspec
+scipy
+gcsfs==2024.6.1

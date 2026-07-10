@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import os
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-os.environ.setdefault("ROCM_VISIBLE_DEVICES", "")
-os.environ.setdefault("TPU_VISIBLE_DEVICES", "")
-
 import argparse
+import os
 import logging
+
+from runtime import configure_backend_from_argv
+
+configure_backend_from_argv()
 
 import jax
 import jax.numpy as jnp

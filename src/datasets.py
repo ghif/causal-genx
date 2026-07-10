@@ -7,6 +7,10 @@ import struct
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from runtime import configure_backend_from_argv
+
+configure_backend_from_argv()
+
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
@@ -75,12 +79,16 @@ class MorphoMNIST:
         columns: Optional[List[str]] = None,
         norm: Optional[str] = None,
         concat_pa: bool = True,
+        pad: int = 4,
+        input_res: int = 32,
     ):
         self.train = train
         self.transform = transform
         self.columns = columns
         self.concat_pa = concat_pa
         self.norm = norm
+        self.pad = pad
+        self.input_res = input_res
         cols_not_digit = [c for c in self.columns if c != "digit"]
         images, labels, metrics_df = load_morphomnist_like(root_dir, train, cols_not_digit)
         self.images = np.asarray(images)
@@ -112,6 +120,26 @@ class MorphoMNIST:
             sample.update({k: v[idx] for k, v in self.samples.items()})
         return sample
 
+    def make_batch(self, batch_idx, rng=None, shuffle: bool = False):
+        batch_idx = np.asarray(batch_idx, dtype=np.int64)
+        sample = {"x": self.images[batch_idx].astype(np.float32)[:, None, ...]}
+        if self.transform is not None:
+            if self.train:
+                sample["x"] = _batch_train_transform(sample["x"], pad=self.pad, input_res=self.input_res, rng=rng)
+            else:
+                sample["x"] = _batch_eval_transform(sample["x"], pad=2, input_res=self.input_res)
+        if self.concat_pa:
+            parts = []
+            for k, values in self.samples.items():
+                v = np.asarray(values[batch_idx], dtype=np.float32)
+                if k != "digit":
+                    v = v[:, None]
+                parts.append(v)
+            sample["pa"] = np.concatenate(parts, axis=1).astype(np.float32)
+        else:
+            sample.update({k: np.asarray(v[batch_idx], dtype=np.float32) for k, v in self.samples.items()})
+        return sample
+
 
 def _train_transform(x, pad=4, input_res=32):
     img = Image.fromarray(np.squeeze(x).astype(np.uint8))
@@ -124,6 +152,22 @@ def _train_transform(x, pad=4, input_res=32):
     return np.asarray(img, dtype=np.float32)[None, ...]
 
 
+def _batch_train_transform(x, pad=4, input_res=32, rng=None):
+    images = np.asarray(x, dtype=np.float32)
+    if pad:
+        images = np.pad(images, ((0, 0), (0, 0), (pad, pad), (pad, pad)), mode="constant")
+    max_top = max(0, images.shape[2] - input_res)
+    max_left = max(0, images.shape[3] - input_res)
+    rng = rng or np.random.default_rng()
+    tops = rng.integers(0, max_top + 1, size=images.shape[0]) if max_top > 0 else np.zeros((images.shape[0],), dtype=np.int64)
+    lefts = rng.integers(0, max_left + 1, size=images.shape[0]) if max_left > 0 else np.zeros((images.shape[0],), dtype=np.int64)
+    crops = [
+        images[i : i + 1, :, top : top + input_res, left : left + input_res]
+        for i, (top, left) in enumerate(zip(tops, lefts))
+    ]
+    return np.concatenate(crops, axis=0)
+
+
 def _eval_transform(x, pad=2, input_res=32):
     img = Image.fromarray(np.squeeze(x).astype(np.uint8))
     if pad:
@@ -131,6 +175,21 @@ def _eval_transform(x, pad=2, input_res=32):
     if img.size != (input_res, input_res):
         img = img.resize((input_res, input_res), resample=Image.Resampling.BILINEAR)
     return np.asarray(img, dtype=np.float32)[None, ...]
+
+
+def _batch_eval_transform(x, pad=2, input_res=32):
+    images = np.asarray(x, dtype=np.float32)
+    if pad:
+        images = np.pad(images, ((0, 0), (0, 0), (pad, pad), (pad, pad)), mode="constant")
+    if images.shape[2] == input_res and images.shape[3] == input_res:
+        return images
+    out = []
+    for img in images:
+        pil = Image.fromarray(np.squeeze(img).astype(np.uint8))
+        if pil.size != (input_res, input_res):
+            pil = pil.resize((input_res, input_res), resample=Image.Resampling.BILINEAR)
+        out.append(np.asarray(pil, dtype=np.float32)[None, ...])
+    return np.concatenate(out, axis=0)
 
 
 def morphomnist(args: Hparams) -> Dict[str, MorphoMNIST]:
@@ -147,5 +206,7 @@ def morphomnist(args: Hparams) -> Dict[str, MorphoMNIST]:
             columns=args.parents_x,
             norm=args.context_norm,
             concat_pa=args.concat_pa,
+            pad=args.pad,
+            input_res=args.input_res,
         )
     return datasets
