@@ -8,6 +8,7 @@ from runtime import configure_backend_from_argv
 
 configure_backend_from_argv()
 
+import jax
 from flax import nnx
 
 from datasets import morphomnist
@@ -40,6 +41,12 @@ def main(args):
     ensure_dir(args.save_dir)
     ensure_dir(args.checkpoint_dir)
     logger = setup_logging(args)
+    logger.info(
+        "runtime accelerator=%s backend=%s local_device_count=%d",
+        args.accelerator,
+        jax.default_backend(),
+        jax.local_device_count(),
+    )
     logger.info("loading datasets")
     writer = setup_tensorboard(args)
     datasets = morphomnist(args)

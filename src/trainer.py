@@ -36,6 +36,31 @@ def preprocess_batch(args, batch, expand_pa: bool = False):
     return {"x": x, "pa": pa}
 
 
+def _block_until_ready(tree):
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return tree
+    leaves[0].block_until_ready()
+    return tree
+
+
+def _unreplicate(tree):
+    return jax.tree_util.tree_map(lambda x: x[0], tree)
+
+
+def _shard_batch(batch, n_devices: int):
+    def _reshape(x):
+        x = jnp.asarray(x)
+        if x.shape[0] % n_devices != 0:
+            raise ValueError(
+                f"Batch size {x.shape[0]} must be divisible by local device count {n_devices} for TPU replication."
+            )
+        per_device = x.shape[0] // n_devices
+        return x.reshape((n_devices, per_device) + x.shape[1:])
+
+    return jax.tree_util.tree_map(_reshape, batch)
+
+
 @dataclass
 class TrainState:
     params: Any
@@ -93,6 +118,26 @@ def make_eval_step(graphdef):
         return model(batch["x"], batch["pa"], beta=beta, rng=rng)
 
     return jax.jit(_step)
+
+
+def make_pmap_train_step(graphdef, tx, ema_decay: float):
+    def _step(params, opt_state, ema_params, batch, beta, rng):
+        def _loss(p):
+            return loss_fn(graphdef, p, batch, beta, rng)
+
+        (_, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
+        grads = jax.lax.pmean(grads, axis_name="devices")
+        out = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="devices"), out)
+        updates, new_opt_state = tx.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        new_ema = jax.tree_util.tree_map(
+            lambda e, p: ema_decay * e + (1.0 - ema_decay) * p,
+            ema_params,
+            new_params,
+        )
+        return new_params, new_opt_state, new_ema, out
+
+    return jax.pmap(_step, axis_name="devices", in_axes=(None, None, None, 0, None, 0))
 
 
 def _tree_allclose(a, b, atol: float = 1e-6, rtol: float = 1e-6) -> bool:
@@ -163,7 +208,22 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
     valid_iter = batch_iterator(datasets["valid"], args.bs, False, args.seed + 1)
     steps_per_epoch = max(1, len(datasets["train"]) // args.bs)
     total_train_steps = steps_per_epoch * max(1, args.epochs - state.epoch)
-    train_step_fn = make_train_step(graphdef, tx, state.ema.decay)
+    use_tpu_pmap = args.accelerator == "tpu" and jax.local_device_count() > 1
+    device_count = jax.local_device_count() if use_tpu_pmap else 1
+    if use_tpu_pmap and args.bs % device_count != 0:
+        raise ValueError(
+            f"Global batch size {args.bs} must be divisible by TPU local device count {device_count}."
+        )
+    if use_tpu_pmap:
+        logger.info(
+            "tpu_multi_core_training=enabled local_device_count=%d global_batch_size=%d per_device_batch_size=%d",
+            device_count,
+            args.bs,
+            args.bs // device_count,
+        )
+        train_step_fn = make_pmap_train_step(graphdef, tx, state.ema.decay)
+    else:
+        train_step_fn = make_train_step(graphdef, tx, state.ema.decay)
     eval_step_fn = make_eval_step(graphdef)
     beta_warmup = linear_warmup(args.beta_warmup_steps) if getattr(args, "beta_warmup_steps", 0) > 0 else None
 
@@ -179,7 +239,24 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             rng = jax.random.PRNGKey(args.seed + state.step + step + epoch * 1000)
             beta_scale = float(beta_warmup(state.step)) if beta_warmup is not None else 1.0
             beta = args.beta * beta_scale
-            new_params, new_opt_state, new_ema_params, out = train_step_fn(state.params, state.opt_state, state.ema.params, batch, beta, rng)
+            if use_tpu_pmap:
+                batch = _shard_batch(batch, device_count)
+                rng = jax.random.split(rng, device_count)
+            new_params, new_opt_state, new_ema_params, out = train_step_fn(
+                state.params,
+                state.opt_state,
+                state.ema.params,
+                batch,
+                beta,
+                rng,
+            )
+            if use_tpu_pmap:
+                new_params = _unreplicate(_block_until_ready(new_params))
+                new_opt_state = _unreplicate(_block_until_ready(new_opt_state))
+                new_ema_params = _unreplicate(_block_until_ready(new_ema_params))
+                out = _unreplicate(_block_until_ready(out))
+            else:
+                _block_until_ready(out)
             state = TrainState(
                 params=new_params,
                 opt_state=new_opt_state,
@@ -247,6 +324,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
         valid_batch = preprocess_batch(args, next(valid_iter), expand_pa=True)
         valid_beta = args.beta * (float(beta_warmup(state.step)) if beta_warmup is not None else 1.0)
         valid_out = eval_step_fn(state.ema.params, valid_batch, valid_beta, jax.random.PRNGKey(args.seed + epoch))
+        _block_until_ready(valid_out)
         if float(valid_out["elbo"]) < state.best_loss:
             state.best_loss = float(valid_out["elbo"])
             save_state(args, state, tx, epoch + 1)
@@ -260,7 +338,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 state.ema.params,
                 valid_batch,
                 jax.random.PRNGKey(args.seed + epoch),
-                step=epoch + 1,
+                step=state.step,
             )
             logger.info("viz_image=%s", viz_path)
         epoch_time = time.perf_counter() - t0

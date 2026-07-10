@@ -55,6 +55,7 @@ run_cmd=(python -u main.py
   --beta=1
   --cond_prior
   --viz_freq=1
+  --viz_batch_size=32
   --eval_freq=4
   "${extra_args[@]}")
 

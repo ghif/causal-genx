@@ -54,6 +54,7 @@ HPARAMS_REGISTRY["morphomnist"] = _make_hparams(
     accu_steps=1,
     eval_freq=5,
     viz_freq=10000,
+    viz_batch_size=32,
     seed=7,
     deterministic=False,
     ema_rate=0.999,
@@ -97,6 +98,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--beta_warmup_steps", type=int, default=0)
     parser.add_argument("--kl_free_bits", type=float, default=0.0)
     parser.add_argument("--viz_freq", type=int, default=10000)
+    parser.add_argument("--viz_batch_size", type=int, default=32)
     parser.add_argument("--speed_log_freq", type=int, default=50)
     parser.add_argument("--eval_freq", type=int, default=5)
     parser.add_argument("--checkpoint_smoke_test", action="store_true", default=False)

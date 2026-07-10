@@ -14,6 +14,9 @@ unset JAX_PLATFORMS
 unset JAX_PLATFORM_NAME
 
 exp_name="${1:-tpu_run_$(date +%Y%m%d_%H%M%S)}"
+echo "Launching TPU training for $exp_name"
+echo "Expected mode: single-core on v6e-1 or multi-core on v6e-4 when JAX exposes 4 local TPU devices"
+
 extra_args=()
 run_nohup=false
 run_smoke=false
@@ -56,6 +59,7 @@ run_cmd=(python -u main.py
   --beta=1
   --cond_prior
   --viz_freq=1
+  --viz_batch_size=32
   --eval_freq=4
   "${extra_args[@]}")
 
