@@ -54,6 +54,7 @@ run_cmd=(python -u main.py
   --wd=0.01
   --beta=1
   --cond_prior
+  --viz_freq=1
   --eval_freq=4
   "${extra_args[@]}")
 

@@ -56,6 +56,7 @@ run_cmd=(python -u main.py
   --beta=1
   --cond_prior
   --eval_freq=4
+  --viz_freq=1
   "${extra_args[@]}")
 
 if [ "$run_nohup" = true ]
