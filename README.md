@@ -127,7 +127,7 @@ bash run_local.sh my_experiment
 The launcher accepts extra arguments and forwards them to `main.py`, so you can override the defaults when needed:
 
 ```bash
-bash run_local.sh my_experiment --bs 32 --epochs 500 --eval_freq 4
+bash run_local.sh my_experiment --bs 32 --epochs 500 --eval_freq 4 --viz_batch_size 32
 ```
 
 To run in the background:
@@ -150,7 +150,7 @@ To override GPU defaults:
 
 ```bash
 cd causal-genx/src
-bash run_gpu.sh my_experiment --bs 128 --precision bf16 --eval_freq 4
+bash run_gpu.sh my_experiment --bs 128 --precision bf16 --eval_freq 4 --viz_batch_size 32
 ```
 
 For Google Cloud TPU, use the TPU launcher:
@@ -164,7 +164,7 @@ To override TPU defaults:
 
 ```bash
 cd causal-genx/src
-bash run_tpu.sh my_experiment --bs 32 --precision bf16 --eval_freq 4
+bash run_tpu.sh my_experiment --bs 32 --precision bf16 --eval_freq 4 --viz_batch_size 32
 ```
 
 You can also call the entrypoint directly:
@@ -202,7 +202,7 @@ If you want to add a new dataset or causal mechanism, the rough flow is:
 
 ### Checkpointing
 
-The JAX port now uses **Orbax checkpoint directories** for persistence. Each run writes its training state under a checkpoint root inside the experiment folder:
+The JAX port now uses **Orbax checkpoint directories** for persistence. Each run writes its training state under a checkpoint root inside the experiment run folder:
 
 ```text
 <ckpt_dir>/<hps>/<exp_name>/checkpoints/
@@ -243,13 +243,13 @@ If you are resuming from the mirrored GCS tree, use the remote checkpoint root i
 --resume gs://medical-airnd/causal-gen/checkpoints/morphomnist/my_experiment/checkpoints
 ```
 
-By default, local training also mirrors the full experiment tree to GCS under:
+By default, local training also mirrors the full experiment run tree to GCS under:
 
 ```text
 gs://medical-airnd/causal-gen/checkpoints/<hps>/<exp_name>/
 ```
 
-That means the same Orbax checkpoint root is available locally and in the bucket after each save.
+That means the same Orbax checkpoint root is available locally and in the bucket after each save, and the checkpoint data stays under the run's `checkpoints/` subfolder in both places.
 
 Visualization artifacts follow the same training-step convention and are written as:
 

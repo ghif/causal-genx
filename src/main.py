@@ -15,7 +15,7 @@ from datasets import morphomnist
 from hps import add_arguments, setup_hparams
 from models import HVAE, SimpleVAE
 from trainer import init_state, trainer
-from utils import SummaryWriter, checkpoint_root_dir, ensure_dir, load_checkpoint, seed_all
+from utils import SummaryWriter, checkpoint_root_dir, ensure_dir, experiment_run_dir, load_checkpoint, seed_all
 
 
 def setup_logging(args):
@@ -35,9 +35,10 @@ def setup_tensorboard(args):
 
 def main(args):
     seed_all(args.seed, args.deterministic)
-    args.save_dir = os.path.join(args.ckpt_dir, args.hps, args.exp_name or "run")
+    args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "run")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
-    args.remote_save_dir = os.path.join(args.remote_ckpt_dir, args.hps, args.exp_name or "run") if getattr(args, "remote_ckpt_dir", "") else ""
+    remote_run_dir = experiment_run_dir(args.remote_ckpt_dir, args.hps, args.exp_name, "run")
+    args.remote_save_dir = remote_run_dir
     ensure_dir(args.save_dir)
     ensure_dir(args.checkpoint_dir)
     logger = setup_logging(args)

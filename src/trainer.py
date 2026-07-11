@@ -206,20 +206,21 @@ def save_state(
     path = args.checkpoint_dir
     metadata = {"epoch": epoch, "best_loss": float(state.best_loss)}
     if artifact_writer is not None and not wait:
-        remote_save_dir = getattr(args, "remote_save_dir", "")
+        remote_run_dir = getattr(args, "remote_save_dir", "")
         return artifact_writer.submit_checkpoint(
             ckpt,
             path,
             step=state.step,
             custom_metadata=metadata,
-            local_tree_dir=args.checkpoint_dir if remote_save_dir else None,
-            remote_tree_dir=os.path.join(remote_save_dir, "checkpoints") if remote_save_dir else None,
+            local_tree_dir=args.checkpoint_dir if remote_run_dir else None,
+            remote_tree_dir=os.path.join(remote_run_dir, "checkpoints") if remote_run_dir else None,
         )
     save_checkpoint(ckpt, path, step=state.step, custom_metadata=metadata)
-    if getattr(args, "remote_save_dir", ""):
+    remote_run_dir = getattr(args, "remote_save_dir", "")
+    if remote_run_dir:
         from utils import sync_tree
 
-        sync_tree(args.checkpoint_dir, os.path.join(args.remote_save_dir, "checkpoints"))
+        sync_tree(args.checkpoint_dir, os.path.join(remote_run_dir, "checkpoints"))
     return path
 
 

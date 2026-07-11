@@ -134,6 +134,12 @@ def checkpoint_root_dir(save_dir: str) -> str:
     return os.path.abspath(os.path.join(save_dir, "checkpoints"))
 
 
+def experiment_run_dir(root_dir: str, hps: str, exp_name: str, default_name: str) -> str:
+    if not root_dir:
+        return ""
+    return os.path.join(root_dir, hps, exp_name or default_name)
+
+
 def materialize_nnx(graphdef, params):
     return nnx.merge(graphdef, nnx.State(params))
 
@@ -429,13 +435,13 @@ def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterat
 
 
 def write_images(args, model, params, batch, rng_key=None, step: Optional[int] = None):
-    viz_bs = int(getattr(args, "viz_bs", 32))
+    viz_batch_size = int(getattr(args, "viz_batch_size", getattr(args, "viz_bs", 32)))
     x = _ensure_nhwc(np.asarray(batch["x"]))
-    viz_bs = max(1, min(viz_bs, x.shape[0]))
-    batch = {k: v[:viz_bs] for k, v in batch.items()}
+    viz_batch_size = max(1, min(viz_batch_size, x.shape[0]))
+    batch = {k: v[:viz_batch_size] for k, v in batch.items()}
     x = _ensure_nhwc(np.asarray(batch["x"]))
     model = materialize_nnx(model, params)
-    bs = int(min(getattr(args, "viz_batch_size", 32), x.shape[0]))
+    bs = int(min(viz_batch_size, x.shape[0]))
     x = x[:bs]
     x_jax = jnp.asarray(batch["x"])[:bs]
     pa_jax = jnp.asarray(batch["pa"])[:bs]
@@ -530,8 +536,9 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
     viz_step = int(step if step is not None else getattr(args, "iter", 0))
     viz_path = viz_path_for_step(args.save_dir, viz_step)
     imageio.imwrite(viz_path, grid)
-    if getattr(args, "remote_save_dir", ""):
-        sync_file(viz_path, viz_path_for_step(args.remote_save_dir, viz_step))
+    remote_run_dir = getattr(args, "remote_save_dir", "")
+    if remote_run_dir:
+        sync_file(viz_path, viz_path_for_step(remote_run_dir, viz_step))
     return viz_path
 
 
