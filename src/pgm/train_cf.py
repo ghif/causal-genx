@@ -18,15 +18,17 @@ from pgm.dscm import DSCM
 from pgm.flow_pgm import MorphoMNISTPGM
 from models import HVAE
 from trainer import preprocess_batch
-from utils import SummaryWriter, ensure_dir, load_checkpoint, seed_all
+from utils import EvalOnlyFileFilter, SummaryWriter, SyncFileHandler, ensure_dir, load_checkpoint, seed_all
 
 
 def setup_logging(args):
     ensure_dir(args.save_dir)
+    file_handler = SyncFileHandler(os.path.join(args.save_dir, "trainlog.txt"))
+    file_handler.addFilter(EvalOnlyFileFilter())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt"))],
+        handlers=[logging.StreamHandler(), file_handler],
         force=True,
     )
     return logging.getLogger("causal-genx-cf")

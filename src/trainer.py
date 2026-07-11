@@ -16,7 +16,7 @@ import numpy as np
 import optax
 from flax import nnx
 
-from utils import BackgroundArtifactWriter, EMA, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint
+from utils import BackgroundArtifactWriter, EMA, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, write_images
 
 
 def preprocess_batch(args, batch, expand_pa: bool = False):
@@ -367,16 +367,15 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                         writer.add_scalar("speed/eta_sec", eta_sec, state.step)
 
                 if getattr(args, "checkpoint_smoke_test", False):
-                    if args.viz_freq:
-                        viz_path = artifact_writer.submit_viz(
-                            args,
-                            graphdef,
-                            state.ema.params,
-                            batch,
-                            jax.random.PRNGKey(args.seed + state.step),
-                            step=state.step,
-                        )
-                        logger.info("viz_image=%s", viz_path)
+                    viz_path = write_images(
+                        args,
+                        graphdef,
+                        state.ema.params,
+                        batch,
+                        jax.random.PRNGKey(args.seed + state.step),
+                        step=state.step,
+                    )
+                    logger.info("viz_image=%s", viz_path)
                     if state.step >= max(1, args.checkpoint_smoke_steps):
                         artifact_writer.flush()
                         checkpoint_smoke_test(args, state, tx, logger)
@@ -424,8 +423,9 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 writer.add_scalar("valid/elbo", valid_nelbo, epoch + 1)
                 writer.add_scalar("valid/nll", valid_nll, epoch + 1)
                 writer.add_scalar("valid/kl", valid_kl, epoch + 1)
-            if args.viz_freq and not getattr(args, "checkpoint_smoke_test", False) and (epoch + 1) % args.viz_freq == 0:
-                viz_path = artifact_writer.submit_viz(
+            eval_due = (epoch + 1) % max(1, args.eval_freq) == 0
+            if not getattr(args, "checkpoint_smoke_test", False) and eval_due:
+                viz_path = write_images(
                     args,
                     graphdef,
                     state.ema.params,
@@ -433,7 +433,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     jax.random.PRNGKey(args.seed + epoch),
                     step=state.step,
                 )
-                logger.info("viz_image=%s", viz_path)
+                logger.info("viz_image=%s", viz_path, extra={"eval_log": True})
             epoch_time = time.perf_counter() - t0
             epoch_iter_per_sec = steps_per_epoch / max(epoch_time, 1e-12)
             epoch_sample_per_sec = steps_per_epoch * args.bs / max(epoch_time, 1e-12)
@@ -445,14 +445,16 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 state.step,
                 epoch_iter_per_sec,
                 epoch_sample_per_sec,
+                extra={"eval_log": eval_due},
             )
-            if epoch % max(1, args.eval_freq) == 0:
+            if eval_due:
                 logger.info(
                     "=> valid | nelbo: %.4f - nll: %.4f - kl: %.4f - steps: %d",
                     valid_nelbo,
                     valid_nll,
                     valid_kl,
                     state.step,
+                    extra={"eval_log": True},
                 )
                 logger.info(
                     "epoch=%d epoch_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
@@ -460,6 +462,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     epoch_time,
                     epoch_iter_per_sec,
                     epoch_sample_per_sec,
+                    extra={"eval_log": True},
                 )
             else:
                 logger.info(

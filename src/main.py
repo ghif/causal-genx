@@ -15,15 +15,17 @@ from datasets import morphomnist
 from hps import add_arguments, setup_hparams
 from models import HVAE, SimpleVAE
 from trainer import init_state, trainer
-from utils import SummaryWriter, checkpoint_root_dir, ensure_dir, experiment_run_dir, load_checkpoint, seed_all
+from utils import EvalOnlyFileFilter, SummaryWriter, SyncFileHandler, checkpoint_root_dir, ensure_dir, experiment_run_dir, load_checkpoint, seed_all
 
 
 def setup_logging(args):
     ensure_dir(args.save_dir)
+    file_handler = SyncFileHandler(os.path.join(args.save_dir, "trainlog.txt"))
+    file_handler.addFilter(EvalOnlyFileFilter())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt"))],
+        handlers=[logging.StreamHandler(), file_handler],
         force=True,
     )
     return logging.getLogger("causal-genx")

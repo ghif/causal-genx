@@ -18,15 +18,17 @@ from datasets import morphomnist
 from hps import add_arguments, setup_hparams
 from pgm.flow_pgm import MorphoMNISTPGM
 from trainer import preprocess_batch
-from utils import BackgroundArtifactWriter, SummaryWriter, checkpoint_root_dir, ensure_dir, experiment_run_dir, materialize_nnx, seed_all
+from utils import BackgroundArtifactWriter, SummaryWriter, SyncFileHandler, EvalOnlyFileFilter, checkpoint_root_dir, ensure_dir, experiment_run_dir, materialize_nnx, seed_all
 
 
 def setup_logging(args):
     ensure_dir(args.save_dir)
+    file_handler = SyncFileHandler(os.path.join(args.save_dir, "trainlog.txt"))
+    file_handler.addFilter(EvalOnlyFileFilter())
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt"))],
+        handlers=[logging.StreamHandler(), file_handler],
         force=True,
     )
     return logging.getLogger("causal-genx-pgm")

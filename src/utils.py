@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import logging
 import os
 import random
 import shutil
@@ -19,6 +20,22 @@ import imageio.v2 as imageio
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+class EvalOnlyFileFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return bool(getattr(record, "eval_log", False) or record.levelno >= logging.WARNING)
+
+
+class SyncFileHandler(logging.FileHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        if self.stream is not None and not self.stream.closed:
+            self.flush()
+            try:
+                os.fsync(self.stream.fileno())
+            except OSError:
+                pass
 
 class _NoOpMonitoring:
     def record_scalar(self, *args, **kwargs):

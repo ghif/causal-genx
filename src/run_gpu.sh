@@ -31,7 +31,6 @@ if [ "$run_smoke" = true ]
 then
   extra_args+=(
     --epochs=1
-    --viz_freq=1
     --checkpoint_smoke_test
     --checkpoint_smoke_steps=1
     --eval_freq=1000000
@@ -54,7 +53,6 @@ run_cmd=(python -u main.py
   --wd=0.01
   --beta=1
   --cond_prior
-  --viz_freq=50
   --viz_batch_size=32
   --eval_freq=10
   --checkpoint_freq=50
