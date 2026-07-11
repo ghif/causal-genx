@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import atexit
 import io
 import os
 import random
 import shutil
 import tempfile
+import threading
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 import time
@@ -200,6 +203,78 @@ def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None,
         manager.wait_until_finished()
     finally:
         manager.close()
+
+
+def _save_checkpoint_and_sync(
+    data: Dict[str, Any],
+    path: str,
+    step: Optional[int],
+    custom_metadata: Optional[Dict[str, Any]],
+    local_tree_dir: Optional[str],
+    remote_tree_dir: Optional[str],
+) -> None:
+    save_checkpoint(data, path, step=step, custom_metadata=custom_metadata)
+    if local_tree_dir and remote_tree_dir:
+        sync_tree(local_tree_dir, remote_tree_dir)
+
+
+class AsyncCheckpointWriter:
+    """Serialize checkpoint saves on a background thread."""
+
+    def __init__(self):
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="checkpoint-writer")
+        self._futures = []
+        self._lock = threading.Lock()
+        self._closed = False
+        self._close_registered = False
+        self._register_atexit()
+
+    def _register_atexit(self):
+        if self._close_registered:
+            return
+        atexit.register(self.close)
+        self._close_registered = True
+
+    def submit(
+        self,
+        data: Dict[str, Any],
+        path: str,
+        step: Optional[int] = None,
+        custom_metadata: Optional[Dict[str, Any]] = None,
+        local_tree_dir: Optional[str] = None,
+        remote_tree_dir: Optional[str] = None,
+    ):
+        if self._closed:
+            raise RuntimeError("AsyncCheckpointWriter is closed.")
+        future = self._executor.submit(
+            _save_checkpoint_and_sync,
+            data,
+            path,
+            step,
+            custom_metadata,
+            local_tree_dir,
+            remote_tree_dir,
+        )
+        with self._lock:
+            self._futures.append(future)
+        return future
+
+    def flush(self):
+        with self._lock:
+            futures = list(self._futures)
+        for future in futures:
+            future.result()
+        with self._lock:
+            self._futures = [future for future in self._futures if not future.done()]
+
+    def close(self):
+        if self._closed:
+            return
+        try:
+            self.flush()
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._closed = True
 
 
 def load_checkpoint(path: str, template: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
