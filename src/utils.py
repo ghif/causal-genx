@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import json
-import atexit
 import io
 import os
 import random
 import shutil
 import tempfile
-import threading
-import logging
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 import time
@@ -175,7 +171,7 @@ def _checkpoint_manager(root_dir: str, *, create: bool) -> ocp.CheckpointManager
         max_to_keep=3,
         create=create,
         save_interval_steps=1,
-        enable_async_checkpointing=True,
+        enable_async_checkpointing=False,
     )
     return ocp.CheckpointManager(root_dir, options=options)
 
@@ -224,21 +220,10 @@ def _save_checkpoint_and_sync(
 
 
 class BackgroundArtifactWriter:
-    """Serialize artifact saves on a single background thread."""
+    """Serialize artifact saves on the caller thread."""
 
     def __init__(self):
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="artifact-writer")
-        self._futures = []
-        self._lock = threading.Lock()
         self._closed = False
-        self._close_registered = False
-        self._register_atexit()
-
-    def _register_atexit(self):
-        if self._close_registered:
-            return
-        atexit.register(self.close)
-        self._close_registered = True
 
     def _submit_job(
         self,
@@ -248,17 +233,7 @@ class BackgroundArtifactWriter:
     ):
         if self._closed:
             raise RuntimeError("BackgroundArtifactWriter is closed.")
-        future = self._executor.submit(fn, *args, **kwargs)
-        future.add_done_callback(self._report_future)
-        with self._lock:
-            self._futures.append(future)
-        return future
-
-    def _report_future(self, future):
-        try:
-            future.result()
-        except Exception:
-            logging.exception("Background artifact job failed")
+        return fn(*args, **kwargs)
 
     def submit_checkpoint(
         self,
@@ -295,21 +270,12 @@ class BackgroundArtifactWriter:
         return viz_path
 
     def flush(self):
-        with self._lock:
-            futures = list(self._futures)
-        for future in futures:
-            future.result()
-        with self._lock:
-            self._futures = [future for future in self._futures if not future.done()]
+        return None
 
     def close(self):
         if self._closed:
             return
-        try:
-            self.flush()
-        finally:
-            self._executor.shutdown(wait=True, cancel_futures=False)
-            self._closed = True
+        self._closed = True
 
 
 AsyncCheckpointWriter = BackgroundArtifactWriter
@@ -463,6 +429,10 @@ def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterat
 
 
 def write_images(args, model, params, batch, rng_key=None, step: Optional[int] = None):
+    viz_bs = int(getattr(args, "viz_bs", 32))
+    x = _ensure_nhwc(np.asarray(batch["x"]))
+    viz_bs = max(1, min(viz_bs, x.shape[0]))
+    batch = {k: v[:viz_bs] for k, v in batch.items()}
     x = _ensure_nhwc(np.asarray(batch["x"]))
     model = materialize_nnx(model, params)
     bs = int(x.shape[0])

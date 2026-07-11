@@ -52,6 +52,7 @@ HPARAMS_REGISTRY["morphomnist"] = _make_hparams(
     grad_clip=350.0,
     grad_skip=500.0,
     accu_steps=1,
+    viz_bs=32,
     eval_freq=5,
     viz_freq=10000,
     seed=7,
@@ -96,6 +97,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--beta_warmup_steps", type=int, default=0)
     parser.add_argument("--kl_free_bits", type=float, default=0.0)
+    parser.add_argument("--viz_bs", type=int, default=32)
     parser.add_argument("--viz_freq", type=int, default=10000)
     parser.add_argument("--speed_log_freq", type=int, default=50)
     parser.add_argument("--eval_freq", type=int, default=5)
