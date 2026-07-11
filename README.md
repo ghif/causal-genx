@@ -251,6 +251,14 @@ gs://medical-airnd/causal-gen/checkpoints/<hps>/<exp_name>/
 
 That means the same Orbax checkpoint root is available locally and in the bucket after each save.
 
+Visualization artifacts follow the same training-step convention and are written as:
+
+```text
+<save_dir>/viz-step-<training_step>.png
+```
+
+For example, the end-of-epoch validation image for global step 400 is saved as `viz-step-400.png`.
+
 ### License
 
 See the original repository for licensing details.

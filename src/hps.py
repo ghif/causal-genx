@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from typing import Any, Dict
 
 
 @dataclass
@@ -52,9 +52,10 @@ HPARAMS_REGISTRY["morphomnist"] = _make_hparams(
     grad_clip=350.0,  # global grad-norm clipping threshold
     grad_skip=500.0,  # skip update if grad norm exceeds this
     accu_steps=1,  # gradient accumulation steps
+    viz_bs=32,  # compatibility alias for legacy visualization batch size
+    viz_batch_size=32,  # number of samples used for visualization
     eval_freq=5,  # run validation every N epochs
     viz_freq=10000,  # visualization frequency in epochs
-    viz_batch_size=32,  # number of samples used for visualization
     seed=7,  # random seed
     deterministic=False,  # allow nondeterministic execution
     ema_rate=0.999,  # EMA decay for evaluation weights
@@ -97,7 +98,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--beta", type=float, default=1.0)  # KL multiplier
     parser.add_argument("--beta_warmup_steps", type=int, default=0)  # beta warmup duration
     parser.add_argument("--kl_free_bits", type=float, default=0.0)  # free-bits threshold for KL
-    parser.add_argument("--viz_freq", type=int, default=10000)  # visualization frequency in epochs
+    parser.add_argument("--viz_bs", type=int, default=32)  # compatibility alias for legacy visualization batch size
     parser.add_argument("--viz_batch_size", type=int, default=32)  # samples used for visual grids
     parser.add_argument("--speed_log_freq", type=int, default=50)  # step logging frequency
     parser.add_argument("--eval_freq", type=int, default=5)  # validation frequency in epochs
