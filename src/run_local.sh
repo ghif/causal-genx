@@ -56,6 +56,7 @@ run_cmd=(python -u main.py
   --beta=1
   --cond_prior
   --eval_freq=50
+  --checkpoint_freq=50
   --viz_freq=50
   --viz_batch_size=32
   "${extra_args[@]}")

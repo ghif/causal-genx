@@ -54,6 +54,7 @@ HPARAMS_REGISTRY["morphomnist"] = _make_hparams(
     accu_steps=1,  # gradient accumulation steps
     viz_batch_size=32,  # number of samples used for visualization
     eval_freq=5,  # run validation every N epochs
+    checkpoint_freq=1,  # run checkpoint save eligibility every N epochs
     viz_freq=10000,  # visualization frequency in epochs
     seed=7,  # random seed
     deterministic=False,  # allow nondeterministic execution
@@ -111,6 +112,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     )
     parser.add_argument("--speed_log_freq", type=int, default=50)  # step logging frequency
     parser.add_argument("--eval_freq", type=int, default=5)  # validation frequency in epochs
+    parser.add_argument("--checkpoint_freq", type=int, default=1)  # checkpoint eligibility frequency in epochs
     parser.add_argument("--checkpoint_smoke_test", action="store_true", default=False)  # enable checkpoint smoke test
     parser.add_argument("--checkpoint_smoke_steps", type=int, default=1)  # smoke-test step threshold
     parser.add_argument("--vae", type=str, default="hierarchical", choices=["simple", "hierarchical"])  # VAE variant

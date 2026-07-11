@@ -407,7 +407,8 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             valid_nelbo = valid_nelbo_sum / max(1, valid_count)
             valid_nll = valid_nll_sum / max(1, valid_count)
             valid_kl = valid_kl_sum / max(1, valid_count)
-            if valid_nelbo < state.best_loss:
+            checkpoint_due = (epoch + 1) % max(1, args.checkpoint_freq) == 0
+            if checkpoint_due and valid_nelbo < state.best_loss:
                 state.best_loss = valid_nelbo
                 save_state(args, state, tx, epoch + 1, artifact_writer=artifact_writer)
             if hasattr(writer, "add_scalar"):

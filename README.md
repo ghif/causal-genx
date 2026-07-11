@@ -127,7 +127,7 @@ bash run_local.sh my_experiment
 The launcher accepts extra arguments and forwards them to `main.py`, so you can override the defaults when needed:
 
 ```bash
-bash run_local.sh my_experiment --bs 32 --epochs 500 --eval_freq 4 --viz_batch_size 32
+bash run_local.sh my_experiment --bs 32 --epochs 500 --eval_freq 4 --checkpoint_freq 50 --viz_batch_size 32
 ```
 
 To run in the background:
@@ -150,7 +150,7 @@ To override GPU defaults:
 
 ```bash
 cd causal-genx/src
-bash run_gpu.sh my_experiment --bs 128 --precision bf16 --eval_freq 4 --viz_batch_size 32
+bash run_gpu.sh my_experiment --bs 128 --precision bf16 --eval_freq 4 --checkpoint_freq 4 --viz_batch_size 32
 ```
 
 For Google Cloud TPU, use the TPU launcher:
@@ -164,7 +164,7 @@ To override TPU defaults:
 
 ```bash
 cd causal-genx/src
-bash run_tpu.sh my_experiment --bs 32 --precision bf16 --eval_freq 4 --viz_batch_size 32
+bash run_tpu.sh my_experiment --bs 32 --precision bf16 --eval_freq 4 --checkpoint_freq 4 --viz_batch_size 32
 ```
 
 You can also call the entrypoint directly:
@@ -183,6 +183,7 @@ For counterfactual or structured-mechanism training, the matching JAX entrypoint
 - `run_tpu.sh` launches `main.py` with `--accelerator=tpu` and `--precision=bf16`
 - MorphoMNIST is loaded from `gs://medical-airnd/causal-gen/datasets/morphomnist`
 - checkpoints default to a local `../checkpoints` directory from inside `src/`
+- `eval_freq` controls how often validation is reported, while `checkpoint_freq` controls how often checkpoint saving is even eligible; a checkpoint is written only when the validation loss improves on that scheduled epoch
 - CPU is the intended execution target
 
 ### Notes
