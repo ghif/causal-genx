@@ -54,10 +54,10 @@ run_cmd=(python -u main.py
   --wd=0.01
   --beta=1
   --cond_prior
-  --viz_freq=1
+  --viz_freq=50
   --viz_batch_size=32
-  --eval_freq=4
-  --checkpoint_freq=4
+  --eval_freq=10
+  --checkpoint_freq=50
   "${extra_args[@]}")
 
 if [ "$run_nohup" = true ]
