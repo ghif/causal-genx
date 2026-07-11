@@ -205,7 +205,6 @@ def save_state(args, state: TrainState, tx, epoch):
 def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
     ensure_dir(args.save_dir)
     train_iter = batch_iterator(datasets["train"], args.bs, True, args.seed)
-    valid_iter = batch_iterator(datasets["valid"], args.bs, False, args.seed + 1)
     steps_per_epoch = max(1, len(datasets["train"]) // args.bs)
     total_train_steps = steps_per_epoch * max(1, args.epochs - state.epoch)
     use_tpu_pmap = args.accelerator == "tpu" and jax.local_device_count() > 1
@@ -226,6 +225,39 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
         train_step_fn = make_train_step(graphdef, tx, state.ema.decay)
     eval_step_fn = make_eval_step(graphdef)
     beta_warmup = linear_warmup(args.beta_warmup_steps) if getattr(args, "beta_warmup_steps", 0) > 0 else None
+
+    def _iter_eval_batches(dataset):
+        for start in range(0, len(dataset), args.bs):
+            batch_idx = np.arange(start, min(start + args.bs, len(dataset)))
+            if hasattr(dataset, "make_batch"):
+                yield dataset.make_batch(batch_idx, shuffle=False)
+            else:
+                batch = [dataset[int(i)] for i in batch_idx]
+                keys = batch[0].keys()
+                out = {}
+                for k in keys:
+                    values = [np.asarray(item[k]) for item in batch]
+                    out[k] = np.stack(values, axis=0)
+                yield out
+
+    def _eval_dataset(dataset):
+        stats_sum = {"elbo": 0.0, "nll": 0.0, "kl": 0.0}
+        sample_count = 0
+        rng_key = jax.random.PRNGKey(args.seed)
+        beta_scale = float(beta_warmup(state.step)) if beta_warmup is not None else 1.0
+        beta = args.beta * beta_scale
+        for batch_i, batch in enumerate(_iter_eval_batches(dataset)):
+            batch = preprocess_batch(args, batch, expand_pa=True)
+            batch_key = jax.random.fold_in(rng_key, batch_i)
+            out = eval_step_fn(state.ema.params, batch, beta, batch_key)
+            _block_until_ready(out)
+            bs = int(batch["x"].shape[0])
+            sample_count += bs
+            for key in stats_sum:
+                stats_sum[key] += float(out[key]) * bs
+        if sample_count == 0:
+            return {k: 0.0 for k in stats_sum}
+        return {k: v / sample_count for k, v in stats_sum.items()}
 
     for epoch in range(state.epoch, args.epochs):
         t0 = time.perf_counter()
@@ -345,10 +377,8 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             epoch_sample_per_sec,
         )
         if epoch % max(1, args.eval_freq) == 0:
-            valid_batch = preprocess_batch(args, next(valid_iter), expand_pa=True)
-            valid_beta = args.beta * (float(beta_warmup(state.step)) if beta_warmup is not None else 1.0)
-            valid_out = eval_step_fn(state.ema.params, valid_batch, valid_beta, jax.random.PRNGKey(args.seed + epoch))
-            _block_until_ready(valid_out)
+            valid_batch = preprocess_batch(args, next(_iter_eval_batches(datasets["valid"])), expand_pa=True)
+            valid_out = _eval_dataset(datasets["valid"])
             if float(valid_out["elbo"]) < state.best_loss:
                 state.best_loss = float(valid_out["elbo"])
                 save_state(args, state, tx, epoch + 1)
