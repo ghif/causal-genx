@@ -139,6 +139,34 @@ nohup bash run_local.sh my_experiment nohup > my_experiment.log 2>&1 &
 tail -f my_experiment.log
 ```
 
+For NVIDIA GPU / A100, use the GPU launcher:
+
+```bash
+cd causal-genx/src
+bash run_gpu.sh my_experiment
+```
+
+To override GPU defaults:
+
+```bash
+cd causal-genx/src
+bash run_gpu.sh my_experiment --bs 128 --precision bf16 --eval_freq 4
+```
+
+For Google Cloud TPU, use the TPU launcher:
+
+```bash
+cd causal-genx/src
+bash run_tpu.sh my_experiment
+```
+
+To override TPU defaults:
+
+```bash
+cd causal-genx/src
+bash run_tpu.sh my_experiment --bs 32 --precision bf16 --eval_freq 4
+```
+
 You can also call the entrypoint directly:
 
 ```bash
@@ -151,6 +179,8 @@ For counterfactual or structured-mechanism training, the matching JAX entrypoint
 ### Current Defaults
 
 - `run_local.sh` activates the `med-jax` conda environment
+- `run_gpu.sh` launches `main.py` with `--accelerator=gpu` and `--precision=bf16`
+- `run_tpu.sh` launches `main.py` with `--accelerator=tpu` and `--precision=bf16`
 - MorphoMNIST is loaded from `gs://medical-airnd/causal-gen/datasets/morphomnist`
 - checkpoints default to a local `../checkpoints` directory from inside `src/`
 - CPU is the intended execution target
@@ -181,6 +211,37 @@ The JAX port now uses **Orbax checkpoint directories** for persistence. Each run
 Resume by pointing `--resume` at that checkpoint directory. Orbax keeps the latest step subdirectory and the associated metadata under that root, so the resume path is a folder rather than a single `.pt` file.
 
 If you are migrating an older script, treat `.pt` checkpoints as legacy-only. The new default is always the Orbax directory layout.
+
+### Resume Training
+
+To resume from the latest checkpoint, point `--resume` at the checkpoint root directory for the run. Orbax will pick the latest saved step inside that directory automatically.
+
+Local example:
+
+```bash
+cd causal-genx/src
+bash run_local.sh my_experiment --resume ../checkpoints/morphomnist/my_experiment/checkpoints
+```
+
+GPU example:
+
+```bash
+cd causal-genx/src
+bash run_gpu.sh my_experiment --resume ../checkpoints/morphomnist/my_experiment/checkpoints
+```
+
+TPU example:
+
+```bash
+cd causal-genx/src
+bash run_tpu.sh my_experiment --resume ../checkpoints/morphomnist/my_experiment/checkpoints
+```
+
+If you are resuming from the mirrored GCS tree, use the remote checkpoint root instead:
+
+```bash
+--resume gs://medical-airnd/causal-gen/checkpoints/morphomnist/my_experiment/checkpoints
+```
 
 By default, local training also mirrors the full experiment tree to GCS under:
 

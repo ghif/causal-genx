@@ -62,8 +62,8 @@ def normalize(x, x_min=None, x_max=None, zero_one=False):
 
 def log_standardize(x):
     x = jnp.asarray(x, dtype=jnp.float32)
-    lx = jnp.log(jnp.clip(x, a_min=1e-12))
-    return (lx - jnp.mean(lx)) / jnp.clip(jnp.std(lx), a_min=1e-12)
+    lx = jnp.log(jnp.maximum(x, 1e-12))
+    return (lx - jnp.mean(lx)) / jnp.maximum(jnp.std(lx), 1e-12)
 
 
 def linear_warmup(warmup_iters):
@@ -435,13 +435,15 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
     batch = {k: v[:viz_bs] for k, v in batch.items()}
     x = _ensure_nhwc(np.asarray(batch["x"]))
     model = materialize_nnx(model, params)
-    bs = int(x.shape[0])
+    bs = int(min(getattr(args, "viz_batch_size", 32), x.shape[0]))
+    x = x[:bs]
+    x_jax = jnp.asarray(batch["x"])[:bs]
+    pa_jax = jnp.asarray(batch["pa"])[:bs]
     rows = [postprocess(x)]
 
     def _append_counterfactual_rows(zs, pa_ctx, cf_pa_ctx, x_ctx, alpha, t):
         x_rec, _ = model.forward_latents(latents=zs, parents=pa_ctx, t=t)
         x_rec = postprocess(x_rec)
-        rows.append(x_rec.astype(np.uint8))
 
         cf_x, _ = model.forward_latents(latents=zs, parents=cf_pa_ctx, t=t)
         cf_x = postprocess(cf_x)
@@ -452,21 +454,18 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
             # Match the Torch visualization path: re-abduct on the counterfactual parents
             # and show the indirect and total effect rows as well.
             cf_z = model.abduct(x=x_ctx, parents=pa_ctx, cf_parents=cf_pa_ctx, alpha=alpha, t=t)
-            indirect_zs = [z["z"] for z in cf_z]
 
-            x_indirect, _ = model.forward_latents(latents=indirect_zs, parents=pa_ctx, t=t)
+            x_indirect, _ = model.forward_latents(latents=cf_z, parents=pa_ctx, t=t)
             x_indirect = postprocess(x_indirect)
             rows.append(x_indirect.astype(np.uint8))
             rows.append((x_indirect - x_rec).astype(np.uint8))
 
-            x_total, _ = model.forward_latents(latents=indirect_zs, parents=cf_pa_ctx, t=t)
+            x_total, _ = model.forward_latents(latents=cf_z, parents=cf_pa_ctx, t=t)
             x_total = postprocess(x_total)
             rows.append(x_total.astype(np.uint8))
             rows.append((x_total - x_rec).astype(np.uint8))
 
     try:
-        x_jax = jnp.asarray(batch["x"])
-        pa_jax = jnp.asarray(batch["pa"])
         zs = model.abduct(x=x_jax, parents=pa_jax)
         n_latents_viz = 0
         l_points = np.floor(np.linspace(0, 1, n_latents_viz + 2) * len(zs)).astype(int)[1:]
@@ -482,12 +481,11 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
 
     rows.append(postprocess(x * 0))
     for temp in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
-        sample, _ = model.sample(parents=jnp.asarray(batch["pa"]), return_loc=True, t=temp, rng=rng_key)
+        sample, _ = model.sample(parents=pa_jax, return_loc=True, t=temp, rng=rng_key)
         rows.append(postprocess(sample))
-    rows.append(postprocess(x * 0))
 
     if "morphomnist" in getattr(args, "hps", ""):
-        base_pa = np.asarray(batch["pa"])
+        base_pa = np.asarray(batch["pa"])[:bs]
         if base_pa.ndim == 4:
             base_pa = base_pa[:, 0, 0, :]
         idx = np.arange(bs)

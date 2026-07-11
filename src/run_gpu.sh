@@ -50,12 +50,13 @@ run_cmd=(python -u main.py
   --context_dim=12
   --concat_pa
   --lr=0.001
-  --bs=128
+  --bs=32
   --wd=0.01
   --beta=1
   --cond_prior
   --viz_bs=32
   --viz_freq=1
+  --viz_batch_size=32
   --eval_freq=4
   "${extra_args[@]}")
 

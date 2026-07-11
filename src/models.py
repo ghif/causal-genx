@@ -14,25 +14,47 @@ import numpy as np
 from flax import nnx
 
 
-SMALL_INIT = nnx.initializers.variance_scaling(0.01, "fan_avg", "truncated_normal")
+TORCH_CONV_INIT = nnx.initializers.variance_scaling(1.0 / 3.0, "fan_in", "uniform")
 
 
 def gaussian_kl(q_loc, q_logscale, p_loc, p_logscale):
-    q_logscale = jnp.clip(q_logscale, -9.0, 9.0)
-    p_logscale = jnp.clip(p_logscale, -9.0, 9.0)
-    kl = -0.5 + p_logscale - q_logscale + 0.5 * (
+    return -0.5 + p_logscale - q_logscale + 0.5 * (
         jnp.exp(q_logscale) ** 2 + (q_loc - p_loc) ** 2
-    ) / (jnp.exp(p_logscale) ** 2 + 1e-12)
-    return jnp.nan_to_num(kl, nan=0.0, posinf=1e6, neginf=0.0)
+    ) / (jnp.exp(p_logscale) ** 2)
 
 
 def sample_gaussian(rng, loc, logscale):
-    logscale = jnp.clip(logscale, -9.0, 9.0)
-    return jnp.nan_to_num(loc + jnp.exp(logscale) * jax.random.normal(rng, loc.shape), nan=0.0)
+    return loc + jnp.exp(logscale) * jax.random.normal(rng, loc.shape)
 
 
 def _upsample(x, res):
     return jax.image.resize(x, (x.shape[0], res, res, x.shape[-1]), method="nearest")
+
+
+def _avg_pool2d(x, kernel_size: int, stride: int):
+    pooled = jax.lax.reduce_window(
+        x,
+        0.0,
+        jax.lax.add,
+        window_dimensions=(1, kernel_size, kernel_size, 1),
+        window_strides=(1, stride, stride, 1),
+        padding="VALID",
+    )
+    return pooled / float(kernel_size * kernel_size)
+
+
+def _last_conv(block):
+    return block.conv2 if block.version == "light" else block.conv4
+
+
+def _nnx_list(values):
+    list_cls = getattr(nnx, "List", None)
+    return list_cls(values) if list_cls is not None else values
+
+
+def _nnx_dict():
+    dict_cls = getattr(nnx, "Dict", None)
+    return dict_cls() if dict_cls is not None else {}
 
 
 class Block(nnx.Module):
@@ -61,7 +83,7 @@ class Block(nnx.Module):
                 out_features=self.bottleneck,
                 kernel_size=(self.kernel_size, self.kernel_size),
                 padding=padding,
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -70,7 +92,7 @@ class Block(nnx.Module):
                 out_features=self.out_width,
                 kernel_size=(self.kernel_size, self.kernel_size),
                 padding=padding,
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -80,7 +102,7 @@ class Block(nnx.Module):
                 out_features=self.bottleneck,
                 kernel_size=(1, 1),
                 padding="VALID",
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -89,7 +111,7 @@ class Block(nnx.Module):
                 out_features=self.bottleneck,
                 kernel_size=(self.kernel_size, self.kernel_size),
                 padding=padding,
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -98,7 +120,7 @@ class Block(nnx.Module):
                 out_features=self.bottleneck,
                 kernel_size=(self.kernel_size, self.kernel_size),
                 padding=padding,
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -107,7 +129,7 @@ class Block(nnx.Module):
                 out_features=self.out_width,
                 kernel_size=(1, 1),
                 padding="VALID",
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -117,7 +139,7 @@ class Block(nnx.Module):
                 out_features=self.out_width,
                 kernel_size=(1, 1),
                 padding="VALID",
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -131,13 +153,13 @@ class Block(nnx.Module):
             h = nnx.relu(h)
             h = self.conv2(h)
         else:
-            h = nnx.relu(h)
+            h = jax.nn.gelu(h)
             h = self.conv1(h)
-            h = nnx.relu(h)
+            h = jax.nn.gelu(h)
             h = self.conv2(h)
-            h = nnx.relu(h)
+            h = jax.nn.gelu(h)
             h = self.conv3(h)
-            h = nnx.relu(h)
+            h = jax.nn.gelu(h)
             h = self.conv4(h)
         if self.residual:
             res_proj = getattr(self, "res_proj", None)
@@ -145,8 +167,11 @@ class Block(nnx.Module):
                 x = res_proj(x)
             h = x + h
         if self.down_rate:
-            res = max(1, int(h.shape[1] / self.down_rate)) if isinstance(self.down_rate, float) else max(1, h.shape[1] // self.down_rate)
-            h = jax.image.resize(h, (h.shape[0], res, res, h.shape[-1]), method="linear")
+            if isinstance(self.down_rate, float):
+                res = max(1, int(h.shape[1] / self.down_rate))
+                h = jax.image.resize(h, (h.shape[0], res, res, h.shape[-1]), method="linear")
+            else:
+                h = _avg_pool2d(h, int(self.down_rate), int(self.down_rate))
         return h
 
 
@@ -173,7 +198,7 @@ class Encoder(nnx.Module):
             kernel_size=(7, 7),
             strides=(1, 1),
             padding="SAME",
-            kernel_init=SMALL_INIT,
+            kernel_init=TORCH_CONV_INIT,
             bias_init=nnx.initializers.zeros,
             rngs=rngs,
         )
@@ -190,7 +215,11 @@ class Encoder(nnx.Module):
             prev_width = stages[max(0, i - 1)][0]
             block_bottleneck = max(1, int(prev_width / self.bottleneck))
             blocks.append(Block(prev_width, block_bottleneck, width, down_rate=d, version=self.vr, rngs=rngs))
-        self.blocks = blocks
+        scale = np.sqrt(1 / len(blocks))
+        for block in blocks:
+            last = _last_conv(block)
+            last.kernel.value = last.kernel.value * scale
+        self.blocks = _nnx_list(blocks)
 
     def __call__(self, x):
         x = self.stem(x)
@@ -211,6 +240,7 @@ class DecoderBlock(nnx.Module):
         resolution: int,
         z_dim: int,
         context_dim: int,
+        z_max_res: int = 192,
         bottleneck: int = 4,
         cond_prior: bool = False,
         q_correction: bool = True,
@@ -222,6 +252,7 @@ class DecoderBlock(nnx.Module):
         self.resolution = resolution
         self.z_dim = z_dim
         self.context_dim = context_dim
+        self.stochastic = self.resolution <= z_max_res
         self.bottleneck = bottleneck
         self.cond_prior = cond_prior
         self.q_correction = q_correction
@@ -236,7 +267,7 @@ class DecoderBlock(nnx.Module):
             version=self.vr,
             rngs=rngs,
         )
-        if self.resolution <= 192:
+        if self.stochastic:
             self.posterior = Block(
                 2 * self.in_width + self.context_dim,
                 max(1, int(self.in_width / self.bottleneck)),
@@ -251,7 +282,7 @@ class DecoderBlock(nnx.Module):
             out_features=self.in_width,
             kernel_size=(1, 1),
             padding="VALID",
-            kernel_init=SMALL_INIT,
+            kernel_init=TORCH_CONV_INIT,
             bias_init=nnx.initializers.zeros,
             rngs=rngs,
         )
@@ -261,7 +292,7 @@ class DecoderBlock(nnx.Module):
                 out_features=self.out_width,
                 kernel_size=(1, 1),
                 padding="VALID",
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -293,6 +324,7 @@ class Decoder(nnx.Module):
         dec_arch: str,
         z_dim: int,
         context_dim: int,
+        z_max_res: int = 192,
         bottleneck: int = 4,
         cond_prior: bool = False,
         q_correction: bool = True,
@@ -305,6 +337,7 @@ class Decoder(nnx.Module):
         self.dec_arch = dec_arch
         self.z_dim = z_dim
         self.context_dim = context_dim
+        self.z_max_res = z_max_res
         self.bottleneck = bottleneck
         self.cond_prior = cond_prior
         self.q_correction = q_correction
@@ -323,6 +356,7 @@ class Decoder(nnx.Module):
                 res,
                 self.z_dim,
                 self.context_dim,
+                z_max_res=self.z_max_res,
                 bottleneck=self.bottleneck,
                 cond_prior=self.cond_prior,
                 q_correction=self.q_correction,
@@ -331,14 +365,22 @@ class Decoder(nnx.Module):
             )
             for i, (res, width) in enumerate(stages)
         ]
-        self.blocks = decoder_blocks
+        self.blocks = _nnx_list(decoder_blocks)
         self.resolutions = tuple(sorted({r for r, _ in stages}))
         self.is_drop_cond = "morphomnist" in self.hps
-        self.biases = {}
+        self.biases = _nnx_dict()
         for i, res in enumerate(self.resolutions):
             if res <= self.bias_max_res:
                 width = self.widths[::-1][min(i, len(self.widths) - 1)]
                 self.biases[str(res)] = nnx.Param(jnp.zeros((1, res, res, width), dtype=jnp.float32))
+        self._scale_weights()
+
+    def _scale_weights(self):
+        scale = np.sqrt(1 / len(self.blocks))
+        for block in self.blocks:
+            block.z_proj.kernel.value = block.z_proj.kernel.value * scale
+            _last_conv(block.conv).kernel.value = _last_conv(block.conv).kernel.value * scale
+            _last_conv(block.prior).kernel.value = _last_conv(block.prior).kernel.value * 0.0
 
     def drop_cond(self, rng):
         options = jnp.array([[0, 1], [1, 0], [1, 1]], dtype=jnp.int32)
@@ -414,7 +456,7 @@ class DGaussNet(nnx.Module):
             out_features=self.input_channels,
             kernel_size=(1, 1),
             padding="VALID",
-            kernel_init=nnx.initializers.zeros,
+            kernel_init=TORCH_CONV_INIT,
             bias_init=nnx.initializers.zeros,
             rngs=rngs,
         )
@@ -423,8 +465,8 @@ class DGaussNet(nnx.Module):
             out_features=self.input_channels,
             kernel_size=(1, 1),
             padding="VALID",
-            kernel_init=nnx.initializers.zeros,
-            bias_init=nnx.initializers.constant(np.log(max(self.std_init, 1e-3))),
+            kernel_init=nnx.initializers.zeros if self.std_init > 0 else TORCH_CONV_INIT,
+            bias_init=nnx.initializers.zeros,
             rngs=rngs,
         )
         self.channel_coeffs = (
@@ -433,7 +475,7 @@ class DGaussNet(nnx.Module):
                 out_features=3,
                 kernel_size=(1, 1),
                 padding="VALID",
-                kernel_init=SMALL_INIT,
+                kernel_init=TORCH_CONV_INIT,
                 bias_init=nnx.initializers.zeros,
                 rngs=rngs,
             )
@@ -442,7 +484,7 @@ class DGaussNet(nnx.Module):
         )
 
     def __call__(self, h, x=None, t=None):
-        loc, logscale = self.x_loc(h), jnp.clip(self.x_logscale(h), -9.0, 9.0)
+        loc, logscale = self.x_loc(h), jnp.maximum(self.x_logscale(h), -9.0)
         if self.channel_coeffs is not None:
             coeff = jnp.tanh(self.channel_coeffs(h))
             if x is None:
@@ -456,7 +498,7 @@ class DGaussNet(nnx.Module):
             loc = jnp.stack([loc_red, loc_green, loc_blue], axis=-1)
         if t is not None:
             logscale = logscale + jnp.log(t)
-        return jnp.nan_to_num(loc, nan=0.0), jnp.nan_to_num(logscale, nan=-9.0)
+        return loc, logscale
 
     def approx_cdf(self, x):
         return 0.5 * (1.0 + jnp.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * (x**3))))
@@ -469,19 +511,21 @@ class DGaussNet(nnx.Module):
         cdf_plus = self.approx_cdf(plus_in)
         min_in = inv_stdv * (centered_x - 1.0 / 255.0)
         cdf_min = self.approx_cdf(min_in)
-        log_cdf_plus = jnp.log(jnp.clip(cdf_plus, a_min=1e-12))
-        log_one_minus_cdf_min = jnp.log(jnp.clip(1.0 - cdf_min, a_min=1e-12))
+        log_cdf_plus = jnp.log(jnp.maximum(cdf_plus, 1e-12))
+        log_one_minus_cdf_min = jnp.log(jnp.maximum(1.0 - cdf_min, 1e-12))
         cdf_delta = cdf_plus - cdf_min
         log_probs = jnp.where(
             x < -0.999,
             log_cdf_plus,
-            jnp.where(x > 0.999, log_one_minus_cdf_min, jnp.log(jnp.clip(cdf_delta, a_min=1e-12))),
+            jnp.where(x > 0.999, log_one_minus_cdf_min, jnp.log(jnp.maximum(cdf_delta, 1e-12))),
         )
-        return -jnp.nan_to_num(jnp.mean(log_probs, axis=(1, 2, 3)), nan=0.0, posinf=1e6, neginf=0.0)
+        return -jnp.mean(log_probs, axis=(1, 2, 3))
 
     def sample(self, h, return_loc=True, t=None, rng=None):
-        loc, logscale = self.__call__(h, None, t=t)
-        if not return_loc:
+        if return_loc:
+            loc, logscale = self.__call__(h)
+        else:
+            loc, logscale = self.__call__(h, None, t=t)
             rng = rng or jax.random.PRNGKey(0)
             loc = loc + jnp.exp(logscale) * jax.random.normal(rng, loc.shape)
         return jnp.clip(loc, -1.0, 1.0), jnp.exp(logscale)
@@ -497,8 +541,11 @@ class HVAE(nnx.Module):
         widths: List[int],
         z_dim: int = 16,
         context_dim: int = 12,
+        z_max_res: int = 192,
         bottleneck: int = 4,
         cond_prior: bool = False,
+        q_correction: bool = False,
+        bias_max_res: int = 64,
         x_like: str = "none_dgauss",
         kl_free_bits: float = 0.0,
         std_init: float = 0.1,
@@ -513,8 +560,11 @@ class HVAE(nnx.Module):
         self.widths = widths
         self.z_dim = z_dim
         self.context_dim = context_dim
+        self.z_max_res = z_max_res
         self.bottleneck = bottleneck
         self.cond_prior = cond_prior
+        self.q_correction = q_correction
+        self.bias_max_res = bias_max_res
         self.x_like = x_like
         self.kl_free_bits = kl_free_bits
         self.std_init = std_init
@@ -526,10 +576,11 @@ class HVAE(nnx.Module):
             self.dec_arch,
             self.z_dim,
             self.context_dim,
+            self.z_max_res,
             self.bottleneck,
             self.cond_prior,
-            True,
-            192,
+            self.q_correction,
+            self.bias_max_res,
             self.vr,
             self.hps,
             rngs=rngs,
@@ -544,7 +595,9 @@ class HVAE(nnx.Module):
             fb = self.kl_free_bits
             kl = 0.0
             for stat in stats:
-                kl = kl + jnp.maximum(fb, jnp.sum(stat["kl"], axis=(1, 2, 3))).mean()
+                kl = kl + jnp.maximum(
+                    fb, jnp.sum(stat["kl"], axis=(1, 2)).mean(axis=0)
+                ).sum()
         else:
             kl = 0.0
             for stat in stats:
@@ -561,7 +614,25 @@ class HVAE(nnx.Module):
     def abduct(self, x, parents, cf_parents=None, alpha=0.5, t=None, rng=None):
         acts = self.encoder(x)
         _, q_stats = self.decoder(parents=parents, x=acts, abduct=True, t=t, rng=rng, training=False)
-        return [s["z"] for s in q_stats]
+        q_stats = [s["z"] for s in q_stats]
+        if self.cond_prior and cf_parents is not None:
+            _, p_stats = self.decoder(parents=cf_parents, abduct=True, t=t, rng=rng, training=False)
+            p_stats = [s["z"] for s in p_stats]
+            cf_zs = []
+            for q_stat, p_stat in zip(q_stats, p_stats):
+                q_loc = q_stat["q_loc"]
+                q_scale = jnp.exp(q_stat["q_logscale"])
+                u = (q_stat["z"] - q_loc) / q_scale
+                p_loc = p_stat["p_loc"]
+                p_var = jnp.exp(p_stat["p_logscale"]) ** 2
+                r_loc = alpha * q_loc + (1.0 - alpha) * p_loc
+                r_var = alpha**2 * q_scale**2 + (1.0 - alpha) ** 2 * p_var
+                r_scale = jnp.sqrt(r_var)
+                if t is not None:
+                    r_scale = r_scale * t
+                cf_zs.append(r_loc + r_scale * u)
+            return cf_zs
+        return q_stats
 
     def forward_latents(self, latents, parents, t=None, rng=None):
         h, _ = self.decoder(parents=parents, latents=latents, t=t, rng=rng, training=False)

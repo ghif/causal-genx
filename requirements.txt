@@ -6,7 +6,9 @@ flax
 optax
 orbax-checkpoint
 tensorboard
-numpy<2
+# NumPy 1.26 has no Python 3.13 wheels and would require a local C compiler.
+# Let JAX select a compatible NumPy release (NumPy 2 on Python 3.13+).
+numpy
 pandas
 pillow
 imageio

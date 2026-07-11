@@ -36,6 +36,31 @@ def preprocess_batch(args, batch, expand_pa: bool = False):
     return {"x": x, "pa": pa}
 
 
+def _block_until_ready(tree):
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return tree
+    leaves[0].block_until_ready()
+    return tree
+
+
+def _unreplicate(tree):
+    return jax.tree_util.tree_map(lambda x: x[0], tree)
+
+
+def _shard_batch(batch, n_devices: int):
+    def _reshape(x):
+        x = jnp.asarray(x)
+        if x.shape[0] % n_devices != 0:
+            raise ValueError(
+                f"Batch size {x.shape[0]} must be divisible by local device count {n_devices} for TPU replication."
+            )
+        per_device = x.shape[0] // n_devices
+        return x.reshape((n_devices, per_device) + x.shape[1:])
+
+    return jax.tree_util.tree_map(_reshape, batch)
+
+
 @dataclass
 class TrainState:
     params: Any
@@ -95,6 +120,26 @@ def make_eval_step(graphdef):
     return jax.jit(_step)
 
 
+def make_pmap_train_step(graphdef, tx, ema_decay: float):
+    def _step(params, opt_state, ema_params, batch, beta, rng):
+        def _loss(p):
+            return loss_fn(graphdef, p, batch, beta, rng)
+
+        (_, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
+        grads = jax.lax.pmean(grads, axis_name="devices")
+        out = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="devices"), out)
+        updates, new_opt_state = tx.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        new_ema = jax.tree_util.tree_map(
+            lambda e, p: ema_decay * e + (1.0 - ema_decay) * p,
+            ema_params,
+            new_params,
+        )
+        return new_params, new_opt_state, new_ema, out
+
+    return jax.pmap(_step, axis_name="devices", in_axes=(None, None, None, 0, None, 0))
+
+
 def _tree_allclose(a, b, atol: float = 1e-6, rtol: float = 1e-6) -> bool:
     if jax.tree_util.tree_structure(a) != jax.tree_util.tree_structure(b):
         return False
@@ -140,7 +185,15 @@ def checkpoint_smoke_test(args, state: TrainState, tx, logger) -> None:
     logger.info("checkpoint_smoke_test=passed checkpoint_dir=%s step=%d", args.checkpoint_dir, state.step)
 
 
-def save_state(args, state: TrainState, tx, epoch, *, artifact_writer: BackgroundArtifactWriter | None = None, wait: bool = False):
+def save_state(
+    args,
+    state: TrainState,
+    tx,
+    epoch,
+    *,
+    artifact_writer: BackgroundArtifactWriter | None = None,
+    wait: bool = False,
+):
     ckpt = {
         "epoch": epoch,
         "step": state.step,
@@ -173,21 +226,67 @@ def save_state(args, state: TrainState, tx, epoch, *, artifact_writer: Backgroun
 def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
     ensure_dir(args.save_dir)
     train_iter = batch_iterator(datasets["train"], args.bs, True, args.seed)
-    valid_iter = batch_iterator(datasets["valid"], args.bs, False, args.seed + 1)
     steps_per_epoch = max(1, len(datasets["train"]) // args.bs)
     total_train_steps = steps_per_epoch * max(1, args.epochs - state.epoch)
-    train_step_fn = make_train_step(graphdef, tx, state.ema.decay)
+    use_tpu_pmap = args.accelerator == "tpu" and jax.local_device_count() > 1
+    device_count = jax.local_device_count() if use_tpu_pmap else 1
+    if use_tpu_pmap and args.bs % device_count != 0:
+        raise ValueError(
+            f"Global batch size {args.bs} must be divisible by TPU local device count {device_count}."
+        )
+    if use_tpu_pmap:
+        logger.info(
+            "tpu_multi_core_training=enabled local_device_count=%d global_batch_size=%d per_device_batch_size=%d",
+            device_count,
+            args.bs,
+            args.bs // device_count,
+        )
+        train_step_fn = make_pmap_train_step(graphdef, tx, state.ema.decay)
+    else:
+        train_step_fn = make_train_step(graphdef, tx, state.ema.decay)
     eval_step_fn = make_eval_step(graphdef)
     beta_warmup = linear_warmup(args.beta_warmup_steps) if getattr(args, "beta_warmup_steps", 0) > 0 else None
+
+    def _iter_eval_batches(dataset):
+        for start in range(0, len(dataset), args.bs):
+            batch_idx = np.arange(start, min(start + args.bs, len(dataset)))
+            if hasattr(dataset, "make_batch"):
+                yield dataset.make_batch(batch_idx, shuffle=False)
+            else:
+                batch = [dataset[int(i)] for i in batch_idx]
+                keys = batch[0].keys()
+                out = {}
+                for k in keys:
+                    values = [np.asarray(item[k]) for item in batch]
+                    out[k] = np.stack(values, axis=0)
+                yield out
+
+    def _eval_dataset(dataset):
+        stats_sum = {"elbo": 0.0, "nll": 0.0, "kl": 0.0}
+        sample_count = 0
+        rng_key = jax.random.PRNGKey(args.seed)
+        beta_scale = float(beta_warmup(state.step)) if beta_warmup is not None else 1.0
+        beta = args.beta * beta_scale
+        for batch_i, batch in enumerate(_iter_eval_batches(dataset)):
+            batch = preprocess_batch(args, batch, expand_pa=True)
+            batch_key = jax.random.fold_in(rng_key, batch_i)
+            out = eval_step_fn(state.ema.params, batch, beta, batch_key)
+            _block_until_ready(out)
+            bs = int(batch["x"].shape[0])
+            sample_count += bs
+            for key in stats_sum:
+                stats_sum[key] += float(out[key]) * bs
+        if sample_count == 0:
+            return {k: 0.0 for k in stats_sum}
+        return {k: v / sample_count for k, v in stats_sum.items()}
+
     artifact_writer = BackgroundArtifactWriter()
 
     try:
         for epoch in range(state.epoch, args.epochs):
             t0 = time.perf_counter()
             epoch_step_t0 = time.perf_counter()
-            train_nelbo_sum = 0.0
-            train_nll_sum = 0.0
-            train_kl_sum = 0.0
+            train_stats_sum = {"elbo": 0.0, "nll": 0.0, "kl": 0.0}
 
             for step in range(steps_per_epoch):
                 fetch_t0 = time.perf_counter()
@@ -196,7 +295,24 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 rng = jax.random.PRNGKey(args.seed + state.step + step + epoch * 1000)
                 beta_scale = float(beta_warmup(state.step)) if beta_warmup is not None else 1.0
                 beta = args.beta * beta_scale
-                new_params, new_opt_state, new_ema_params, out = train_step_fn(state.params, state.opt_state, state.ema.params, batch, beta, rng)
+                if use_tpu_pmap:
+                    batch = _shard_batch(batch, device_count)
+                    rng = jax.random.split(rng, device_count)
+                new_params, new_opt_state, new_ema_params, out = train_step_fn(
+                    state.params,
+                    state.opt_state,
+                    state.ema.params,
+                    batch,
+                    beta,
+                    rng,
+                )
+                if use_tpu_pmap:
+                    new_params = _unreplicate(_block_until_ready(new_params))
+                    new_opt_state = _unreplicate(_block_until_ready(new_opt_state))
+                    new_ema_params = _unreplicate(_block_until_ready(new_ema_params))
+                    out = _unreplicate(_block_until_ready(out))
+                else:
+                    _block_until_ready(out)
                 state = TrainState(
                     params=new_params,
                     opt_state=new_opt_state,
@@ -206,12 +322,8 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     best_loss=state.best_loss,
                 )
                 step_end_t0 = time.perf_counter()
-                train_nelbo = float(out["elbo"])
-                train_nll = float(out["nll"])
-                train_kl = float(out["kl"])
-                train_nelbo_sum += train_nelbo
-                train_nll_sum += train_nll
-                train_kl_sum += train_kl
+                for key in train_stats_sum:
+                    train_stats_sum[key] += float(out[key])
 
                 if (step + 1) % max(1, args.speed_log_freq) == 0:
                     data_dt = batch_ready_t0 - fetch_t0
@@ -231,9 +343,9 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                         step + 1,
                         steps_per_epoch,
                         state.step,
-                        train_nelbo,
-                        train_nll,
-                        train_kl,
+                        float(out["elbo"]),
+                        float(out["nll"]),
+                        float(out["kl"]),
                         data_dt,
                         compute_dt,
                         step_dt,
@@ -244,9 +356,6 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                         eta_sec,
                     )
                     if hasattr(writer, "add_scalar"):
-                        writer.add_scalar("train/nelbo", train_nelbo, state.step)
-                        writer.add_scalar("train/nll", train_nll, state.step)
-                        writer.add_scalar("train/kl", train_kl, state.step)
                         writer.add_scalar("speed/data_time_sec", data_dt, state.step)
                         writer.add_scalar("speed/compute_time_sec", compute_dt, state.step)
                         writer.add_scalar("speed/iter_per_sec", iter_per_sec, state.step)
@@ -272,23 +381,23 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                         checkpoint_smoke_test(args, state, tx, logger)
                         return
 
-            valid_steps = max(1, (len(datasets["valid"]) + args.bs - 1) // args.bs)
             valid_nelbo_sum = 0.0
             valid_nll_sum = 0.0
             valid_kl_sum = 0.0
             valid_count = 0
             valid_viz_batch = None
             valid_beta = args.beta * (float(beta_warmup(state.step)) if beta_warmup is not None else 1.0)
-            for valid_step in range(valid_steps):
-                valid_batch = preprocess_batch(args, next(valid_iter), expand_pa=True)
+            for valid_step, valid_batch in enumerate(_iter_eval_batches(datasets["valid"])):
                 if valid_viz_batch is None:
                     valid_viz_batch = valid_batch
+                valid_batch = preprocess_batch(args, valid_batch, expand_pa=True)
                 valid_out = eval_step_fn(
                     state.ema.params,
                     valid_batch,
                     valid_beta,
                     jax.random.PRNGKey(args.seed + epoch * 1000 + valid_step),
                 )
+                _block_until_ready(valid_out)
                 batch_count = int(valid_batch["x"].shape[0])
                 valid_nelbo_sum += float(valid_out["elbo"]) * batch_count
                 valid_nll_sum += float(valid_out["nll"]) * batch_count
@@ -301,10 +410,16 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 state.best_loss = valid_nelbo
                 save_state(args, state, tx, epoch + 1, artifact_writer=artifact_writer)
             if hasattr(writer, "add_scalar"):
-                writer.add_scalar("train/nelbo", train_nelbo_sum / max(1, steps_per_epoch), epoch + 1)
-                writer.add_scalar("train/nll", train_nll_sum / max(1, steps_per_epoch), epoch + 1)
-                writer.add_scalar("train/kl", train_kl_sum / max(1, steps_per_epoch), epoch + 1)
-                writer.add_scalar("valid/nelbo", valid_nelbo, epoch + 1)
+                writer.add_scalar("nelbo/train", train_stats_sum["elbo"] / max(1, steps_per_epoch), epoch + 1)
+                writer.add_scalar("nll/train", train_stats_sum["nll"] / max(1, steps_per_epoch), epoch + 1)
+                writer.add_scalar("kl/train", train_stats_sum["kl"] / max(1, steps_per_epoch), epoch + 1)
+                writer.add_scalar("train/elbo", train_stats_sum["elbo"] / max(1, steps_per_epoch), epoch + 1)
+                writer.add_scalar("train/nll", train_stats_sum["nll"] / max(1, steps_per_epoch), epoch + 1)
+                writer.add_scalar("train/kl", train_stats_sum["kl"] / max(1, steps_per_epoch), epoch + 1)
+                writer.add_scalar("nelbo/valid", valid_nelbo, epoch + 1)
+                writer.add_scalar("nll/valid", valid_nll, epoch + 1)
+                writer.add_scalar("kl/valid", valid_kl, epoch + 1)
+                writer.add_scalar("valid/elbo", valid_nelbo, epoch + 1)
                 writer.add_scalar("valid/nll", valid_nll, epoch + 1)
                 writer.add_scalar("valid/kl", valid_kl, epoch + 1)
             if args.viz_freq and not getattr(args, "checkpoint_smoke_test", False) and (epoch + 1) % args.viz_freq == 0:
@@ -321,25 +436,38 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             epoch_iter_per_sec = steps_per_epoch / max(epoch_time, 1e-12)
             epoch_sample_per_sec = steps_per_epoch * args.bs / max(epoch_time, 1e-12)
             logger.info(
-                "epoch=%d => train | nelbo: %.4f - nll: %.4f - kl: %.4f - steps: %d - it/s: %.2f - samples/s: %.1f",
-                epoch + 1,
-                train_nelbo_sum / max(1, steps_per_epoch),
-                train_nll_sum / max(1, steps_per_epoch),
-                train_kl_sum / max(1, steps_per_epoch),
+                "=> train | nelbo: %.4f - nll: %.4f - kl: %.4f - steps: %d - it/s: %.2f - samples/s: %.1f",
+                train_stats_sum["elbo"] / max(1, steps_per_epoch),
+                train_stats_sum["nll"] / max(1, steps_per_epoch),
+                train_stats_sum["kl"] / max(1, steps_per_epoch),
                 state.step,
                 epoch_iter_per_sec,
                 epoch_sample_per_sec,
             )
-            logger.info(
-                "epoch=%d => valid | nelbo: %.4f - nll: %.4f - kl: %.4f - steps: %d",
-                epoch + 1,
-                valid_nelbo,
-                valid_nll,
-                valid_kl,
-                state.step,
-            )
+            if epoch % max(1, args.eval_freq) == 0:
+                logger.info(
+                    "=> valid | nelbo: %.4f - nll: %.4f - kl: %.4f - steps: %d",
+                    valid_nelbo,
+                    valid_nll,
+                    valid_kl,
+                    state.step,
+                )
+                logger.info(
+                    "epoch=%d epoch_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
+                    epoch + 1,
+                    epoch_time,
+                    epoch_iter_per_sec,
+                    epoch_sample_per_sec,
+                )
+            else:
+                logger.info(
+                    "epoch=%d epoch_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
+                    epoch + 1,
+                    epoch_time,
+                    epoch_iter_per_sec,
+                    epoch_sample_per_sec,
+                )
             if getattr(args, "checkpoint_smoke_test", False) and state.step >= max(1, args.checkpoint_smoke_steps):
-                artifact_writer.flush()
                 checkpoint_smoke_test(args, state, tx, logger)
                 return
     finally:

@@ -8,6 +8,7 @@ from runtime import configure_backend_from_argv
 
 configure_backend_from_argv()
 
+import jax
 from flax import nnx
 
 from datasets import morphomnist
@@ -40,6 +41,12 @@ def main(args):
     ensure_dir(args.save_dir)
     ensure_dir(args.checkpoint_dir)
     logger = setup_logging(args)
+    logger.info(
+        "runtime accelerator=%s backend=%s local_device_count=%d",
+        args.accelerator,
+        jax.default_backend(),
+        jax.local_device_count(),
+    )
     logger.info("loading datasets")
     writer = setup_tensorboard(args)
     datasets = morphomnist(args)
@@ -54,8 +61,11 @@ def main(args):
         widths=args.widths,
         z_dim=args.z_dim,
         context_dim=args.context_dim,
+        z_max_res=args.z_max_res,
         bottleneck=args.bottleneck,
         cond_prior=args.cond_prior,
+        q_correction=args.q_correction,
+        bias_max_res=args.bias_max_res,
         x_like=args.x_like,
         kl_free_bits=args.kl_free_bits,
         std_init=args.std_init,
@@ -69,8 +79,11 @@ def main(args):
         widths=args.widths,
         z_dim=args.z_dim,
         context_dim=args.context_dim,
+        z_max_res=args.z_max_res,
         bottleneck=args.bottleneck,
         cond_prior=args.cond_prior,
+        q_correction=args.q_correction,
+        bias_max_res=args.bias_max_res,
         x_like=args.x_like,
         kl_free_bits=args.kl_free_bits,
         std_init=args.std_init,
