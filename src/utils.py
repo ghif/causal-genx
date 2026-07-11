@@ -457,11 +457,15 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
     if x.max() > 1.5:
         x = (x - 127.5) / 127.5
     pa = np.asarray(batch["pa"], dtype=np.float32)
+    if x.ndim == 4 and x.shape[1] in (1, 3):
+        x = np.transpose(x, (0, 2, 3, 1))
     if pa.ndim == 2:
         pa = pa[:, :, None, None]
         pa = np.repeat(pa, args.input_res, axis=2)
         pa = np.repeat(pa, args.input_res, axis=3)
-    x = _ensure_nhwc(x)
+        pa = np.transpose(pa, (0, 2, 3, 1))
+    elif pa.ndim == 4 and pa.shape[1] == args.context_dim and pa.shape[-1] == args.input_res:
+        pa = np.transpose(pa, (0, 2, 3, 1))
     viz_batch_size = max(1, min(viz_batch_size, x.shape[0]))
     x = x[:viz_batch_size]
     pa = pa[:viz_batch_size]
