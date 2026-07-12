@@ -449,7 +449,14 @@ def make_image_grid(images: Sequence[np.ndarray], n_rows: int, n_cols: int) -> n
     return im.squeeze(-1) if im.ndim == 3 and im.shape[-1] == 1 else im
 
 
-def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterator[Dict[str, np.ndarray]]:
+def batch_iterator(
+    dataset,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+    *,
+    drop_remainder: bool = False,
+) -> Iterator[Dict[str, np.ndarray]]:
     rng = np.random.default_rng(seed)
     indices = np.arange(len(dataset))
     while True:
@@ -457,6 +464,8 @@ def batch_iterator(dataset, batch_size: int, shuffle: bool, seed: int) -> Iterat
             rng.shuffle(indices)
         for start in range(0, len(indices), batch_size):
             batch_idx = indices[start : start + batch_size]
+            if drop_remainder and len(batch_idx) < batch_size:
+                continue
             if hasattr(dataset, "make_batch"):
                 yield dataset.make_batch(batch_idx, rng=rng, shuffle=shuffle)
                 continue

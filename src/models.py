@@ -18,13 +18,25 @@ TORCH_CONV_INIT = nnx.initializers.variance_scaling(1.0 / 3.0, "fan_in", "unifor
 
 
 def gaussian_kl(q_loc, q_logscale, p_loc, p_logscale):
-    return -0.5 + p_logscale - q_logscale + 0.5 * (
-        jnp.exp(q_logscale) ** 2 + (q_loc - p_loc) ** 2
-    ) / (jnp.exp(p_logscale) ** 2)
+    # Distribution math is particularly sensitive in BF16. Bound learned
+    # scales and evaluate the KL in FP32 to prevent exp overflow/underflow.
+    q_loc = q_loc.astype(jnp.float32)
+    p_loc = p_loc.astype(jnp.float32)
+    q_logscale = jnp.clip(q_logscale.astype(jnp.float32), -7.0, 7.0)
+    p_logscale = jnp.clip(p_logscale.astype(jnp.float32), -7.0, 7.0)
+    logscale_delta = jnp.clip(q_logscale - p_logscale, -14.0, 14.0)
+    standardized_delta = (q_loc - p_loc) * jnp.exp(-p_logscale)
+    return 0.5 * (
+        jnp.exp(2.0 * logscale_delta)
+        + standardized_delta**2
+        - 1.0
+        - 2.0 * logscale_delta
+    )
 
 
 def sample_gaussian(rng, loc, logscale):
-    return loc + jnp.exp(logscale) * jax.random.normal(rng, loc.shape)
+    logscale = jnp.clip(logscale, -7.0, 7.0)
+    return loc + jnp.exp(logscale) * jax.random.normal(rng, loc.shape, dtype=loc.dtype)
 
 
 def _upsample(x, res):
@@ -390,6 +402,14 @@ class Decoder(nnx.Module):
     def __call__(self, parents, x=None, t=None, abduct=False, latents=None, rng=None, training=False):
         if rng is None:
             rng = jax.random.PRNGKey(0)
+        # Training transfers compact context vectors and expands them on device.
+        # Keep accepting the historical spatial representation for sampling and
+        # checkpoint compatibility.
+        if parents.ndim == 2:
+            parents = jnp.broadcast_to(
+                parents[:, None, None, :],
+                (parents.shape[0], self.resolutions[-1], self.resolutions[-1], parents.shape[-1]),
+            )
         bias = {}
         for i, res in enumerate(self.resolutions):
             if res <= self.bias_max_res:
@@ -484,7 +504,7 @@ class DGaussNet(nnx.Module):
         )
 
     def __call__(self, h, x=None, t=None):
-        loc, logscale = self.x_loc(h), jnp.maximum(self.x_logscale(h), -9.0)
+        loc, logscale = self.x_loc(h), jnp.clip(self.x_logscale(h), -9.0, 7.0)
         if self.channel_coeffs is not None:
             coeff = jnp.tanh(self.channel_coeffs(h))
             if x is None:
@@ -505,6 +525,9 @@ class DGaussNet(nnx.Module):
 
     def nll(self, h, x):
         loc, logscale = self.__call__(h, x)
+        loc = loc.astype(jnp.float32)
+        logscale = logscale.astype(jnp.float32)
+        x = x.astype(jnp.float32)
         centered_x = x - loc
         inv_stdv = jnp.exp(-logscale)
         plus_in = inv_stdv * (centered_x + 1.0 / 255.0)
