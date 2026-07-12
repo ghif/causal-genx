@@ -119,6 +119,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--drop_remainder", action="store_true", default=False)
     parser.add_argument("--benchmark_steps", type=int, default=0, help="stop after this many training steps; 0 disables")
     parser.add_argument("--benchmark_warmup_steps", type=int, default=20)
+    parser.add_argument(
+        "--tpu_auto_scale",
+        action="store_true",
+        default=False,
+        help="scale the default batch and learning rate when this process sees a multi-core TPU",
+    )
     parser.add_argument("--eval_freq", type=int, default=5)  # validation and visualization frequency in epochs
     parser.add_argument("--checkpoint_freq", type=int, default=1)  # checkpoint eligibility frequency in epochs
     parser.add_argument("--checkpoint_smoke_test", action="store_true", default=False)  # enable checkpoint smoke test

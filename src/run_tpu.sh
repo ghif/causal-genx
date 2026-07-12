@@ -18,7 +18,6 @@ echo "Launching TPU training for $exp_name"
 echo "Expected mode: single-core on v6e-1 or multi-core on v6e-4 when JAX exposes 4 local TPU devices"
 
 extra_args=()
-performance_args=()
 run_nohup=false
 run_smoke=false
 run_benchmark=false
@@ -34,12 +33,6 @@ for arg in "${@:2}"; do
     extra_args+=("$arg")
   fi
 done
-
-local_tpu_devices="$(python -c 'import jax; print(jax.local_device_count())')"
-if [ "$local_tpu_devices" -gt 1 ]; then
-  performance_args+=(--bs=512 --lr=0.004 --drop_remainder)
-  echo "Using multi-core TPU performance defaults: global batch 512, learning rate 0.004"
-fi
 
 if [ "$run_benchmark" = true ]
 then
@@ -82,7 +75,7 @@ run_cmd=(python -u main.py
   --viz_batch_size=32
   --eval_freq=10
   --checkpoint_freq=20
-  "${performance_args[@]}"
+  --tpu_auto_scale
   "${extra_args[@]}")
 
 if [ "$run_nohup" = true ]

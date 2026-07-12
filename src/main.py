@@ -35,6 +35,18 @@ def setup_tensorboard(args):
 
 def main(args):
     seed_all(args.seed, args.deterministic)
+    if (
+        getattr(args, "tpu_auto_scale", False)
+        and args.accelerator == "tpu"
+        and jax.local_device_count() > 1
+    ):
+        # Preserve explicit non-default overrides supplied after run_tpu.sh's
+        # batch/lr defaults.
+        if args.bs == 128:
+            args.bs = 512
+        if args.lr == 0.001:
+            args.lr = 0.004
+        args.drop_remainder = True
     args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "run")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
     remote_run_dir = experiment_run_dir(args.remote_ckpt_dir, args.hps, args.exp_name, "run")
