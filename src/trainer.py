@@ -123,15 +123,34 @@ def loss_fn(graphdef, params, batch, beta, rng):
     return out["elbo"], out
 
 
+def _select_tree(predicate, true_tree, false_tree):
+    return jax.tree_util.tree_map(
+        lambda new, old: jnp.where(predicate, new, old), true_tree, false_tree
+    )
+
+
+def _grads_are_finite(grads):
+    leaves = jax.tree_util.tree_leaves(grads)
+    checks = [jnp.all(jnp.isfinite(x)) for x in leaves]
+    return jnp.all(jnp.stack(checks)) if checks else jnp.array(True)
+
+
 def make_train_step(graphdef, tx, ema_decay: float):
     def _step(params, opt_state, ema_params, batch, beta, rng):
         def _loss(p):
             return loss_fn(graphdef, p, batch, beta, rng)
 
-        (_, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
-        updates, new_opt_state = tx.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        new_ema = jax.tree_util.tree_map(lambda e, p: ema_decay * e + (1.0 - ema_decay) * p, ema_params, new_params)
+        (loss, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
+        grad_norm = optax.global_norm(grads)
+        finite = jnp.logical_and(jnp.isfinite(loss), _grads_are_finite(grads))
+        updates, candidate_opt_state = tx.update(grads, opt_state, params)
+        candidate_params = optax.apply_updates(params, updates)
+        finite = jnp.logical_and(finite, _grads_are_finite(candidate_params))
+        new_params = _select_tree(finite, candidate_params, params)
+        new_opt_state = _select_tree(finite, candidate_opt_state, opt_state)
+        candidate_ema = jax.tree_util.tree_map(lambda e, p: ema_decay * e + (1.0 - ema_decay) * p, ema_params, new_params)
+        new_ema = _select_tree(finite, candidate_ema, ema_params)
+        out = {**out, "grad_norm": grad_norm, "update_skipped": jnp.logical_not(finite).astype(jnp.float32)}
         return new_params, new_opt_state, new_ema, out
 
     return jax.jit(_step)
@@ -150,16 +169,32 @@ def make_pmap_train_step(graphdef, tx, ema_decay: float):
         def _loss(p):
             return loss_fn(graphdef, p, batch, beta, rng)
 
-        (_, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
+        (loss, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
+        grad_norm = optax.global_norm(grads)
+        local_finite = jnp.logical_and(jnp.isfinite(loss), _grads_are_finite(grads))
+        finite = jax.lax.pmin(local_finite.astype(jnp.int32), axis_name="devices").astype(jnp.bool_)
         grads = jax.lax.pmean(grads, axis_name="devices")
         out = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="devices"), out)
-        updates, new_opt_state = tx.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        new_ema = jax.tree_util.tree_map(
+        updates, candidate_opt_state = tx.update(grads, opt_state, params)
+        candidate_params = optax.apply_updates(params, updates)
+        candidate_finite = _grads_are_finite(candidate_params)
+        finite = jax.lax.pmin(
+            jnp.logical_and(finite, candidate_finite).astype(jnp.int32),
+            axis_name="devices",
+        ).astype(jnp.bool_)
+        new_params = _select_tree(finite, candidate_params, params)
+        new_opt_state = _select_tree(finite, candidate_opt_state, opt_state)
+        candidate_ema = jax.tree_util.tree_map(
             lambda e, p: ema_decay * e + (1.0 - ema_decay) * p,
             ema_params,
             new_params,
         )
+        new_ema = _select_tree(finite, candidate_ema, ema_params)
+        out = {
+            **out,
+            "grad_norm": jax.lax.pmean(grad_norm, axis_name="devices"),
+            "update_skipped": jnp.logical_not(finite).astype(jnp.float32),
+        }
         return new_params, new_opt_state, new_ema, out
 
     # State is replicated once outside the loop and remains resident on device.
@@ -396,7 +431,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     train_steps_left = max(0, total_train_steps - train_steps_done)
                     eta_sec = train_steps_left / max(epoch_iters_per_sec, 1e-12)
                     logger.info(
-                        "epoch=%d step=%d/%d global_step=%d nelbo=%.4f nll=%.4f kl=%.4f data_time=%.2fs compute_time=%.2fs step_time=%.2fs iter/s=%.3f sample/s=%.3f epoch_iter/s=%.3f epoch_sample/s=%.3f eta=%.1fs",
+                        "epoch=%d step=%d/%d global_step=%d nelbo=%.4f nll=%.4f kl=%.4f grad_norm=%.4f update_skipped=%d data_time=%.2fs compute_time=%.2fs step_time=%.2fs iter/s=%.3f sample/s=%.3f epoch_iter/s=%.3f epoch_sample/s=%.3f eta=%.1fs",
                         epoch + 1,
                         step + 1,
                         steps_per_epoch,
@@ -404,6 +439,8 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                         float(metric_out["elbo"]),
                         float(metric_out["nll"]),
                         float(metric_out["kl"]),
+                        float(metric_out["grad_norm"]),
+                        int(float(metric_out["update_skipped"])),
                         data_dt,
                         compute_dt,
                         step_dt,
@@ -422,6 +459,8 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                         writer.add_scalar("speed/epoch_iter_per_sec", epoch_iters_per_sec, state.step)
                         writer.add_scalar("speed/epoch_sample_per_sec", epoch_samples_per_sec, state.step)
                         writer.add_scalar("speed/eta_sec", eta_sec, state.step)
+                        writer.add_scalar("train/grad_norm", float(metric_out["grad_norm"]), state.step)
+                        writer.add_scalar("train/update_skipped", float(metric_out["update_skipped"]), state.step)
                     speed_window_t0 = sync_t0
                     speed_window_step = step + 1
 

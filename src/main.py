@@ -44,8 +44,8 @@ def main(args):
         # batch/lr defaults.
         if args.bs == 128:
             args.bs = 512
-        if args.lr == 0.001:
-            args.lr = 0.004
+        # AdamW LR scaling is not generally safe for this hierarchical VAE.
+        # Keep the configured learning rate even when scaling the global batch.
         args.drop_remainder = True
     args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "run")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
