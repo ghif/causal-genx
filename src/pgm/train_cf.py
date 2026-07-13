@@ -125,7 +125,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = add_arguments(parser)
     parser.add_argument(
-        "--pgm_path", type=str, default="checkpoints/t_i_d/pgm/checkpoints"
+        "--pgm_path", type=str, default="checkpoints/morphomnist/pgm/checkpoints"
     )
     parser.add_argument(
         "--vae_path", type=str, default="checkpoints/morphomnist/run/checkpoints"
