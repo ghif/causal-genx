@@ -49,6 +49,10 @@ from xla_runtime import (
 )
 
 
+def _to_device(value: Tensor, device: torch.device) -> Tensor:
+    return value.to(device, non_blocking=device.type == "cuda")
+
+
 def preprocess(
     batch: Dict[str, Tensor],
     dataset: str = "ukbb",
@@ -56,14 +60,14 @@ def preprocess(
     device: torch.device = torch.device("cpu"),
 ) -> Dict[str, Tensor]:
     if "x" in batch.keys():
-        batch["x"] = (batch["x"].float().to(device) - 127.5) / 127.5  # [-1,1]
+        batch["x"] = (_to_device(batch["x"].float(), device) - 127.5) / 127.5  # [-1,1]
     # for all other variables except x
     not_x = [k for k in batch.keys() if k != "x"]
     for k in not_x:
         if split == "u":  # unlabelled
             batch[k] = None
         elif split == "l":  # labelled
-            batch[k] = batch[k].float().to(device)
+            batch[k] = _to_device(batch[k].float(), device)
             if len(batch[k].shape) < 2:
                 batch[k] = batch[k].unsqueeze(-1)
         else:
@@ -75,6 +79,43 @@ def preprocess(
                 batch[k] = (batch[k] - k_min) / (k_max - k_min)  # [0,1]
                 batch[k] = 2 * batch[k] - 1  # [-1,1]
     return batch
+
+
+def resolve_loader_settings(args: Hparams) -> Dict[str, Any]:
+    cpu_count = os.cpu_count() or 1
+
+    if args.num_workers >= 0:
+        num_workers = args.num_workers
+    elif args.device.type == "cuda":
+        num_workers = min(8, max(2, cpu_count // 2))
+    else:
+        num_workers = min(4, max(0, cpu_count // 4))
+
+    if args.pin_memory == "auto":
+        pin_memory = args.device.type == "cuda"
+    else:
+        pin_memory = args.pin_memory == "true"
+
+    if args.persistent_workers == "auto":
+        persistent_workers = args.device.type == "cuda" and num_workers > 0
+    else:
+        persistent_workers = args.persistent_workers == "true"
+
+    if args.prefetch_factor > 0:
+        prefetch_factor = args.prefetch_factor
+    else:
+        prefetch_factor = 4 if args.device.type == "cuda" else 2
+
+    loader_kwargs = {
+        "batch_size": args.bs,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "worker_init_fn": seed_worker,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return loader_kwargs
 
 
 def ss_train_epoch(
@@ -306,12 +347,7 @@ def setup_dataloaders(args: Hparams) -> Dict[str, DataLoader]:
     else:
         NotImplementedError
 
-    kwargs = {
-        "batch_size": args.bs,
-        "num_workers": 4,
-        "pin_memory": args.device.type == "cuda",
-        "worker_init_fn": seed_worker,
-    }
+    kwargs = resolve_loader_settings(args)
 
     def make_loader(dataset, shuffle=False, drop_last=False):
         sampler = None
@@ -416,6 +452,32 @@ if __name__ == "__main__":
         "--epochs", help="Number of training epochs.", type=int, default=1000
     )
     parser.add_argument("--bs", help="Batch size.", type=int, default=32)
+    parser.add_argument(
+        "--num_workers",
+        help="DataLoader workers; use -1 for an accelerator-aware default.",
+        type=int,
+        default=-1,
+    )
+    parser.add_argument(
+        "--pin_memory",
+        help="Pin host memory for faster device transfers: auto/true/false.",
+        type=str,
+        default="auto",
+        choices=["auto", "true", "false"],
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        help="Keep DataLoader workers alive across epochs: auto/true/false.",
+        type=str,
+        default="auto",
+        choices=["auto", "true", "false"],
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        help="DataLoader prefetch factor; use -1 for an accelerator-aware default.",
+        type=int,
+        default=-1,
+    )
     parser.add_argument("--lr", help="Learning rate.", type=float, default=1e-4)
     parser.add_argument(
         "--lr_warmup_steps", help="lr warmup steps.", type=int, default=1

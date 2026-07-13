@@ -66,8 +66,8 @@ def plot_joint(
         if not os.path.exists(file):
             df = pd.DataFrame(
                 {
-                    "thickness": dataset.metrics["thickness"],
-                    "intensity": dataset.metrics["intensity"],
+                    "thickness": dataset.samples["thickness"].cpu().numpy(),
+                    "intensity": dataset.samples["intensity"].cpu().numpy(),
                     # 'digit': np.argmax(dataset.labels, axis=-1)
                 }
             )
