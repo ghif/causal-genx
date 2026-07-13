@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 -- backend selection must happen before importing JAX.
+
 import argparse
 import os
 import logging
@@ -18,7 +20,15 @@ from pgm.dscm import DSCM
 from pgm.flow_pgm import MorphoMNISTPGM
 from models import HVAE
 from trainer import preprocess_batch
-from utils import EvalOnlyFileFilter, SummaryWriter, SyncFileHandler, ensure_dir, load_checkpoint, seed_all, sync_file
+from utils import (
+    EvalOnlyFileFilter,
+    SummaryWriter,
+    SyncFileHandler,
+    ensure_dir,
+    load_checkpoint,
+    seed_all,
+    sync_file,
+)
 
 
 def setup_logging(args):
@@ -43,7 +53,9 @@ class Bundle:
 def main(args):
     seed_all(args.seed, args.deterministic)
     args.save_dir = os.path.join(args.ckpt_dir, args.hps, args.exp_name or "cf")
-    args.remote_save_dir = os.path.join(args.remote_ckpt_dir, args.hps, args.exp_name or "cf")
+    args.remote_save_dir = os.path.join(
+        args.remote_ckpt_dir, args.hps, args.exp_name or "cf"
+    )
     ensure_dir(args.save_dir)
     logger = setup_logging(args)
     writer = SummaryWriter(args.save_dir)
@@ -66,15 +78,35 @@ def main(args):
         hps=args.hps,
         rngs=rngs,
     )
-    pgm = MorphoMNISTPGM(context_dim=args.context_dim, rngs=rngs)
+    pgm_ckpt = load_checkpoint(args.pgm_path)
+    if pgm_ckpt.get("format_version") != 2 or "ema_params" not in pgm_ckpt:
+        raise ValueError(
+            "The PGM checkpoint uses the old simplified Gaussian/CNN format. "
+            "Retrain it with pgm/train_pgm.py before running counterfactual inference."
+        )
+    pgm_hparams = pgm_ckpt.get("hparams", {})
+    pgm = MorphoMNISTPGM(widths=pgm_hparams.get("widths", [32, 32]), rngs=rngs)
     vae_graphdef, _ = nnx.split(vae, nnx.Param)
     pgm_graphdef, _ = nnx.split(pgm, nnx.Param)
 
-    batch = preprocess_batch(args, {k: datasets["valid"][0][k][None] for k in datasets["valid"][0]}, expand_pa=True)
+    batch = preprocess_batch(
+        args,
+        {k: datasets["valid"][0][k][None] for k in datasets["valid"][0]},
+        expand_pa=True,
+    )
     vae_ckpt = load_checkpoint(args.vae_path)
-    pgm_ckpt = load_checkpoint(args.pgm_path)
+    expected_pgm_params = nnx.state(pgm, nnx.Param).to_pure_dict()
+    if jax.tree_util.tree_structure(
+        expected_pgm_params
+    ) != jax.tree_util.tree_structure(pgm_ckpt["ema_params"]):
+        raise ValueError(
+            "PGM checkpoint parameter structure is incompatible with MorphoMNISTPGM"
+        )
 
-    dscm = DSCM(Bundle(vae_graphdef, vae_ckpt["params"]), Bundle(pgm_graphdef, pgm_ckpt["params"]))
+    dscm = DSCM(
+        Bundle(vae_graphdef, vae_ckpt["params"]),
+        Bundle(pgm_graphdef, pgm_ckpt["ema_params"]),
+    )
 
     obs = {"x": batch["x"], "pa": batch["pa"]}
     intervention = {"digit": jax.nn.one_hot(jnp.array([1]), 10)}
@@ -82,14 +114,21 @@ def main(args):
     logger.info(f"counterfactual_x_shape={cf['x'].shape}")
     writer.add_scalar("cf/x_mean", float(jnp.mean(cf["x"])), 1)
     if getattr(args, "remote_save_dir", ""):
-        sync_file(os.path.join(args.save_dir, "trainlog.txt"), os.path.join(args.remote_save_dir, "trainlog.txt"))
+        sync_file(
+            os.path.join(args.save_dir, "trainlog.txt"),
+            os.path.join(args.remote_save_dir, "trainlog.txt"),
+        )
     writer.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = add_arguments(parser)
-    parser.add_argument("--pgm_path", type=str, default="checkpoints/morphomnist/pgm/checkpoints")
-    parser.add_argument("--vae_path", type=str, default="checkpoints/morphomnist/run/checkpoints")
+    parser.add_argument(
+        "--pgm_path", type=str, default="checkpoints/morphomnist/pgm/checkpoints"
+    )
+    parser.add_argument(
+        "--vae_path", type=str, default="checkpoints/morphomnist/run/checkpoints"
+    )
     args = setup_hparams(parser)
     main(args)
