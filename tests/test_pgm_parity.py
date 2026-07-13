@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -18,6 +19,7 @@ from pgm.flow_pgm import (
 from pgm.train_pgm import (
     PGMEMA,
     _progress_description,
+    _sync_pdf_artifacts,
     epoch_batches,
     make_train_step,
     preprocess,
@@ -264,3 +266,32 @@ def test_orbax_checkpoint_round_trip(tmp_path):
     assert restored["format_version"] == 2
     assert restored["step"] == 7
     np.testing.assert_allclose(restored["ema_params"]["value"], [1.0, 2.0])
+
+
+def test_pdf_artifacts_are_synced_to_remote_run_dir(tmp_path, monkeypatch):
+    save_dir = tmp_path / "run"
+    remote_dir = tmp_path / "remote"
+    save_dir.mkdir()
+    remote_dir.mkdir()
+    (save_dir / "trainlog.txt").write_text("ignore me", encoding="utf-8")
+    (save_dir / "joint_data.pdf").write_bytes(b"pdf-a")
+    (save_dir / "joint_model_7.pdf").write_bytes(b"pdf-b")
+    (save_dir / "notes.txt").write_text("ignore me too", encoding="utf-8")
+
+    copied = []
+
+    def fake_sync_file(local_path, remote_path):
+        copied.append((os.path.basename(local_path), os.path.basename(remote_path)))
+
+    monkeypatch.setattr("pgm.train_pgm.sync_file", fake_sync_file)
+    args = SimpleNamespace(
+        save_dir=str(save_dir),
+        remote_save_dir=str(remote_dir),
+    )
+
+    _sync_pdf_artifacts(args)
+
+    assert copied == [
+        ("joint_data.pdf", "joint_data.pdf"),
+        ("joint_model_7.pdf", "joint_model_7.pdf"),
+    ]

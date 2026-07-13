@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from glob import glob
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional
 
@@ -237,6 +238,13 @@ def _plot_joint(
     )
 
 
+def _sync_pdf_artifacts(args: argparse.Namespace) -> None:
+    if not args.remote_save_dir:
+        return
+    for pdf_path in sorted(glob(os.path.join(args.save_dir, "*.pdf"))):
+        sync_file(pdf_path, os.path.join(args.remote_save_dir, os.path.basename(pdf_path)))
+
+
 def _joint_figure(x: np.ndarray, y: np.ndarray, title: str, path: str) -> None:
     figure = plt.figure(figsize=(6, 6))
     grid = figure.add_gridspec(4, 4, hspace=0.05, wspace=0.05)
@@ -374,6 +382,7 @@ def main(args: argparse.Namespace) -> Dict[str, float]:
             " - ".join(f"{key}: {value:.4f}" for key, value in stats.items()),
         )
         _plot_joint(args, graphdef, ema.params, datasets["test"], 0)
+        _sync_pdf_artifacts(args)
         writer.close()
         return stats
 
@@ -435,6 +444,7 @@ def main(args: argparse.Namespace) -> Dict[str, float]:
         writer.add_scalar("elbo/train", train_stats["loss"], step)
         writer.add_scalar("elbo/valid", valid_stats["loss"], step)
         _plot_joint(args, graphdef, ema.params, datasets["train"], step)
+        _sync_pdf_artifacts(args)
 
         if valid_stats["loss"] < best_loss:
             best_loss = valid_stats["loss"]
@@ -459,6 +469,7 @@ def main(args: argparse.Namespace) -> Dict[str, float]:
                 os.path.join(args.save_dir, "trainlog.txt"),
                 os.path.join(args.remote_save_dir, "trainlog.txt"),
             )
+            _sync_pdf_artifacts(args)
 
         if args.benchmark_steps and step >= args.benchmark_steps:
             break
