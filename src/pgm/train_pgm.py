@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 from flax import nnx
+from tqdm import tqdm
 
 from pgm.flow_pgm import MorphoMNISTPGM
 from utils import (
@@ -176,6 +177,17 @@ def _mean_metrics(totals: Dict[str, float], count: int) -> Dict[str, float]:
     return {key: value / max(1, count) for key, value in totals.items()}
 
 
+def _progress_description(
+    mode: str, stats: Dict[str, float], grad_norm: Optional[float] = None
+) -> str:
+    description = f" => {mode} | " + ", ".join(
+        f"{key}: {value:.4f}" for key, value in stats.items()
+    )
+    if grad_norm is not None:
+        description += f", grad_norm: {grad_norm:.3f}"
+    return description
+
+
 def eval_epoch(
     graphdef: Any,
     params: Any,
@@ -185,14 +197,22 @@ def eval_epoch(
 ) -> Dict[str, float]:
     totals: Dict[str, float] = {}
     count = 0
-    for batch in epoch_batches(
-        dataset, batch_size, shuffle=False, drop_last=False, rng=rng
-    ):
+    total_batches = (len(dataset) + batch_size - 1) // batch_size
+    progress = tqdm(
+        epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng),
+        total=total_batches,
+        miniters=max(1, total_batches // 100),
+        mininterval=5,
+    )
+    for batch in progress:
         _, metrics = _loss(graphdef, params, batch)
         size = int(batch["digit"].shape[0])
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + float(value) * size
         count += size
+        progress.set_description(
+            _progress_description("eval", _mean_metrics(totals, count))
+        )
     return _mean_metrics(totals, count)
 
 
@@ -362,12 +382,24 @@ def main(args: argparse.Namespace) -> Dict[str, float]:
     train_step = make_train_step(graphdef, optimizer)
     final_stats: Dict[str, float] = {}
     for epoch in range(start_epoch, args.epochs):
+        logger.info("Epoch %d:", epoch + 1)
         totals: Dict[str, float] = {}
         seen = 0
         last_grad_norm = 0.0
-        for batch in epoch_batches(
-            datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng
-        ):
+        total_batches = len(datasets["train"]) // args.bs
+        progress = tqdm(
+            epoch_batches(
+                datasets["train"],
+                args.bs,
+                shuffle=True,
+                drop_last=True,
+                rng=rng,
+            ),
+            total=total_batches,
+            miniters=max(1, total_batches // 100),
+            mininterval=5,
+        )
+        for batch in progress:
             params, opt_state, metrics, grad_norm = train_step(params, opt_state, batch)
             ema.update(params)
             size = int(batch["digit"].shape[0])
@@ -376,16 +408,14 @@ def main(args: argparse.Namespace) -> Dict[str, float]:
             seen += size
             step += 1
             last_grad_norm = float(grad_norm)
+            progress.set_description(
+                _progress_description(
+                    "train", _mean_metrics(totals, seen), last_grad_norm
+                )
+            )
             if args.benchmark_steps and step >= args.benchmark_steps:
                 break
         train_stats = _mean_metrics(totals, seen)
-        logger.info(
-            "Epoch %d: train loss=%.4f grad_norm=%.3f steps=%d",
-            epoch + 1,
-            train_stats["loss"],
-            last_grad_norm,
-            step,
-        )
 
         if epoch % args.eval_freq != 0:
             if args.benchmark_steps and step >= args.benchmark_steps:

@@ -15,4 +15,5 @@ imageio
 matplotlib
 fsspec
 scipy
+tqdm
 gcsfs==2024.6.1

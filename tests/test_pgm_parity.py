@@ -15,7 +15,13 @@ from pgm.flow_pgm import (
     _set_variable_value,
     monotonic_rational_spline,
 )
-from pgm.train_pgm import PGMEMA, epoch_batches, make_train_step, preprocess
+from pgm.train_pgm import (
+    PGMEMA,
+    _progress_description,
+    epoch_batches,
+    make_train_step,
+    preprocess,
+)
 from utils import load_checkpoint, save_checkpoint
 
 
@@ -188,6 +194,23 @@ def test_training_batches_drop_only_incomplete_batch():
     )
     assert len(batches) == 2
     assert all(batch["thickness"].shape == (2, 1) for batch in batches)
+
+
+def test_progress_description_matches_pytorch_format():
+    stats = {
+        "loss": 5.6714,
+        "logp(digit)": -2.3021,
+        "logp(thickness)": -3.0910,
+        "logp(intensity)": -0.2784,
+    }
+    assert _progress_description("train", stats, 6.037) == (
+        " => train | loss: 5.6714, logp(digit): -2.3021, "
+        "logp(thickness): -3.0910, logp(intensity): -0.2784, grad_norm: 6.037"
+    )
+    assert _progress_description("eval", stats) == (
+        " => eval | loss: 5.6714, logp(digit): -2.3021, "
+        "logp(thickness): -3.0910, logp(intensity): -0.2784"
+    )
 
 
 def test_clipped_adamw_training_step_has_reference_metrics():
