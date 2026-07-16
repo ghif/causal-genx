@@ -651,6 +651,8 @@ def main(args):
         writer.close()
         return
 
+    benchmark_start_step = state["step"]
+    benchmark_done = False
     for epoch in range(state["epoch"], args.epochs):
         logger.info("Epoch %d:", epoch + 1)
         totals: Dict[str, float] = {}
@@ -698,6 +700,10 @@ def main(args):
                 + (f", grad_norm: {float(out['grad_norm']):.3f}" if "grad_norm" in out else "")
             )
 
+            if args.benchmark_steps > 0 and state["step"] - benchmark_start_step >= args.benchmark_steps:
+                benchmark_done = True
+                break
+
             if i % max(1, args.plot_freq) == 0:
                 copy_do_pa = copy.deepcopy(args.do_pa)
                 for pa_k in dag_vars + [None]:
@@ -718,6 +724,10 @@ def main(args):
                     loginfo(f"valid do({pa_k})", logger, valid_metrics)
                     last_valid_stats, last_valid_metrics = valid_stats, valid_metrics
                 args.do_pa = copy_do_pa
+
+        if benchmark_done:
+            logger.info("Benchmark completed after %d training step(s).", args.benchmark_steps)
+            break
 
         train_stats = {k: v / max(1, seen) for k, v in totals.items()}
         loginfo("train", logger, train_stats)

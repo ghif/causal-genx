@@ -713,10 +713,7 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
         n_latents_viz = 0
         l_points = np.floor(np.linspace(0, 1, n_latents_viz + 2) * len(zs)).astype(int)[1:]
         for l in l_points:
-            if getattr(model, "cond_prior", False):
-                latents = [zs[i]["z"] for i in range(l)]
-            else:
-                latents = zs[:l]
+            latents = zs[:l]
             x_rec, _ = model.forward_latents(latents=latents, parents=pa_jax, t=0.1)
             rows.append(postprocess(x_rec))
     except AttributeError:

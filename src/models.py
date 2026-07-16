@@ -655,7 +655,7 @@ class HVAE(nnx.Module):
                     r_scale = r_scale * t
                 cf_zs.append(r_loc + r_scale * u)
             return cf_zs
-        return q_stats
+        return [z["z"] if isinstance(z, dict) else z for z in q_stats]
 
     def forward_latents(self, latents, parents, t=None, rng=None):
         h, _ = self.decoder(parents=parents, latents=latents, t=t, rng=rng, training=False)
