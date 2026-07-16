@@ -16,6 +16,8 @@ if [ "${CONDA_DEFAULT_ENV:-}" != "med-jax" ]; then
 fi
 
 accelerator="cpu"
+gpu_id="${CUDA_VISIBLE_DEVICES:-0}"
+gpu_id="${gpu_id%%,*}"
 exp_name=""
 data_dir=""
 ckpt_dir=""
@@ -29,6 +31,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --accelerator)
       accelerator="${2:?missing value for --accelerator}"
+      shift 2
+      ;;
+    --gpu_id)
+      gpu_id="${2:?missing value for --gpu_id}"
       shift 2
       ;;
     --exp_name)
@@ -90,6 +96,10 @@ fi
 if [ "$accelerator" = "cuda" ]; then
   accelerator="gpu"
 fi
+if [[ "$accelerator" != "cpu" && "$accelerator" != "gpu" && "$accelerator" != "tpu" ]]; then
+  echo "Unsupported accelerator '$accelerator'. Use cpu, gpu (or cuda), or tpu." >&2
+  exit 2
+fi
 
 if [ -z "$data_dir" ]; then
   data_dir="gs://medical-airnd/causal-gen/datasets/morphomnist"
@@ -115,6 +125,11 @@ if [ "$accelerator" = "cpu" ]; then
   export JAX_PLATFORMS=cpu
   export JAX_PLATFORM_NAME=cpu
   export CUDA_VISIBLE_DEVICES=""
+elif [ "$accelerator" = "gpu" ]; then
+  unset JAX_PLATFORMS
+  unset JAX_PLATFORM_NAME
+  export CUDA_VISIBLE_DEVICES="$gpu_id"
+  echo "GPU selection: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (single-device JAX)"
 else
   unset JAX_PLATFORMS
   unset JAX_PLATFORM_NAME
@@ -123,6 +138,7 @@ fi
 run_cmd=(
   python -u train_cf.py
   --accelerator "$accelerator"
+  --gpu_id "$gpu_id"
   --precision fp32
   --dataset morphomnist
   --data_dir "$data_dir"

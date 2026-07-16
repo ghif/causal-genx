@@ -58,6 +58,36 @@ def setup_logging(args):
     return logging.getLogger("causal-genx-cf")
 
 
+def _validate_runtime_device(args) -> None:
+    devices = jax.devices()
+    if args.accelerator == "gpu":
+        gpu_devices = [device for device in devices if device.platform in {"gpu", "cuda"}]
+        if not gpu_devices:
+            raise RuntimeError(
+                "--accelerator gpu requested, but JAX found no CUDA GPU. Install a CUDA-enabled "
+                "JAX build compatible with the NVIDIA driver and CUDA runtime."
+            )
+        if len(gpu_devices) != 1:
+            raise RuntimeError(
+                f"Counterfactual finetuning requires one visible GPU, found {len(gpu_devices)}. "
+                "Set --gpu_id or CUDA_VISIBLE_DEVICES to a single device."
+            )
+        device = gpu_devices[0]
+    elif args.accelerator == "cpu":
+        cpu_devices = [device for device in devices if device.platform == "cpu"]
+        if not cpu_devices:
+            raise RuntimeError("--accelerator cpu requested, but JAX found no CPU device")
+        device = cpu_devices[0]
+    else:
+        matching_devices = [device for device in devices if device.platform == args.accelerator]
+        if not matching_devices:
+            raise RuntimeError(
+                f"--accelerator {args.accelerator} requested, but JAX devices are {devices}"
+            )
+        device = matching_devices[0]
+    print(f"JAX device preflight passed: platform={device.platform} device={device}")
+
+
 def loginfo(title: str, logger: Any, stats: Dict[str, Any]) -> None:
     logger.info(f"{title} | " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
 
@@ -89,6 +119,7 @@ def _restore_args(args, checkpoint):
     saved = checkpoint.get("hparams", {})
     preserved = {
         "accelerator": args.accelerator,
+        "gpu_id": args.gpu_id,
         "data_dir": args.data_dir,
         "load_path": args.load_path,
         "testing": args.testing,
@@ -616,6 +647,7 @@ def _save_cf_checkpoint(args, state, epoch: int) -> str:
 
 
 def main(args):
+    _validate_runtime_device(args)
     seed_all(args.seed, args.deterministic)
     if args.do_pa in {"None", "none", "null", ""}:
         args.do_pa = None
@@ -867,6 +899,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = add_arguments(parser)
     parser.add_argument("--load_path", type=str, default="")
+    parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument("--pgm_path", type=str, default="checkpoints/morphomnist/pgm/checkpoints")
     parser.add_argument("--predictor_path", type=str, default="checkpoints/morphomnist/run/checkpoints")
     parser.add_argument("--vae_path", type=str, default="checkpoints/morphomnist/run/checkpoints")
