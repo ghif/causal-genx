@@ -141,6 +141,7 @@ run_cmd=(
   --alpha 0.1
   --lmbda_init 0
   --damping 100
+  --model_validation_batches 1
   --seed 7
 )
 

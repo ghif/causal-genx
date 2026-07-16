@@ -97,6 +97,7 @@ def _restore_args(args, checkpoint):
         "predictor_path": args.predictor_path,
         "vae_path": args.vae_path,
         "trust_incomplete_checkpoint": args.trust_incomplete_checkpoint,
+        "model_validation_batches": args.model_validation_batches,
     }
     for key, value in saved.items():
         if hasattr(args, key):
@@ -518,6 +519,83 @@ def _epoch_batches(dataset, batch_size: int, *, shuffle: bool, drop_last: bool, 
             yield batch
 
 
+def _model_validation_batches(args, dataset):
+    rng = np.random.default_rng(args.seed)
+    for index, raw_batch in enumerate(
+        _epoch_batches(dataset, args.bs, shuffle=False, drop_last=False, rng=rng)
+    ):
+        if args.model_validation_batches > 0 and index >= args.model_validation_batches:
+            break
+        yield preprocess_batch(args, raw_batch, compact_pa=True)
+
+
+def _validated_means(name: str, path: str, totals: Dict[str, float], count: int) -> None:
+    if count == 0:
+        raise ValueError(f"{name} checkpoint validation found no test samples: {path}")
+    means = {key: value / count for key, value in totals.items()}
+    if not all(np.isfinite(value) for value in means.values()):
+        raise ValueError(f"{name} checkpoint validation produced non-finite metrics at {path}: {means}")
+    metrics = " - ".join(f"{key}: {value:.4f}" for key, value in means.items())
+    print(f"Validated {name} checkpoint: {path} | samples: {count} | {metrics}")
+
+
+def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
+    model = bundle.materialize()
+    model.eval()
+    totals = {key: 0.0 for key in ("elbo", "nll", "kl")}
+    count = 0
+    for index, batch in enumerate(_model_validation_batches(args, dataset)):
+        parents = _expand_parents(batch["pa"], args.input_res)
+        outputs = model(
+            batch["x"],
+            parents,
+            beta=args.beta,
+            rng=jax.random.PRNGKey(args.seed + index),
+        )
+        size = int(batch["x"].shape[0])
+        for key in totals:
+            totals[key] += float(outputs[key]) * size
+        count += size
+    _validated_means("VAE", args.vae_path, totals, count)
+
+
+def _validate_pgm_checkpoint(args, bundle: Bundle, dataset) -> None:
+    model = bundle.materialize()
+    model.eval()
+    totals = {"nll": 0.0, "joint_log_prob": 0.0}
+    count = 0
+    for batch in _model_validation_batches(args, dataset):
+        pa = batch["pa"]
+        outputs = model.log_prob(pa[:, 0], pa[:, 1], pa[:, 2:])
+        joint = jnp.mean(outputs["joint"])
+        size = int(batch["x"].shape[0])
+        totals["nll"] += float(-joint) * size
+        totals["joint_log_prob"] += float(joint) * size
+        count += size
+    _validated_means("PGM", args.pgm_path, totals, count)
+
+
+def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
+    model = bundle.materialize()
+    model.eval()
+    totals = {"nll": 0.0, "joint_log_prob": 0.0}
+    count = 0
+    for batch in _model_validation_batches(args, dataset):
+        pa = batch["pa"]
+        outputs = model.model_anticausal(
+            x=batch["x"],
+            thickness=pa[:, 0:1],
+            intensity=pa[:, 1:2],
+            digit=pa[:, 2:],
+        )
+        joint = jnp.mean(outputs["joint"])
+        size = int(batch["x"].shape[0])
+        totals["nll"] += float(-joint) * size
+        totals["joint_log_prob"] += float(joint) * size
+        count += size
+    _validated_means("predictor", args.predictor_path, totals, count)
+
+
 def _save_cf_checkpoint(args, state, epoch: int) -> str:
     payload = {
         "epoch": epoch,
@@ -546,8 +624,14 @@ def main(args):
         args.elbo_constraint = 1.841216802597046
 
     vae_ckpt, vae_bundle = _load_vae_bundle(args)
+    datasets = morphomnist(args)
+    _validate_vae_checkpoint(args, vae_bundle, datasets["test"])
+
     pgm_ckpt, pgm_bundle = _load_pgm_bundle(args)
+    _validate_pgm_checkpoint(args, pgm_bundle, datasets["test"])
+
     predictor_ckpt, predictor_bundle = _load_predictor_bundle(args)
+    _validate_predictor_checkpoint(args, predictor_bundle, datasets["test"])
 
     if jax.tree_util.tree_structure(vae_bundle.params) != jax.tree_util.tree_structure(
         vae_ckpt.get("ema_params", vae_ckpt.get("params"))
@@ -618,7 +702,6 @@ def main(args):
     ensure_dir(args.checkpoint_dir)
     logger = setup_logging(args)
     writer = SummaryWriter(args.save_dir)
-    datasets = morphomnist(args)
     train_samples = datasets["train"].samples
 
     for key in sorted(vars(args)):
@@ -797,6 +880,12 @@ if __name__ == "__main__":
     parser.add_argument("--imgs_plot", type=int, default=10)
     parser.add_argument("--cf_particles", type=int, default=1)
     parser.add_argument("--elbo_constraint", type=float, default=1.841216802597046)
+    parser.add_argument(
+        "--model_validation_batches",
+        type=int,
+        default=1,
+        help="Test batches used to validate each loaded model; 0 validates the full test split.",
+    )
     parser.add_argument(
         "--trust_incomplete_checkpoint",
         action="store_true",
