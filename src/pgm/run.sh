@@ -64,6 +64,10 @@ while [ $# -gt 0 ]; do
       fi
       ;;
     *)
+      if [[ "$1" =~ ^[[:space:]]+$ ]]; then
+        echo "Unexpected whitespace-only argument. Ensure each line-continuation backslash is the final character on its line." >&2
+        exit 2
+      fi
       if [ -z "$exp_name" ]; then
         exp_name="$1"
       else
@@ -97,6 +101,10 @@ fi
 if [ -z "$vae_path" ]; then
   vae_path="../../checkpoints/morphomnist/run/checkpoints"
 fi
+
+echo "VAE checkpoint: $vae_path"
+echo "PGM checkpoint: $pgm_path"
+echo "Predictor checkpoint: $predictor_path"
 
 if [ "$accelerator" = "cpu" ]; then
   export JAX_PLATFORMS=cpu
