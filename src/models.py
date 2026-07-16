@@ -418,7 +418,8 @@ class Decoder(nnx.Module):
         h = z = bias[1].repeat(parents.shape[0], axis=0)
         p_sto, p_det = (1, 1)
         if training and self.cond_prior:
-            p_sto, p_det = self.drop_cond(rng)
+            rng, cond_rng = jax.random.split(rng)
+            p_sto, p_det = self.drop_cond(cond_rng)
         stats = []
         keys = jax.random.split(rng, len(self.blocks) + 1)
         for i, block in enumerate(self.blocks):
@@ -610,9 +611,9 @@ class HVAE(nnx.Module):
         )
         self.likelihood = DGaussNet(self.input_channels, self.widths[0], self.std_init, rngs=rngs)
 
-    def __call__(self, x, parents, beta=1.0, rng=None):
+    def __call__(self, x, parents, beta=1.0, rng=None, training=True):
         acts = self.encoder(x)
-        h, stats = self.decoder(parents=parents, x=acts, rng=rng, training=True)
+        h, stats = self.decoder(parents=parents, x=acts, rng=rng, training=training)
         nll = self.likelihood.nll(h, x)
         if self.kl_free_bits > 0:
             fb = self.kl_free_bits

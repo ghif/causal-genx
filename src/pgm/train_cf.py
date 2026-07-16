@@ -25,6 +25,11 @@ from tqdm import tqdm
 from datasets import morphomnist
 from hps import add_arguments, setup_hparams
 from models import HVAE
+from pgm.cf_parity import (
+    clip_counterfactual_grads,
+    damped_lagrangian_loss,
+    inherit_vae_training_config,
+)
 from pgm.flow_pgm import MorphoMNISTPGM
 from pgm.sup_aux_pgm import MorphoMNISTSupAuxPredictor
 from trainer import init_state, preprocess_batch
@@ -238,6 +243,7 @@ def _make_intervention(
 
 def _load_vae_bundle(args):
     vae_hparams = _load_vae_hparams(args)
+    inherit_vae_training_config(args, vae_hparams)
     model_args = {
         key: vae_hparams.get(key, getattr(args, key))
         for key in (
@@ -357,18 +363,20 @@ def _cf_forward(
     lmbda: jax.Array,
     cf_particles: int,
     t_abduct: float = 1.0,
+    training: bool = True,
 ):
     vae = vae_bundle.materialize()
     pgm = pgm_bundle.materialize()
     predictor = predictor_bundle.materialize()
 
-    vae.train()
+    vae.train(training)
     pgm.eval()
     predictor.eval()
 
     pa = batch["pa"]
     pa_maps = _expand_parents(pa, args.input_res)
-    vae_out = vae(batch["x"], pa_maps, beta=beta, rng=rng)
+    vae_rng, counterfactual_rng = jax.random.split(rng)
+    vae_out = vae(batch["x"], pa_maps, beta=beta, rng=vae_rng, training=training)
 
     obs_pgm = {
         "thickness": pa[:, 0],
@@ -379,18 +387,19 @@ def _cf_forward(
     if cf_particles > 1:
         cfs = {"x": jnp.zeros_like(batch["x"]), "x2": jnp.zeros_like(batch["x"])}
 
-    keys = jax.random.split(rng, cf_particles + 2)
+    particle_keys = jax.random.split(counterfactual_rng, cf_particles)
     for i in range(cf_particles):
-        cf_pa = pgm.counterfactual(obs=obs_pgm, intervention=do, rng=keys[i])
+        pgm_rng, abduct_rng, cf_rng, rec_rng = jax.random.split(particle_keys[i], 4)
+        cf_pa = pgm.counterfactual(obs=obs_pgm, intervention=do, rng=pgm_rng)
         cf_pa_maps = _expand_parents(cf_pa["pa"], args.input_res)
-        latents = vae.abduct(batch["x"], pa_maps, t=t_abduct, rng=keys[i + 1])
-        cf_loc, cf_scale = vae.forward_latents(latents, cf_pa_maps, rng=keys[i + 1])
-        rec_loc, rec_scale = vae.forward_latents(latents, pa_maps, rng=keys[i + 1])
+        latents = vae.abduct(batch["x"], pa_maps, t=t_abduct, rng=abduct_rng)
+        cf_loc, cf_scale = vae.forward_latents(latents, cf_pa_maps, rng=cf_rng)
+        rec_loc, rec_scale = vae.forward_latents(latents, pa_maps, rng=rec_rng)
         u = (batch["x"] - rec_loc) / jnp.clip(rec_scale, min=1e-12)
         cf_x = jnp.clip(cf_loc + cf_scale * u, min=-1, max=1)
         if cf_particles > 1:
             cfs["x"] = cfs["x"] + cf_x
-            cfs["x2"] = cfs["x2"] + cf_x**2
+            cfs["x2"] = cfs["x2"] + jax.lax.stop_gradient(cf_x**2)
         else:
             cfs = {"x": cf_x}
 
@@ -404,9 +413,8 @@ def _cf_forward(
     cfs.update(cf_pa)
     log_probs = predictor.model_anticausal(**cfs)
     aux_loss = -jnp.mean(log_probs["joint"])
-    sg = args.elbo_constraint - vae_out["elbo"]
-    damp = args.damping * sg
-    loss = aux_loss - (lmbda - damp) * (args.elbo_constraint - vae_out["elbo"])
+    constraint = args.elbo_constraint - vae_out["elbo"]
+    loss = damped_lagrangian_loss(aux_loss, lmbda, constraint, args.damping)
     out = dict(vae_out)
     out.update({"loss": loss, "aux_loss": aux_loss, "cfs": cfs, "var_cf_x": var_cf_x})
     return out
@@ -427,6 +435,7 @@ def _make_losses(args, vae_bundle, pgm_bundle, predictor_bundle):
             alpha=args.alpha,
             lmbda=lmbda,
             cf_particles=args.cf_particles,
+            training=True,
         )
         return out["loss"], out
 
@@ -441,18 +450,24 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
             vae_params, lmbda, batch, do, rng
         )
         vae_grads, lmbda_grads = grads
-        grad_norm = optax.global_norm(vae_grads)
+        clipped_vae_grads, clipped_lmbda_grads, grad_norm = clip_counterfactual_grads(
+            vae_grads, lmbda_grads, args.grad_clip
+        )
         finite = jnp.isfinite(loss) & jnp.isfinite(grad_norm)
         finite = finite & (grad_norm < args.grad_skip)
 
         def _apply_updates(values):
-            p, o, l, lo = values
-            updates, o = optimizer.update(vae_grads, o, p)
-            p = optax.apply_updates(p, updates)
-            lambda_updates, lo = lambda_optimizer.update(jax.tree_util.tree_map(lambda x: -x, lmbda_grads), lo, l)
-            l = optax.apply_updates(l, lambda_updates)
-            l = jnp.clip(l, min=0)
-            return p, o, l, lo
+            params, opt_state, lmbda_value, lambda_opt_state = values
+            updates, opt_state = optimizer.update(clipped_vae_grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            lambda_updates, lambda_opt_state = lambda_optimizer.update(
+                jax.tree_util.tree_map(lambda x: -x, clipped_lmbda_grads),
+                lambda_opt_state,
+                lmbda_value,
+            )
+            lmbda_value = optax.apply_updates(lmbda_value, lambda_updates)
+            lmbda_value = jnp.clip(lmbda_value, min=0)
+            return params, opt_state, lmbda_value, lambda_opt_state
 
         def _skip_updates(values):
             return values
@@ -473,7 +488,7 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
 
 
 def _make_eval_step(args, vae_bundle, pgm_bundle, predictor_bundle):
-    def step(vae_params, batch, do, rng):
+    def step(vae_params, lmbda, batch, do, rng):
         local_vae = Bundle(vae_bundle.graphdef, _vae_compute_params(args, vae_params))
         out = _cf_forward(
             args,
@@ -485,12 +500,29 @@ def _make_eval_step(args, vae_bundle, pgm_bundle, predictor_bundle):
             rng,
             beta=args.beta,
             alpha=args.alpha,
-            lmbda=jnp.asarray(0.0, dtype=jnp.float32),
+            lmbda=lmbda,
             cf_particles=args.cf_particles,
+            training=False,
         )
         return out
 
     return jax.jit(step)
+
+
+def _make_optimizers(args):
+    optimizer = optax.adamw(
+        learning_rate=args.lr,
+        b1=args.betas[0],
+        b2=args.betas[1],
+        weight_decay=args.wd,
+    )
+    lambda_optimizer = optax.adamw(
+        learning_rate=args.lr_lagrange,
+        b1=args.betas[0],
+        b2=args.betas[1],
+        weight_decay=0.0,
+    )
+    return optimizer, lambda_optimizer
 
 
 def _eval_split(
@@ -507,7 +539,6 @@ def _eval_split(
 ):
     dag_vars = list(MorphoMNISTPGM.variables.keys())
     dataset = datasets[split]
-    do_k = _choose_intervention(args, dag_vars)
     stats = {k: 0.0 for k in ["loss", "aux_loss", "elbo", "nll", "kl", "n"]}
     preds = {k: [] for k in ["thickness", "intensity", "digit"]}
     targets = {k: [] for k in ["thickness", "intensity", "digit"]}
@@ -522,8 +553,15 @@ def _eval_split(
     predictor.eval()
     for i, raw_batch in enumerate(loader):
         batch = preprocess_batch(args, raw_batch, compact_pa=True)
+        do_k = _choose_intervention(args, dag_vars)
         do = _make_intervention(args, batch, do_k, train_samples, train=(split == "train"))
-        out = eval_step(state["ema_params"], batch, do, jax.random.fold_in(jax.random.PRNGKey(args.seed), i))
+        out = eval_step(
+            state["vae_params"],
+            state["lmbda"],
+            batch,
+            do,
+            jax.random.fold_in(jax.random.PRNGKey(args.seed), i),
+        )
         bs = int(batch["x"].shape[0])
         stats["n"] += bs
         stats["loss"] += float(out["loss"]) * bs
@@ -608,6 +646,7 @@ def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
             parents,
             beta=args.beta,
             rng=jax.random.PRNGKey(args.seed + index),
+            training=False,
         )
         size = int(batch["x"].shape[0])
         for key in totals:
@@ -678,6 +717,8 @@ def main(args):
     seed_all(args.seed, args.deterministic)
     if args.do_pa in {"None", "none", "null", ""}:
         args.do_pa = None
+    if args.dataset != "morphomnist":
+        raise ValueError("JAX counterfactual finetuning currently supports --dataset morphomnist only")
 
     if not hasattr(args, "elbo_constraint") or args.elbo_constraint is None:
         args.elbo_constraint = 1.841216802597046
@@ -703,28 +744,18 @@ def main(args):
         "opt_state": None,
         "lmbda": jnp.asarray(args.lmbda_init, dtype=jnp.float32),
         "lambda_opt_state": None,
-        "ema": EMA.init_from(vae_ckpt.get("ema_params", vae_ckpt.get("params")), args.ema_rate),
+        "ema": EMA.init_from(
+            vae_ckpt.get("ema_params", vae_ckpt.get("params")),
+            args.ema_rate,
+            update_after_step=100,
+        ),
         "ema_params": tree_copy(vae_ckpt.get("ema_params", vae_ckpt.get("params"))),
         "step": 0,
         "epoch": 0,
         "best_loss": float("inf"),
     }
 
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(args.grad_clip),
-        optax.adamw(
-            learning_rate=args.lr,
-            b1=args.betas[0],
-            b2=args.betas[1],
-            weight_decay=args.wd,
-        ),
-    )
-    lambda_optimizer = optax.adamw(
-        learning_rate=args.lr_lagrange,
-        b1=args.betas[0],
-        b2=args.betas[1],
-        weight_decay=0.0,
-    )
+    optimizer, lambda_optimizer = _make_optimizers(args)
     state["opt_state"] = optimizer.init(state["vae_params"])
     state["lambda_opt_state"] = lambda_optimizer.init(state["lmbda"])
 
@@ -744,13 +775,18 @@ def main(args):
             _restore_args(args, ckpt)
             state["vae_params"] = ckpt["vae_params"]
             state["ema_params"] = ckpt["ema_params"]
-            state["ema"] = EMA(params=tree_copy(ckpt["ema_params"]), decay=args.ema_rate)
+            state["ema"] = EMA(
+                params=tree_copy(ckpt["ema_params"]),
+                decay=args.ema_rate,
+                update_after_step=100,
+            )
             state["opt_state"] = ckpt["opt_state"]
             state["lmbda"] = ckpt["lmbda"]
             state["lambda_opt_state"] = ckpt["lambda_opt_state"]
             state["step"] = int(ckpt.get("step", 0))
             state["epoch"] = int(ckpt.get("epoch", 0))
             state["best_loss"] = float(ckpt.get("best_loss", float("inf")))
+            optimizer, lambda_optimizer = _make_optimizers(args)
         else:
             print(f"Checkpoint not found: {args.load_path}")
 
@@ -788,8 +824,8 @@ def main(args):
             train_samples,
             rng,
         )
-        print(f"\n[test] " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
-        print(f"[test] " + " - ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
+        print("\n[test] " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
+        print("[test] " + " - ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
         writer.close()
         return
 
@@ -925,6 +961,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = add_arguments(parser)
+    parser.set_defaults(lr=1e-4, eval_freq=1)
     parser.add_argument("--load_path", type=str, default="")
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument("--pgm_path", type=str, default="checkpoints/morphomnist/pgm/checkpoints")

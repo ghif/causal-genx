@@ -557,14 +557,40 @@ def tree_copy(tree):
 class EMA:
     params: Any
     decay: float = 0.999
+    update_after_step: Optional[int] = None
+    step: int = 0
+    initted: bool = False
 
     @classmethod
-    def init_from(cls, params, decay: float = 0.999):
-        return cls(params=tree_copy(params), decay=decay)
+    def init_from(cls, params, decay: float = 0.999, update_after_step: Optional[int] = None):
+        return cls(
+            params=tree_copy(params),
+            decay=decay,
+            update_after_step=update_after_step,
+        )
 
     def update(self, params):
+        if self.update_after_step is not None:
+            current_step = self.step
+            self.step += 1
+            if current_step <= self.update_after_step:
+                self.params = tree_copy(params)
+                return
+            if not self.initted:
+                self.params = tree_copy(params)
+                self.initted = True
+
+            epoch = max(self.step - self.update_after_step - 1, 0)
+            current_decay = 0.0 if epoch <= 0 else min(
+                self.decay, 1.0 - (1.0 + epoch) ** -1.0
+            )
+        else:
+            current_decay = self.decay
+
         self.params = jax.tree_util.tree_map(
-            lambda e, p: self.decay * e + (1.0 - self.decay) * p, self.params, params
+            lambda e, p: current_decay * e + (1.0 - current_decay) * p,
+            self.params,
+            params,
         )
 
 
