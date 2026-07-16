@@ -22,6 +22,7 @@ ckpt_dir=""
 pgm_path=""
 predictor_path=""
 vae_path=""
+trust_incomplete_checkpoint="false"
 extra_args=()
 
 while [ $# -gt 0 ]; do
@@ -53,6 +54,10 @@ while [ $# -gt 0 ]; do
     --vae_path)
       vae_path="${2:?missing value for --vae_path}"
       shift 2
+      ;;
+    --trust_incomplete_checkpoint)
+      trust_incomplete_checkpoint="true"
+      shift
       ;;
     --*)
       if [ $# -ge 2 ] && [[ "${2}" != --* ]]; then
@@ -141,6 +146,10 @@ run_cmd=(
 
 if [ "${#extra_args[@]}" -gt 0 ]; then
   run_cmd+=("${extra_args[@]}")
+fi
+
+if [ "$trust_incomplete_checkpoint" = "true" ]; then
+  run_cmd+=(--trust_incomplete_checkpoint)
 fi
 
 "${run_cmd[@]}"

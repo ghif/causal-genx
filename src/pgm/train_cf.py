@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import logging
 import os
 import random
@@ -26,7 +27,7 @@ from hps import add_arguments, setup_hparams
 from models import HVAE
 from pgm.flow_pgm import MorphoMNISTPGM
 from pgm.sup_aux_pgm import MorphoMNISTSupAuxPredictor
-from trainer import preprocess_batch
+from trainer import init_state, preprocess_batch
 from utils import (
     EMA,
     SummaryWriter,
@@ -34,6 +35,7 @@ from utils import (
     ensure_dir,
     experiment_run_dir,
     load_checkpoint,
+    open_file,
     save_checkpoint,
     seed_all,
     sync_file,
@@ -94,6 +96,7 @@ def _restore_args(args, checkpoint):
         "pgm_path": args.pgm_path,
         "predictor_path": args.predictor_path,
         "vae_path": args.vae_path,
+        "trust_incomplete_checkpoint": args.trust_incomplete_checkpoint,
     }
     for key, value in saved.items():
         if hasattr(args, key):
@@ -105,6 +108,28 @@ def _restore_args(args, checkpoint):
 def _assert_tree_compatible(name: str, checkpoint: Dict[str, Any], tree: Any, key: str) -> None:
     if jax.tree_util.tree_structure(checkpoint[key]) != jax.tree_util.tree_structure(tree):
         raise ValueError(f"{name} checkpoint parameter structure does not match the current model")
+
+
+def _load_runtime_checkpoint(args, path: str, template: Optional[Dict[str, Any]] = None):
+    fallback_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    return load_checkpoint(
+        path,
+        template=template,
+        fallback_sharding=fallback_sharding,
+        allow_incomplete=args.trust_incomplete_checkpoint,
+    )
+
+
+def _checkpoint_root(path: str) -> str:
+    path = path.rstrip("/")
+    if path.split("/")[-1].isdigit():
+        return path.rsplit("/", 1)[0]
+    return path
+
+
+def _load_vae_hparams(args) -> Dict[str, Any]:
+    with open_file(f"{_checkpoint_root(args.vae_path)}/hparams.json", "r") as f:
+        return json.load(f)
 
 
 def _expand_parents(pa: jax.Array, input_res: int) -> jax.Array:
@@ -140,25 +165,45 @@ def _make_intervention(
 
 
 def _load_vae_bundle(args):
+    vae_hparams = _load_vae_hparams(args)
+    model_args = {
+        key: vae_hparams.get(key, getattr(args, key))
+        for key in (
+            "input_channels",
+            "input_res",
+            "enc_arch",
+            "dec_arch",
+            "widths",
+            "z_dim",
+            "context_dim",
+            "z_max_res",
+            "bottleneck",
+            "cond_prior",
+            "q_correction",
+            "bias_max_res",
+            "x_like",
+            "kl_free_bits",
+            "std_init",
+            "hps",
+        )
+    }
+    for key, value in model_args.items():
+        setattr(args, key, value)
+
     rngs = nnx.Rngs(args.seed)
-    vae = HVAE(
-        input_channels=args.input_channels,
-        input_res=args.input_res,
-        enc_arch=args.enc_arch,
-        dec_arch=args.dec_arch,
-        widths=args.widths,
-        z_dim=args.z_dim,
-        context_dim=args.context_dim,
-        bottleneck=args.bottleneck,
-        cond_prior=args.cond_prior,
-        x_like=args.x_like,
-        kl_free_bits=args.kl_free_bits,
-        std_init=args.std_init,
-        hps=args.hps,
-        rngs=rngs,
-    )
+    vae = HVAE(**model_args, rngs=rngs)
     graphdef, _ = nnx.split(vae, nnx.Param)
-    checkpoint = load_checkpoint(args.vae_path)
+    params = nnx.state(vae, nnx.Param).to_pure_dict()
+    _, tx = init_state(vae, args, None, jax.random.PRNGKey(args.seed))
+    template = {
+        "epoch": 0,
+        "step": 0,
+        "best_loss": float("inf"),
+        "params": params,
+        "ema_params": params,
+        "opt_state": tx.init(params),
+    }
+    checkpoint = _load_runtime_checkpoint(args, args.vae_path, template=template)
     params = checkpoint.get("ema_params", checkpoint.get("params"))
     if params is None:
         raise ValueError(f"VAE checkpoint at {args.vae_path} is missing params")
@@ -167,7 +212,7 @@ def _load_vae_bundle(args):
 
 
 def _load_pgm_bundle(args):
-    pgm_ckpt = load_checkpoint(args.pgm_path)
+    pgm_ckpt = _load_runtime_checkpoint(args, args.pgm_path)
     if pgm_ckpt.get("format_version") != 2 or "ema_params" not in pgm_ckpt:
         raise ValueError(
             "The PGM checkpoint uses the old simplified Gaussian/CNN format. "
@@ -182,7 +227,7 @@ def _load_pgm_bundle(args):
 
 
 def _load_predictor_bundle(args):
-    predictor_ckpt = load_checkpoint(args.predictor_path)
+    predictor_ckpt = _load_runtime_checkpoint(args, args.predictor_path)
     if predictor_ckpt.get("format_version") != 3 or "ema_params" not in predictor_ckpt:
         raise ValueError(
             "The predictor checkpoint uses the old simplified CNN format. "
@@ -538,7 +583,7 @@ def main(args):
                 "lmbda": state["lmbda"],
                 "lambda_opt_state": state["lambda_opt_state"],
             }
-            ckpt = load_checkpoint(args.load_path, template=template)
+            ckpt = _load_runtime_checkpoint(args, args.load_path, template=template)
             _restore_args(args, ckpt)
             state["vae_params"] = ckpt["vae_params"]
             state["ema_params"] = ckpt["ema_params"]
@@ -728,5 +773,11 @@ if __name__ == "__main__":
     parser.add_argument("--imgs_plot", type=int, default=10)
     parser.add_argument("--cf_particles", type=int, default=1)
     parser.add_argument("--elbo_constraint", type=float, default=1.841216802597046)
+    parser.add_argument(
+        "--trust_incomplete_checkpoint",
+        action="store_true",
+        default=False,
+        help="Restore the newest numeric step even if commit_success.txt is missing.",
+    )
     args = setup_hparams(parser)
     main(args)
