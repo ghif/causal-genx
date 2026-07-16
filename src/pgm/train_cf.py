@@ -142,6 +142,21 @@ def _choose_intervention(args, dag_vars: List[str]) -> str:
     return copy.deepcopy(args.do_pa) if args.do_pa else random.choice(dag_vars)
 
 
+def _batch_parent(args, batch: Dict[str, jax.Array], name: str) -> jax.Array:
+    if name in batch:
+        value = batch[name]
+        return value[:, None] if value.ndim == 1 else value
+
+    pa = batch["pa"]
+    offset = 0
+    for parent_name in args.parents_x:
+        width = 10 if parent_name == "digit" else 1
+        if parent_name == name:
+            return pa[:, offset : offset + width]
+        offset += width
+    raise KeyError(f"Parent {name!r} is not present in batch or --parents_x={args.parents_x}")
+
+
 def _make_intervention(
     args,
     batch: Dict[str, jax.Array],
@@ -151,10 +166,9 @@ def _make_intervention(
     train: bool,
 ) -> Dict[str, jax.Array]:
     if train:
-        permutation = np.random.permutation(batch[do_k].shape[0])
-        value = batch[do_k][permutation]
-        if value.ndim == 1:
-            value = value[:, None]
+        parent = _batch_parent(args, batch, do_k)
+        permutation = np.random.permutation(parent.shape[0])
+        value = parent[permutation]
         return {do_k: value}
 
     idx = np.random.permutation(train_samples[do_k].shape[0])

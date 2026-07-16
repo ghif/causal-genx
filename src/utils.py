@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
@@ -324,6 +325,7 @@ def _restore_orbax_step_direct(
     step_dir: str,
     template: Optional[Dict[str, Any]],
     fallback_sharding: Optional[Any],
+    suppress_warnings: bool = False,
 ) -> Dict[str, Any]:
     parent_dir = os.path.dirname(step_dir.rstrip("/"))
     step_name = os.path.basename(step_dir.rstrip("/"))
@@ -332,25 +334,39 @@ def _restore_orbax_step_direct(
     except ValueError as exc:
         raise ValueError(f"Unsupported Orbax step directory: {step_dir}") from exc
 
-    manager = _checkpoint_manager(parent_dir, create=False)
+    with _orbax_warning_filter(suppress_warnings):
+        manager = _checkpoint_manager(parent_dir, create=False)
+        try:
+            restore_args = ocp.args.StandardRestore(item=template, fallback_sharding=fallback_sharding)
+            ckpt_args = ocp.args.Composite(default=restore_args)
+            # Checkpointer.restore rejects directories without commit_success.txt.
+            # Calling the handler is the explicit escape hatch for checkpoints whose
+            # payload finished uploading but whose final marker was never written.
+            composite = manager._checkpointer._handler.restore(  # type: ignore[attr-defined]
+                epath.Path(step_dir),
+                args=ckpt_args,
+            )
+            restored = composite["default"]
+            _load_hparams_if_present(parent_dir, restored)
+            return restored
+        finally:
+            manager.close()
+
+
+@contextmanager
+def _orbax_warning_filter(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    from absl import logging as absl_logging
+
+    previous_verbosity = absl_logging.get_verbosity()
+    absl_logging.set_verbosity(absl_logging.ERROR)
     try:
-        restore_args = ocp.args.StandardRestore(item=template, fallback_sharding=fallback_sharding)
-        ckpt_args = ocp.args.Composite(default=restore_args)
-        # Checkpointer.restore rejects directories without commit_success.txt.
-        # Calling the handler is the explicit escape hatch for checkpoints whose
-        # payload finished uploading but whose final marker was never written.
-        composite = manager._checkpointer._handler.restore(  # type: ignore[attr-defined]
-            epath.Path(step_dir),
-            args=ckpt_args,
-        )
-        restored = composite["default"]
-        hparams_path = os.path.join(parent_dir, "hparams.json")
-        if os.path.isfile(hparams_path):
-            with open(hparams_path, "r", encoding="utf-8") as f:
-                restored["hparams"] = json.load(f)
-        return restored
+        yield
     finally:
-        manager.close()
+        absl_logging.set_verbosity(previous_verbosity)
 
 
 def _load_hparams_if_present(root_dir: str, restored: Dict[str, Any]) -> None:
@@ -479,7 +495,12 @@ def load_checkpoint(
 
     if _is_orbax_step_dir(path):
         if allow_incomplete:
-            return _restore_orbax_step_direct(path, template, fallback_sharding)
+            return _restore_orbax_step_direct(
+                path,
+                template,
+                fallback_sharding,
+                suppress_warnings=True,
+            )
         if not _is_complete_orbax_step_dir(path):
             parent_dir = os.path.dirname(path.rstrip("/"))
             latest = _find_latest_complete_orbax_step_dir(parent_dir)
