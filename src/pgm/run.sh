@@ -16,8 +16,10 @@ if [ "${CONDA_DEFAULT_ENV:-}" != "med-jax" ]; then
 fi
 
 accelerator="cpu"
+precision="auto"
 gpu_id="${CUDA_VISIBLE_DEVICES:-0}"
 gpu_id="${gpu_id%%,*}"
+gpu_memory_fraction="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.90}"
 exp_name=""
 data_dir=""
 ckpt_dir=""
@@ -35,6 +37,14 @@ while [ $# -gt 0 ]; do
       ;;
     --gpu_id)
       gpu_id="${2:?missing value for --gpu_id}"
+      shift 2
+      ;;
+    --gpu_memory_fraction)
+      gpu_memory_fraction="${2:?missing value for --gpu_memory_fraction}"
+      shift 2
+      ;;
+    --precision)
+      precision="${2:?missing value for --precision}"
       shift 2
       ;;
     --exp_name)
@@ -100,6 +110,17 @@ if [[ "$accelerator" != "cpu" && "$accelerator" != "gpu" && "$accelerator" != "t
   echo "Unsupported accelerator '$accelerator'. Use cpu, gpu (or cuda), or tpu." >&2
   exit 2
 fi
+if [ "$precision" = "auto" ]; then
+  if [ "$accelerator" = "cpu" ]; then
+    precision="fp32"
+  else
+    precision="bf16"
+  fi
+fi
+if [[ "$precision" != "fp32" && "$precision" != "bf16" ]]; then
+  echo "Unsupported precision '$precision'. Use auto, fp32, or bf16." >&2
+  exit 2
+fi
 
 if [ -z "$data_dir" ]; then
   data_dir="gs://medical-airnd/causal-gen/datasets/morphomnist"
@@ -120,6 +141,12 @@ fi
 echo "VAE checkpoint: $vae_path"
 echo "PGM checkpoint: $pgm_path"
 echo "Predictor checkpoint: $predictor_path"
+echo "Compute policy: accelerator=$accelerator precision=$precision"
+
+export JAX_ENABLE_COMPILATION_CACHE="${JAX_ENABLE_COMPILATION_CACHE:-true}"
+export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/causal-genx-jax-cache}"
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-1}"
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 if [ "$accelerator" = "cpu" ]; then
   export JAX_PLATFORMS=cpu
@@ -129,6 +156,8 @@ elif [ "$accelerator" = "gpu" ]; then
   unset JAX_PLATFORMS
   unset JAX_PLATFORM_NAME
   export CUDA_VISIBLE_DEVICES="$gpu_id"
+  export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-true}"
+  export XLA_PYTHON_CLIENT_MEM_FRACTION="$gpu_memory_fraction"
   echo "GPU selection: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (single-device JAX)"
 else
   unset JAX_PLATFORMS
@@ -139,7 +168,7 @@ run_cmd=(
   python -u train_cf.py
   --accelerator "$accelerator"
   --gpu_id "$gpu_id"
-  --precision fp32
+  --precision "$precision"
   --dataset morphomnist
   --data_dir "$data_dir"
   --ckpt_dir "$ckpt_dir"

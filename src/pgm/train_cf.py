@@ -88,6 +88,31 @@ def _validate_runtime_device(args) -> None:
     print(f"JAX device preflight passed: platform={device.platform} device={device}")
 
 
+def _configure_compute_policy(args) -> None:
+    if args.accelerator == "cpu" and args.precision != "fp32":
+        raise ValueError("CPU counterfactual finetuning requires --precision fp32")
+    if args.accelerator in {"gpu", "tpu"} and args.precision == "bf16":
+        matmul_precision = "default"
+    else:
+        matmul_precision = "highest"
+    jax.config.update("jax_default_matmul_precision", matmul_precision)
+    print(
+        "JAX compute policy: "
+        f"precision={args.precision} master_params=fp32 matmul_precision={matmul_precision}"
+    )
+
+
+def _vae_compute_params(args, params):
+    if args.precision != "bf16" or args.accelerator not in {"gpu", "tpu"}:
+        return params
+    return jax.tree_util.tree_map(
+        lambda value: value.astype(jnp.bfloat16)
+        if hasattr(value, "dtype") and jnp.issubdtype(value.dtype, jnp.floating)
+        else value,
+        params,
+    )
+
+
 def loginfo(title: str, logger: Any, stats: Dict[str, Any]) -> None:
     logger.info(f"{title} | " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
 
@@ -120,6 +145,7 @@ def _restore_args(args, checkpoint):
     preserved = {
         "accelerator": args.accelerator,
         "gpu_id": args.gpu_id,
+        "precision": args.precision,
         "data_dir": args.data_dir,
         "load_path": args.load_path,
         "testing": args.testing,
@@ -388,7 +414,7 @@ def _cf_forward(
 
 def _make_losses(args, vae_bundle, pgm_bundle, predictor_bundle):
     def loss_fn(vae_params, lmbda, batch, do, rng):
-        local_vae = Bundle(vae_bundle.graphdef, vae_params)
+        local_vae = Bundle(vae_bundle.graphdef, _vae_compute_params(args, vae_params))
         out = _cf_forward(
             args,
             local_vae,
@@ -443,12 +469,12 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
         out["update_skipped"] = jnp.logical_not(finite).astype(jnp.float32)
         return vae_params, opt_state, lmbda, lambda_opt_state, out
 
-    return jax.jit(step)
+    return jax.jit(step, donate_argnums=(0, 1, 2, 3))
 
 
 def _make_eval_step(args, vae_bundle, pgm_bundle, predictor_bundle):
     def step(vae_params, batch, do, rng):
-        local_vae = Bundle(vae_bundle.graphdef, vae_params)
+        local_vae = Bundle(vae_bundle.graphdef, _vae_compute_params(args, vae_params))
         out = _cf_forward(
             args,
             local_vae,
@@ -571,7 +597,7 @@ def _validated_means(name: str, path: str, totals: Dict[str, float], count: int)
 
 
 def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
-    model = bundle.materialize()
+    model = Bundle(bundle.graphdef, _vae_compute_params(args, bundle.params)).materialize()
     model.eval()
     totals = {key: 0.0 for key in ("elbo", "nll", "kl")}
     count = 0
@@ -648,6 +674,7 @@ def _save_cf_checkpoint(args, state, epoch: int) -> str:
 
 def main(args):
     _validate_runtime_device(args)
+    _configure_compute_policy(args)
     seed_all(args.seed, args.deterministic)
     if args.do_pa in {"None", "none", "null", ""}:
         args.do_pa = None
