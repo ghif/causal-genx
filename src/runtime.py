@@ -15,7 +15,7 @@ def _argv_value(flag: str) -> Optional[str]:
     return None
 
 
-def configure_backend(accelerator: str = "cpu") -> str:
+def configure_backend(accelerator: str = "cpu", gpu_id: Optional[str] = None) -> str:
     if accelerator == "cpu":
         os.environ.setdefault("JAX_PLATFORMS", "cpu")
         os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
@@ -25,8 +25,13 @@ def configure_backend(accelerator: str = "cpu") -> str:
     else:
         os.environ.pop("JAX_PLATFORMS", None)
         os.environ.pop("JAX_PLATFORM_NAME", None)
+        if accelerator in {"gpu", "cuda"} and gpu_id is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
     return accelerator
 
 
 def configure_backend_from_argv(default: str = "cpu") -> str:
-    return configure_backend(_argv_value("--accelerator") or default)
+    return configure_backend(
+        _argv_value("--accelerator") or default,
+        gpu_id=_argv_value("--gpu_id"),
+    )

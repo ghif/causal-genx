@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
@@ -70,6 +71,7 @@ if not hasattr(jax, "monitoring") or not hasattr(jax.monitoring, "record_scalar"
     jax.monitoring = _NoOpMonitoring()
 
 import orbax.checkpoint as ocp
+from etils import epath
 from flax import nnx
 
 from tensorboard.compat.proto.event_pb2 import Event
@@ -217,6 +219,169 @@ def _checkpoint_manager(root_dir: str, *, create: bool) -> ocp.CheckpointManager
     return ocp.CheckpointManager(root_dir, options=options)
 
 
+def _dir_entries(path: str):
+    if is_remote_path(path):
+        fs = _remote_fs(path)
+        if fs is None:
+            return []
+        try:
+            entries = fs.ls(path, detail=True)
+        except Exception:
+            return []
+        out = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                name = entry.get("name", "")
+                entry_type = entry.get("type", "")
+            else:
+                name = str(entry)
+                entry_type = ""
+            if not name.startswith("gs://"):
+                name = "gs://" + name.lstrip("/")
+            out.append((name.rstrip("/"), entry_type))
+        return out
+
+    if not os.path.isdir(path):
+        return []
+    out = []
+    for name in os.listdir(path):
+        child = os.path.join(path, name)
+        out.append((child, "directory" if os.path.isdir(child) else "file"))
+    return out
+
+
+def _is_orbax_step_dir(path: str) -> bool:
+    return path_exists(os.path.join(path, "_CHECKPOINT_METADATA"))
+
+
+def _find_orbax_step_dir(path: str, max_depth: int = 4) -> Optional[str]:
+    from collections import deque
+
+    root = path.rstrip("/")
+    queue = deque([(root, 0)])
+    seen = set()
+    while queue:
+        current, depth = queue.popleft()
+        if current in seen:
+            continue
+        seen.add(current)
+        if _is_orbax_step_dir(current):
+            return current
+        if depth >= max_depth:
+            continue
+        for child, entry_type in _dir_entries(current):
+            if entry_type in {"directory", "dir"} or not entry_type:
+                queue.append((child, depth + 1))
+
+    return None
+
+
+def _is_complete_orbax_step_dir(path: str) -> bool:
+    if not _is_orbax_step_dir(path):
+        return False
+    if path_exists(os.path.join(path, "commit_success.txt")):
+        return True
+    if not is_remote_path(path) and ".orbax-checkpoint-tmp" not in path:
+        return True
+    return False
+
+
+def _find_latest_complete_orbax_step_dir(path: str) -> Optional[str]:
+    root = path.rstrip("/")
+
+    if _is_complete_orbax_step_dir(root):
+        return root
+
+    numeric_children = []
+    for child, entry_type in _dir_entries(root):
+        name = os.path.basename(child.rstrip("/"))
+        if not name.isdigit():
+            continue
+        if entry_type in {"directory", "dir"} or not entry_type:
+            numeric_children.append((int(name), child))
+
+    for _, child in sorted(numeric_children, reverse=True):
+        if _is_complete_orbax_step_dir(child):
+            return child
+
+    return None
+
+
+def _find_latest_orbax_step_dir(path: str) -> Optional[str]:
+    root = path.rstrip("/")
+
+    if _is_orbax_step_dir(root):
+        return root
+
+    numeric_children = []
+    for child, entry_type in _dir_entries(root):
+        name = os.path.basename(child.rstrip("/"))
+        if not name.isdigit():
+            continue
+        if entry_type in {"directory", "dir"} or not entry_type:
+            numeric_children.append((int(name), child))
+
+    if not numeric_children:
+        return None
+
+    return sorted(numeric_children, reverse=True)[0][1]
+
+
+def _restore_orbax_step_direct(
+    step_dir: str,
+    template: Optional[Dict[str, Any]],
+    fallback_sharding: Optional[Any],
+    suppress_warnings: bool = False,
+) -> Dict[str, Any]:
+    parent_dir = os.path.dirname(step_dir.rstrip("/"))
+    step_name = os.path.basename(step_dir.rstrip("/"))
+    try:
+        int(step_name)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported Orbax step directory: {step_dir}") from exc
+
+    with _orbax_warning_filter(suppress_warnings):
+        manager = _checkpoint_manager(parent_dir, create=False)
+        try:
+            restore_args = ocp.args.StandardRestore(item=template, fallback_sharding=fallback_sharding)
+            ckpt_args = ocp.args.Composite(default=restore_args)
+            # Checkpointer.restore rejects directories without commit_success.txt.
+            # Calling the handler is the explicit escape hatch for checkpoints whose
+            # payload finished uploading but whose final marker was never written.
+            composite = manager._checkpointer._handler.restore(  # type: ignore[attr-defined]
+                epath.Path(step_dir),
+                args=ckpt_args,
+            )
+            restored = composite["default"]
+            _load_hparams_if_present(parent_dir, restored)
+            return restored
+        finally:
+            manager.close()
+
+
+@contextmanager
+def _orbax_warning_filter(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    from absl import logging as absl_logging
+
+    previous_verbosity = absl_logging.get_verbosity()
+    absl_logging.set_verbosity(absl_logging.ERROR)
+    try:
+        yield
+    finally:
+        absl_logging.set_verbosity(previous_verbosity)
+
+
+def _load_hparams_if_present(root_dir: str, restored: Dict[str, Any]) -> None:
+    hparams_path = os.path.join(root_dir, "hparams.json")
+    if path_exists(hparams_path):
+        with open_file(hparams_path, "r") as f:
+            restored["hparams"] = json.load(f)
+
+
 def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None, custom_metadata: Optional[Dict[str, Any]] = None) -> None:
     if _is_legacy_checkpoint_file(path):
         ensure_parent_dir(path)
@@ -322,41 +487,63 @@ class BackgroundArtifactWriter:
 AsyncCheckpointWriter = BackgroundArtifactWriter
 
 
-def load_checkpoint(path: str, template: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def load_checkpoint(
+    path: str,
+    template: Optional[Dict[str, Any]] = None,
+    fallback_sharding: Optional[Any] = None,
+    allow_incomplete: bool = False,
+) -> Dict[str, Any]:
     if _is_legacy_checkpoint_file(path):
         import pickle
 
         with open(path, "rb") as f:
             return pickle.load(f)
 
-    if os.path.isdir(path) and os.path.isfile(os.path.join(path, "_CHECKPOINT_METADATA")):
-        parent_dir = os.path.dirname(path)
-        step_name = os.path.basename(path)
-        try:
-            step = int(step_name)
-        except ValueError as exc:
-            raise ValueError(f"Unsupported Orbax step directory: {path}") from exc
-        manager = _checkpoint_manager(parent_dir, create=False)
-        try:
-            restored = manager.restore(step, args=ocp.args.StandardRestore(item=template))
-            hparams_path = os.path.join(parent_dir, "hparams.json")
-            if os.path.isfile(hparams_path):
-                with open(hparams_path, "r", encoding="utf-8") as f:
-                    restored["hparams"] = json.load(f)
-            return restored
-        finally:
-            manager.close()
+    if _is_orbax_step_dir(path):
+        if allow_incomplete:
+            return _restore_orbax_step_direct(
+                path,
+                template,
+                fallback_sharding,
+                suppress_warnings=True,
+            )
+        if not _is_complete_orbax_step_dir(path):
+            parent_dir = os.path.dirname(path.rstrip("/"))
+            latest = _find_latest_complete_orbax_step_dir(parent_dir)
+            if latest is not None:
+                return load_checkpoint(latest, template=template, fallback_sharding=fallback_sharding)
+            raise ValueError(
+                f"Checkpoint {path} is missing commit_success.txt. "
+                "Pass allow_incomplete=True (infer.py: --trust_incomplete_checkpoint) "
+                "to restore it anyway."
+            )
+        return _restore_orbax_step_direct(path, template, fallback_sharding)
+
+    if allow_incomplete:
+        latest = _find_latest_orbax_step_dir(path)
+        if latest is not None:
+            return load_checkpoint(latest, template=template, fallback_sharding=fallback_sharding, allow_incomplete=True)
+
+    latest_complete = _find_latest_complete_orbax_step_dir(path)
+    if latest_complete is not None:
+        return load_checkpoint(latest_complete, template=template, fallback_sharding=fallback_sharding)
+
+    step_dir = _find_orbax_step_dir(path)
+    if step_dir is not None and step_dir != path:
+        return load_checkpoint(
+            step_dir,
+            template=template,
+            fallback_sharding=fallback_sharding,
+            allow_incomplete=allow_incomplete,
+        )
 
     manager = _checkpoint_manager(path, create=False)
     try:
         step = manager.latest_step()
         if step is None:
             raise FileNotFoundError(f"No Orbax checkpoints found in {path}")
-        restored = manager.restore(step, args=ocp.args.StandardRestore(item=template))
-        hparams_path = os.path.join(path, "hparams.json")
-        if os.path.isfile(hparams_path):
-            with open(hparams_path, "r", encoding="utf-8") as f:
-                restored["hparams"] = json.load(f)
+        restored = manager.restore(step, args=ocp.args.StandardRestore(item=template, fallback_sharding=fallback_sharding))
+        _load_hparams_if_present(path, restored)
         return restored
     finally:
         manager.close()
@@ -532,10 +719,7 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
         n_latents_viz = 0
         l_points = np.floor(np.linspace(0, 1, n_latents_viz + 2) * len(zs)).astype(int)[1:]
         for l in l_points:
-            if getattr(model, "cond_prior", False):
-                latents = [zs[i]["z"] for i in range(l)]
-            else:
-                latents = zs[:l]
+            latents = zs[:l]
             x_rec, _ = model.forward_latents(latents=latents, parents=pa_jax, t=0.1)
             rows.append(postprocess(x_rec))
     except AttributeError:
