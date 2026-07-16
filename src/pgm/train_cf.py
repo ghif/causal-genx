@@ -724,7 +724,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr_lagrange", type=float, default=1e-2)
     parser.add_argument("--damping", type=float, default=100.0)
     parser.add_argument("--do_pa", type=str, default=None)
-    parser.add_argument("--eval_freq", type=int, default=1)
     parser.add_argument("--plot_freq", type=int, default=500)
     parser.add_argument("--imgs_plot", type=int, default=10)
     parser.add_argument("--cf_particles", type=int, default=1)
