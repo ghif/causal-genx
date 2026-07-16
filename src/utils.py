@@ -277,7 +277,13 @@ def _find_orbax_step_dir(path: str, max_depth: int = 4) -> Optional[str]:
 
 
 def _is_complete_orbax_step_dir(path: str) -> bool:
-    return _is_orbax_step_dir(path) and path_exists(os.path.join(path, "commit_success.txt"))
+    if not _is_orbax_step_dir(path):
+        return False
+    if path_exists(os.path.join(path, "commit_success.txt")):
+        return True
+    if not is_remote_path(path) and ".orbax-checkpoint-tmp" not in path:
+        return True
+    return False
 
 
 def _find_latest_complete_orbax_step_dir(path: str) -> Optional[str]:
