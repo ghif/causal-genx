@@ -29,6 +29,7 @@ from pgm.cf_parity import (
     clip_counterfactual_grads,
     damped_lagrangian_loss,
     inherit_vae_training_config,
+    set_module_training_mode,
 )
 from pgm.flow_pgm import MorphoMNISTPGM
 from pgm.sup_aux_pgm import MorphoMNISTSupAuxPredictor
@@ -369,7 +370,7 @@ def _cf_forward(
     pgm = pgm_bundle.materialize()
     predictor = predictor_bundle.materialize()
 
-    vae.train(training)
+    set_module_training_mode(vae, training)
     pgm.eval()
     predictor.eval()
 

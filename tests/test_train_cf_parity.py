@@ -8,8 +8,29 @@ from pgm.cf_parity import (
     clip_counterfactual_grads,
     damped_lagrangian_loss,
     inherit_vae_training_config,
+    set_module_training_mode,
 )
 from utils import EMA
+
+
+class _ModeRecorder:
+    def __init__(self):
+        self.mode = None
+
+    def train(self):
+        self.mode = "train"
+
+    def eval(self):
+        self.mode = "eval"
+
+
+def test_nnx_training_mode_uses_zero_argument_train_and_eval_methods():
+    module = _ModeRecorder()
+    set_module_training_mode(module, True)
+    assert module.mode == "train"
+
+    set_module_training_mode(module, False)
+    assert module.mode == "eval"
 
 
 def test_damping_coefficient_is_detached_like_pytorch():

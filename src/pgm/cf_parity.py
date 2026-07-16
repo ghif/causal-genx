@@ -15,6 +15,13 @@ def inherit_vae_training_config(args, vae_hparams: Dict[str, Any]) -> None:
             setattr(args, key, vae_hparams[key])
 
 
+def set_module_training_mode(module, training: bool) -> None:
+    if training:
+        module.train()
+    else:
+        module.eval()
+
+
 def damped_lagrangian_loss(aux_loss, lmbda, constraint, damping):
     damp = damping * jax.lax.stop_gradient(constraint)
     return aux_loss - (lmbda - damp) * constraint
