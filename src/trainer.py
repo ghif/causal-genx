@@ -143,9 +143,10 @@ def make_train_step(graphdef, tx, ema_decay: float):
         (loss, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
         grad_norm = optax.global_norm(grads)
         finite = jnp.logical_and(jnp.isfinite(loss), _grads_are_finite(grads))
+        finite = jnp.logical_and(finite, jnp.isfinite(out["nll"]))
+        finite = jnp.logical_and(finite, jnp.isfinite(out["kl"]))
         updates, candidate_opt_state = tx.update(grads, opt_state, params)
         candidate_params = optax.apply_updates(params, updates)
-        finite = jnp.logical_and(finite, _grads_are_finite(candidate_params))
         new_params = _select_tree(finite, candidate_params, params)
         new_opt_state = _select_tree(finite, candidate_opt_state, opt_state)
         candidate_ema = jax.tree_util.tree_map(lambda e, p: ema_decay * e + (1.0 - ema_decay) * p, ema_params, new_params)
@@ -172,16 +173,13 @@ def make_pmap_train_step(graphdef, tx, ema_decay: float):
         (loss, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
         grad_norm = optax.global_norm(grads)
         local_finite = jnp.logical_and(jnp.isfinite(loss), _grads_are_finite(grads))
+        local_finite = jnp.logical_and(local_finite, jnp.isfinite(out["nll"]))
+        local_finite = jnp.logical_and(local_finite, jnp.isfinite(out["kl"]))
         finite = jax.lax.pmin(local_finite.astype(jnp.int32), axis_name="devices").astype(jnp.bool_)
         grads = jax.lax.pmean(grads, axis_name="devices")
         out = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, axis_name="devices"), out)
         updates, candidate_opt_state = tx.update(grads, opt_state, params)
         candidate_params = optax.apply_updates(params, updates)
-        candidate_finite = _grads_are_finite(candidate_params)
-        finite = jax.lax.pmin(
-            jnp.logical_and(finite, candidate_finite).astype(jnp.int32),
-            axis_name="devices",
-        ).astype(jnp.bool_)
         new_params = _select_tree(finite, candidate_params, params)
         new_opt_state = _select_tree(finite, candidate_opt_state, opt_state)
         candidate_ema = jax.tree_util.tree_map(

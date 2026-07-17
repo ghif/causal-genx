@@ -35,8 +35,12 @@ def gaussian_kl(q_loc, q_logscale, p_loc, p_logscale):
 
 
 def sample_gaussian(rng, loc, logscale):
-    logscale = jnp.clip(logscale, -7.0, 7.0)
-    return loc + jnp.exp(logscale) * jax.random.normal(rng, loc.shape, dtype=loc.dtype)
+    loc_dtype = jnp.asarray(loc).dtype
+    loc = jnp.asarray(loc, dtype=jnp.float32)
+    logscale = jnp.clip(jnp.asarray(logscale, dtype=jnp.float32), -7.0, 7.0)
+    noise = jax.random.normal(rng, loc.shape, dtype=jnp.float32)
+    sample = loc + jnp.exp(logscale) * noise
+    return sample.astype(loc_dtype)
 
 
 def _upsample(x, res):

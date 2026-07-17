@@ -24,7 +24,8 @@ from pgm.train_pgm import (
     make_train_step,
     preprocess,
 )
-from utils import load_checkpoint, save_checkpoint
+import utils
+from utils import load_checkpoint, load_checkpoint_with_path, resolve_checkpoint_path, save_checkpoint
 
 
 def _golden_model():
@@ -262,10 +263,39 @@ def test_orbax_checkpoint_round_trip(tmp_path):
         "hparams": {"widths": [32, 32]},
     }
     save_checkpoint(payload, str(checkpoint_dir), step=7)
-    restored = load_checkpoint(str(checkpoint_dir))
+    restored, resolved_path = load_checkpoint_with_path(str(checkpoint_dir))
+    assert resolved_path == str(checkpoint_dir / "7")
     assert restored["format_version"] == 2
     assert restored["step"] == 7
     np.testing.assert_allclose(restored["ema_params"]["value"], [1.0, 2.0])
+
+    restored_from_step = load_checkpoint(resolved_path)
+    assert restored_from_step["step"] == 7
+
+
+def test_gcs_checkpoint_resolution_prefers_complete_unless_trusted(monkeypatch):
+    root = "gs://bucket/run/checkpoints"
+    step_10 = f"{root}/10"
+    step_20 = f"{root}/20"
+    existing = {
+        f"{step_10}/_CHECKPOINT_METADATA",
+        f"{step_10}/commit_success.txt",
+        f"{step_20}/_CHECKPOINT_METADATA",
+    }
+
+    monkeypatch.setattr(utils, "path_exists", lambda path: path in existing)
+    monkeypatch.setattr(
+        utils,
+        "_dir_entries",
+        lambda path: [(step_10, "directory"), (step_20, "directory")]
+        if path == root
+        else [],
+    )
+
+    assert resolve_checkpoint_path(root) == step_10
+    assert resolve_checkpoint_path(root, allow_incomplete=True) == step_20
+    assert resolve_checkpoint_path(step_20) == step_10
+    assert resolve_checkpoint_path(step_20, allow_incomplete=True) == step_20
 
 
 def test_pdf_artifacts_are_synced_to_remote_run_dir(tmp_path, monkeypatch):

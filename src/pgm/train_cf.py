@@ -26,9 +26,16 @@ from datasets import morphomnist
 from hps import add_arguments, setup_hparams
 from models import HVAE
 from pgm.cf_parity import (
+    batch_progress_kwargs,
     clip_counterfactual_grads,
     damped_lagrangian_loss,
+    epoch_progress_kwargs,
+    format_checkpoint_summary,
+    format_checkpoint_validation_summary,
+    format_run_summary,
     inherit_vae_training_config,
+    intervention_progress_kwargs,
+    format_torch_style_eval_progress,
     set_module_training_mode,
 )
 from pgm.flow_pgm import MorphoMNISTPGM
@@ -37,10 +44,11 @@ from trainer import init_state, preprocess_batch
 from utils import (
     EMA,
     SummaryWriter,
+    checkpoint_is_complete,
     checkpoint_root_dir,
     ensure_dir,
     experiment_run_dir,
-    load_checkpoint,
+    load_checkpoint_with_path,
     open_file,
     save_checkpoint,
     seed_all,
@@ -123,6 +131,14 @@ def loginfo(title: str, logger: Any, stats: Dict[str, Any]) -> None:
     logger.info(f"{title} | " + " - ".join(f"{k}: {v:.4f}" for k, v in stats.items()))
 
 
+def log_run_summary(logger: Any, args, keys: List[str]) -> None:
+    logger.info(format_run_summary(args, keys))
+
+
+def log_checkpoint_summary(logger: Any, args) -> None:
+    logger.info(format_checkpoint_summary(args))
+
+
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class Bundle:
@@ -162,6 +178,11 @@ def _restore_args(args, checkpoint):
         "trust_incomplete_checkpoint": args.trust_incomplete_checkpoint,
         "model_validation_batches": args.model_validation_batches,
     }
+    for name in ("vae", "pgm", "predictor", "resume"):
+        for suffix in ("path", "trusted_incomplete"):
+            key = f"resolved_{name}_{suffix}"
+            if hasattr(args, key):
+                preserved[key] = getattr(args, key)
     for key, value in saved.items():
         if hasattr(args, key):
             setattr(args, key, value)
@@ -174,14 +195,27 @@ def _assert_tree_compatible(name: str, checkpoint: Dict[str, Any], tree: Any, ke
         raise ValueError(f"{name} checkpoint parameter structure does not match the current model")
 
 
-def _load_runtime_checkpoint(args, path: str, template: Optional[Dict[str, Any]] = None):
+def _load_runtime_checkpoint(
+    args,
+    path: str,
+    name: str,
+    template: Optional[Dict[str, Any]] = None,
+):
     fallback_sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
-    return load_checkpoint(
+    checkpoint, resolved_path = load_checkpoint_with_path(
         path,
         template=template,
         fallback_sharding=fallback_sharding,
         allow_incomplete=args.trust_incomplete_checkpoint,
     )
+    trusted_incomplete = (
+        args.trust_incomplete_checkpoint and not checkpoint_is_complete(resolved_path)
+    )
+    setattr(args, f"resolved_{name}_path", resolved_path)
+    setattr(args, f"resolved_{name}_trusted_incomplete", trusted_incomplete)
+    suffix = " (trusted incomplete)" if trusted_incomplete else ""
+    print(f"Loaded {name} checkpoint: {resolved_path}{suffix}")
+    return checkpoint
 
 
 def _checkpoint_root(path: str) -> str:
@@ -282,7 +316,7 @@ def _load_vae_bundle(args):
         "ema_params": params,
         "opt_state": tx.init(params),
     }
-    checkpoint = _load_runtime_checkpoint(args, args.vae_path, template=template)
+    checkpoint = _load_runtime_checkpoint(args, args.vae_path, "vae", template=template)
     params = checkpoint.get("ema_params", checkpoint.get("params"))
     if params is None:
         raise ValueError(f"VAE checkpoint at {args.vae_path} is missing params")
@@ -291,7 +325,7 @@ def _load_vae_bundle(args):
 
 
 def _load_pgm_bundle(args):
-    pgm_ckpt = _load_runtime_checkpoint(args, args.pgm_path)
+    pgm_ckpt = _load_runtime_checkpoint(args, args.pgm_path, "pgm")
     if pgm_ckpt.get("format_version") != 2 or "ema_params" not in pgm_ckpt:
         raise ValueError(
             "The PGM checkpoint uses the old simplified Gaussian/CNN format. "
@@ -306,7 +340,7 @@ def _load_pgm_bundle(args):
 
 
 def _load_predictor_bundle(args):
-    predictor_ckpt = _load_runtime_checkpoint(args, args.predictor_path)
+    predictor_ckpt = _load_runtime_checkpoint(args, args.predictor_path, "predictor")
     if predictor_ckpt.get("format_version") != 3 or "ema_params" not in predictor_ckpt:
         raise ValueError(
             "The predictor checkpoint uses the old simplified CNN format. "
@@ -348,6 +382,25 @@ def _predictor_metrics(args, dataset, preds, targets):
             target = ((target.squeeze(-1) + 1.0) / 2.0) * (max_val - min_val) + min_val
             stats[f"{k}_mae"] = float(np.mean(np.abs(target - pred)))
     return stats
+
+
+def _tree_is_finite(tree: Any) -> bool:
+    leaves = jax.tree_util.tree_leaves(tree)
+    checks = []
+    for leaf in leaves:
+        value = jnp.asarray(leaf)
+        if jnp.issubdtype(value.dtype, jnp.floating) or jnp.issubdtype(value.dtype, jnp.complexfloating):
+            checks.append(jnp.all(jnp.isfinite(value)))
+    return jnp.all(jnp.stack(checks)) if checks else jnp.asarray(True)
+
+
+def _require_finite(tree: Any, *, context: str) -> None:
+    if not bool(np.asarray(_tree_is_finite(tree))):
+        raise FloatingPointError(f"Non-finite values produced during {context}")
+
+
+def _nan_like(value: jax.Array) -> jax.Array:
+    return jnp.asarray(jnp.nan, dtype=jnp.asarray(value).dtype)
 
 
 def _cf_forward(
@@ -412,10 +465,15 @@ def _cf_forward(
         var_cf_x = None
 
     cfs.update(cf_pa)
+    finite = _tree_is_finite(vae_out) & _tree_is_finite(cfs)
+    if var_cf_x is not None:
+        finite = finite & _tree_is_finite(var_cf_x)
     log_probs = predictor.model_anticausal(**cfs)
     aux_loss = -jnp.mean(log_probs["joint"])
     constraint = args.elbo_constraint - vae_out["elbo"]
     loss = damped_lagrangian_loss(aux_loss, lmbda, constraint, args.damping)
+    loss = jax.lax.select(finite, loss, _nan_like(loss))
+    aux_loss = jax.lax.select(finite, aux_loss, _nan_like(aux_loss))
     out = dict(vae_out)
     out.update({"loss": loss, "aux_loss": aux_loss, "cfs": cfs, "var_cf_x": var_cf_x})
     return out
@@ -547,7 +605,7 @@ def _eval_split(
     loader = tqdm(
         _epoch_batches(dataset, args.bs, shuffle=(split == "train"), drop_last=(split == "train"), rng=rng),
         total=total_batches,
-        mininterval=0.1,
+        **batch_progress_kwargs(split),
     )
     grad_norm = 0.0
     predictor = predictor_bundle.materialize()
@@ -563,6 +621,7 @@ def _eval_split(
             do,
             jax.random.fold_in(jax.random.PRNGKey(args.seed), i),
         )
+        _require_finite(out, context=f"{split} evaluation batch {i}")
         bs = int(batch["x"].shape[0])
         stats["n"] += bs
         stats["loss"] += float(out["loss"]) * bs
@@ -625,7 +684,13 @@ def _model_validation_batches(args, dataset):
         yield preprocess_batch(args, raw_batch, compact_pa=True)
 
 
-def _validated_means(name: str, path: str, totals: Dict[str, float], count: int) -> None:
+def _full_model_validation_batches(args, dataset):
+    rng = np.random.default_rng(args.seed)
+    for raw_batch in _epoch_batches(dataset, args.bs, shuffle=False, drop_last=False, rng=rng):
+        yield preprocess_batch(args, raw_batch, compact_pa=True)
+
+
+def _validated_means(name: str, path: str, totals: Dict[str, float], count: int) -> Dict[str, float]:
     if count == 0:
         raise ValueError(f"{name} checkpoint validation found no test samples: {path}")
     means = {key: value / count for key, value in totals.items()}
@@ -633,6 +698,19 @@ def _validated_means(name: str, path: str, totals: Dict[str, float], count: int)
         raise ValueError(f"{name} checkpoint validation produced non-finite metrics at {path}: {means}")
     metrics = " - ".join(f"{key}: {value:.4f}" for key, value in means.items())
     print(f"Validated {name} checkpoint: {path} | samples: {count} | {metrics}")
+    return means
+
+
+def _print_dataset_normalization(datasets: Dict[str, Any]) -> None:
+    for split in ("train", "valid", "test"):
+        dataset = datasets[split]
+        norm = dataset.norm
+        for variable in ("thickness", "intensity"):
+            min_value, max_value = dataset.min_max[variable]
+            print(f"{variable} normalization: {norm}")
+            print(f"max: {max_value}, min: {min_value}")
+        print(f"#samples: {len(dataset)}")
+        print()
 
 
 def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
@@ -640,7 +718,15 @@ def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
     model.eval()
     totals = {key: 0.0 for key in ("elbo", "nll", "kl")}
     count = 0
-    for index, batch in enumerate(_model_validation_batches(args, dataset)):
+    total_batches = (len(dataset) + args.bs - 1) // args.bs
+    loader = tqdm(
+        _full_model_validation_batches(args, dataset),
+        total=total_batches,
+        desc="=> eval",
+        leave=True,
+        mininterval=0.1,
+    )
+    for index, batch in enumerate(loader):
         parents = _expand_parents(batch["pa"], args.input_res)
         outputs = model(
             batch["x"],
@@ -653,31 +739,92 @@ def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
         for key in totals:
             totals[key] += float(outputs[key]) * size
         count += size
-    _validated_means("VAE", args.vae_path, totals, count)
+        loader.set_description(
+            format_torch_style_eval_progress(
+                {
+                    "loss": totals["elbo"] / count,
+                    "nll": totals["nll"] / count,
+                    "kl": totals["kl"] / count,
+                },
+                ("nll", "kl"),
+            )
+        )
+    means = _validated_means("VAE", args.resolved_vae_path, totals, count)
+    print(
+        format_checkpoint_validation_summary(
+            {"loss": means["elbo"], "nll": means["nll"], "kl": means["kl"]},
+            extra_keys=("nll", "kl"),
+        )
+    )
 
 
 def _validate_pgm_checkpoint(args, bundle: Bundle, dataset) -> None:
     model = bundle.materialize()
     model.eval()
-    totals = {"nll": 0.0, "joint_log_prob": 0.0}
+    totals = {
+        "loss": 0.0,
+        "logp(digit)": 0.0,
+        "logp(thickness)": 0.0,
+        "logp(intensity)": 0.0,
+    }
     count = 0
-    for batch in _model_validation_batches(args, dataset):
+    total_batches = (len(dataset) + args.bs - 1) // args.bs
+    loader = tqdm(
+        _full_model_validation_batches(args, dataset),
+        total=total_batches,
+        desc="=> eval",
+        leave=True,
+        mininterval=0.1,
+    )
+    for batch in loader:
         pa = batch["pa"]
         outputs = model.log_prob(pa[:, 0], pa[:, 1], pa[:, 2:])
-        joint = jnp.mean(outputs["joint"])
+        batch_means = {
+            "loss": float(-jnp.mean(outputs["joint"])),
+            "logp(digit)": float(jnp.mean(outputs["digit"])),
+            "logp(thickness)": float(jnp.mean(outputs["thickness"])),
+            "logp(intensity)": float(jnp.mean(outputs["intensity"])),
+        }
         size = int(batch["x"].shape[0])
-        totals["nll"] += float(-joint) * size
-        totals["joint_log_prob"] += float(joint) * size
+        for key, value in batch_means.items():
+            totals[key] += value * size
         count += size
-    _validated_means("PGM", args.pgm_path, totals, count)
+        loader.set_description(
+            format_torch_style_eval_progress(
+                {key: totals[key] / count for key in totals},
+                ("logp(digit)", "logp(thickness)", "logp(intensity)"),
+            )
+        )
+    means = _validated_means("PGM", args.resolved_pgm_path, totals, count)
+    print(
+        format_checkpoint_validation_summary(
+            means,
+            extra_keys=("logp(digit)", "logp(thickness)", "logp(intensity)"),
+        )
+    )
 
 
 def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
     model = bundle.materialize()
     model.eval()
-    totals = {"nll": 0.0, "joint_log_prob": 0.0}
+    totals = {
+        "loss": 0.0,
+        "logp(thickness_aux)": 0.0,
+        "logp(intensity_aux)": 0.0,
+        "logp(digit_aux)": 0.0,
+    }
     count = 0
-    for batch in _model_validation_batches(args, dataset):
+    preds = {k: [] for k in ["thickness", "intensity", "digit"]}
+    targets = {k: [] for k in ["thickness", "intensity", "digit"]}
+    total_batches = (len(dataset) + args.bs - 1) // args.bs
+    loader = tqdm(
+        _full_model_validation_batches(args, dataset),
+        total=total_batches,
+        desc="=> eval",
+        leave=True,
+        mininterval=0.1,
+    )
+    for batch_index, batch in enumerate(loader):
         pa = batch["pa"]
         outputs = model.model_anticausal(
             x=batch["x"],
@@ -685,12 +832,52 @@ def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
             intensity=pa[:, 1:2],
             digit=pa[:, 2:],
         )
-        joint = jnp.mean(outputs["joint"])
+        batch_stats = {
+            "loss": float(-jnp.mean(outputs["joint"])),
+            "logp(thickness_aux)": float(jnp.mean(outputs["thickness_aux"])),
+            "logp(intensity_aux)": float(jnp.mean(outputs["intensity_aux"])),
+            "logp(digit_aux)": float(jnp.mean(outputs["digit_aux"])),
+        }
+        _require_finite(
+            batch_stats,
+            context=f"predictor checkpoint validation batch {batch_index}",
+        )
         size = int(batch["x"].shape[0])
-        totals["nll"] += float(-joint) * size
-        totals["joint_log_prob"] += float(joint) * size
+        for key, value in batch_stats.items():
+            totals[key] += value * size
         count += size
-    _validated_means("predictor", args.predictor_path, totals, count)
+        pred_batch = model.predict(
+            x=batch["x"],
+            thickness=pa[:, 0:1],
+            intensity=pa[:, 1:2],
+            digit=pa[:, 2:],
+        )
+        for key, value in pred_batch.items():
+            preds[key].append(np.asarray(value))
+        for key in targets.keys():
+            targets[key].append(np.asarray(pa[:, 0:1] if key == "thickness" else pa[:, 1:2] if key == "intensity" else pa[:, 2:]))
+        running = {
+            key: totals[key] / count
+            for key in totals
+        }
+        loader.set_description(
+            format_torch_style_eval_progress(
+                running,
+                (
+                    "logp(thickness_aux)",
+                    "logp(intensity_aux)",
+                    "logp(digit_aux)",
+                ),
+            )
+        )
+    _validated_means("predictor", args.resolved_predictor_path, totals, count)
+    metrics = _predictor_metrics(
+        args,
+        dataset,
+        {k: np.concatenate(v, axis=0) for k, v in preds.items()},
+        {k: np.concatenate(v, axis=0) for k, v in targets.items()},
+    )
+    print("test | " + " - ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
 
 
 def _save_cf_checkpoint(args, state, epoch: int) -> str:
@@ -726,12 +913,15 @@ def main(args):
 
     vae_ckpt, vae_bundle = _load_vae_bundle(args)
     datasets = morphomnist(args)
+    _print_dataset_normalization(datasets)
     _validate_vae_checkpoint(args, vae_bundle, datasets["test"])
 
     pgm_ckpt, pgm_bundle = _load_pgm_bundle(args)
+    _print_dataset_normalization(datasets)
     _validate_pgm_checkpoint(args, pgm_bundle, datasets["test"])
 
     predictor_ckpt, predictor_bundle = _load_predictor_bundle(args)
+    _print_dataset_normalization(datasets)
     _validate_predictor_checkpoint(args, predictor_bundle, datasets["test"])
 
     if jax.tree_util.tree_structure(vae_bundle.params) != jax.tree_util.tree_structure(
@@ -772,7 +962,7 @@ def main(args):
                 "lmbda": state["lmbda"],
                 "lambda_opt_state": state["lambda_opt_state"],
             }
-            ckpt = _load_runtime_checkpoint(args, args.load_path, template=template)
+            ckpt = _load_runtime_checkpoint(args, args.load_path, "resume", template=template)
             _restore_args(args, ckpt)
             state["vae_params"] = ckpt["vae_params"]
             state["ema_params"] = ckpt["ema_params"]
@@ -800,8 +990,31 @@ def main(args):
     writer = SummaryWriter(args.save_dir)
     train_samples = datasets["train"].samples
 
-    for key in sorted(vars(args)):
-        logger.info("--%s=%s", key, getattr(args, key))
+    log_run_summary(
+        logger,
+        args,
+        [
+            "exp_name",
+            "accelerator",
+            "precision",
+            "dataset",
+            "bs",
+            "epochs",
+            "lr",
+            "lr_lagrange",
+            "ema_rate",
+            "alpha",
+            "do_pa",
+            "eval_freq",
+            "plot_freq",
+            "cf_particles",
+            "load_path",
+            "pgm_path",
+            "predictor_path",
+            "vae_path",
+        ],
+    )
+    log_checkpoint_summary(logger, args)
 
     eval_step = _make_eval_step(args, vae_bundle, pgm_bundle, predictor_bundle)
     train_step = _make_train_step(
@@ -832,7 +1045,10 @@ def main(args):
 
     benchmark_start_step = state["step"]
     benchmark_done = False
-    for epoch in range(state["epoch"], args.epochs):
+    for epoch in tqdm(
+        range(state["epoch"], args.epochs),
+        **epoch_progress_kwargs(),
+    ):
         logger.info("Epoch %d:", epoch + 1)
         totals: Dict[str, float] = {}
         seen = 0
@@ -842,7 +1058,7 @@ def main(args):
         progress = tqdm(
             _epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng),
             total=steps_in_epoch,
-            mininterval=0.1,
+            **batch_progress_kwargs("train"),
         )
 
         for i, raw_batch in enumerate(progress):
@@ -885,7 +1101,10 @@ def main(args):
 
             if i % max(1, args.plot_freq) == 0:
                 copy_do_pa = copy.deepcopy(args.do_pa)
-                for pa_k in dag_vars + [None]:
+                for pa_k in tqdm(
+                    dag_vars + [None],
+                    **intervention_progress_kwargs(),
+                ):
                     args.do_pa = pa_k
                     valid_stats, valid_metrics = _eval_split(
                         args,
@@ -899,8 +1118,6 @@ def main(args):
                         train_samples,
                         rng,
                     )
-                    loginfo(f"valid do({pa_k})", logger, valid_stats)
-                    loginfo(f"valid do({pa_k})", logger, valid_metrics)
                     last_valid_stats, last_valid_metrics = valid_stats, valid_metrics
                 args.do_pa = copy_do_pa
 

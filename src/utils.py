@@ -487,66 +487,89 @@ class BackgroundArtifactWriter:
 AsyncCheckpointWriter = BackgroundArtifactWriter
 
 
-def load_checkpoint(
-    path: str,
-    template: Optional[Dict[str, Any]] = None,
-    fallback_sharding: Optional[Any] = None,
-    allow_incomplete: bool = False,
-) -> Dict[str, Any]:
+def resolve_checkpoint_path(path: str, allow_incomplete: bool = False) -> str:
+    """Resolve a checkpoint root to the exact file or numeric Orbax step restored."""
+    path = path.rstrip("/")
     if _is_legacy_checkpoint_file(path):
-        import pickle
-
-        with open(path, "rb") as f:
-            return pickle.load(f)
+        return path
 
     if _is_orbax_step_dir(path):
-        if allow_incomplete:
-            return _restore_orbax_step_direct(
-                path,
-                template,
-                fallback_sharding,
-                suppress_warnings=True,
-            )
-        if not _is_complete_orbax_step_dir(path):
-            parent_dir = os.path.dirname(path.rstrip("/"))
-            latest = _find_latest_complete_orbax_step_dir(parent_dir)
-            if latest is not None:
-                return load_checkpoint(latest, template=template, fallback_sharding=fallback_sharding)
-            raise ValueError(
-                f"Checkpoint {path} is missing commit_success.txt. "
-                "Pass allow_incomplete=True (infer.py: --trust_incomplete_checkpoint) "
-                "to restore it anyway."
-            )
-        return _restore_orbax_step_direct(path, template, fallback_sharding)
+        if allow_incomplete or _is_complete_orbax_step_dir(path):
+            return path
+        parent_dir = os.path.dirname(path)
+        latest = _find_latest_complete_orbax_step_dir(parent_dir)
+        if latest is not None:
+            return latest
+        raise ValueError(
+            f"Checkpoint {path} is missing commit_success.txt. "
+            "Pass allow_incomplete=True (infer.py: --trust_incomplete_checkpoint) "
+            "to restore it anyway."
+        )
 
     if allow_incomplete:
         latest = _find_latest_orbax_step_dir(path)
         if latest is not None:
-            return load_checkpoint(latest, template=template, fallback_sharding=fallback_sharding, allow_incomplete=True)
+            return latest
 
     latest_complete = _find_latest_complete_orbax_step_dir(path)
     if latest_complete is not None:
-        return load_checkpoint(latest_complete, template=template, fallback_sharding=fallback_sharding)
+        return latest_complete
 
     step_dir = _find_orbax_step_dir(path)
     if step_dir is not None and step_dir != path:
-        return load_checkpoint(
-            step_dir,
-            template=template,
-            fallback_sharding=fallback_sharding,
-            allow_incomplete=allow_incomplete,
-        )
+        return resolve_checkpoint_path(step_dir, allow_incomplete=allow_incomplete)
 
     manager = _checkpoint_manager(path, create=False)
     try:
         step = manager.latest_step()
         if step is None:
             raise FileNotFoundError(f"No Orbax checkpoints found in {path}")
-        restored = manager.restore(step, args=ocp.args.StandardRestore(item=template, fallback_sharding=fallback_sharding))
-        _load_hparams_if_present(path, restored)
-        return restored
+        return os.path.join(path, str(step))
     finally:
         manager.close()
+
+
+def checkpoint_is_complete(path: str) -> bool:
+    if _is_legacy_checkpoint_file(path):
+        return True
+    return _is_complete_orbax_step_dir(path)
+
+
+def load_checkpoint_with_path(
+    path: str,
+    template: Optional[Dict[str, Any]] = None,
+    fallback_sharding: Optional[Any] = None,
+    allow_incomplete: bool = False,
+) -> Tuple[Dict[str, Any], str]:
+    resolved_path = resolve_checkpoint_path(path, allow_incomplete=allow_incomplete)
+    if _is_legacy_checkpoint_file(resolved_path):
+        import pickle
+
+        with open(resolved_path, "rb") as f:
+            return pickle.load(f), resolved_path
+
+    restored = _restore_orbax_step_direct(
+        resolved_path,
+        template,
+        fallback_sharding,
+        suppress_warnings=allow_incomplete and not _is_complete_orbax_step_dir(resolved_path),
+    )
+    return restored, resolved_path
+
+
+def load_checkpoint(
+    path: str,
+    template: Optional[Dict[str, Any]] = None,
+    fallback_sharding: Optional[Any] = None,
+    allow_incomplete: bool = False,
+) -> Dict[str, Any]:
+    restored, _ = load_checkpoint_with_path(
+        path,
+        template=template,
+        fallback_sharding=fallback_sharding,
+        allow_incomplete=allow_incomplete,
+    )
+    return restored
 
 
 def tree_copy(tree):

@@ -36,8 +36,8 @@ def _torch_linear_kernel(key: jax.Array, shape, dtype=jnp.float32) -> jax.Array:
     return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
 
-def _torch_linear_bias(key: jax.Array, shape, dtype=jnp.float32) -> jax.Array:
-    bound = 1.0 / jnp.sqrt(float(shape[0]))
+def _torch_linear_bias(key: jax.Array, shape, dtype=jnp.float32, *, fan_in: int) -> jax.Array:
+    bound = 1.0 / jnp.sqrt(float(fan_in))
     return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
 
@@ -82,7 +82,7 @@ class CNNEncoder(nnx.Module):
         self.context_dim = int(context_dim)
 
         def activation(x):
-            return jax.nn.leaky_relu(x, negative_slope=0.1)
+            return jax.nn.leaky_relu(x, negative_slope=0.01)
 
         self._activation = activation
 
@@ -206,7 +206,9 @@ class CNNEncoder(nnx.Module):
             8 * self.width,
             self.num_outputs,
             kernel_init=_torch_linear_kernel,
-            bias_init=_torch_linear_bias,
+            bias_init=lambda key, shape, dtype=jnp.float32: _torch_linear_bias(
+                key, shape, dtype, fan_in=8 * self.width
+            ),
             rngs=rngs,
         )
 
