@@ -112,19 +112,15 @@ def _configure_compute_policy(args) -> None:
     jax.config.update("jax_default_matmul_precision", matmul_precision)
     print(
         "JAX compute policy: "
-        f"precision={args.precision} master_params=fp32 matmul_precision={matmul_precision}"
+        f"precision={args.precision} master_params=fp32 vae_cf_compute=fp32 "
+        f"matmul_precision={matmul_precision}"
     )
 
 
 def _vae_compute_params(args, params):
-    if args.precision != "bf16" or args.accelerator not in {"gpu", "tpu"}:
-        return params
-    return jax.tree_util.tree_map(
-        lambda value: value.astype(jnp.bfloat16)
-        if hasattr(value, "dtype") and jnp.issubdtype(value.dtype, jnp.floating)
-        else value,
-        params,
-    )
+    del args
+    # The damped ELBO objective is too sensitive for BF16 VAE parameters.
+    return params
 
 
 def loginfo(title: str, logger: Any, stats: Dict[str, Any]) -> None:
@@ -403,6 +399,15 @@ def _nan_like(value: jax.Array) -> jax.Array:
     return jnp.asarray(jnp.nan, dtype=jnp.asarray(value).dtype)
 
 
+def _cf_lr_scale(step: jax.Array, warmup_steps: int) -> jax.Array:
+    if warmup_steps <= 0:
+        return jnp.asarray(1.0, dtype=jnp.float32)
+    return jnp.minimum(
+        1.0,
+        jnp.asarray(step, dtype=jnp.float32) / float(warmup_steps),
+    )
+
+
 def _cf_forward(
     args,
     vae_bundle: Bundle,
@@ -427,10 +432,11 @@ def _cf_forward(
     pgm.eval()
     predictor.eval()
 
-    pa = batch["pa"]
+    x = batch["x"].astype(jnp.float32)
+    pa = batch["pa"].astype(jnp.float32)
     pa_maps = _expand_parents(pa, args.input_res)
     vae_rng, counterfactual_rng = jax.random.split(rng)
-    vae_out = vae(batch["x"], pa_maps, beta=beta, rng=vae_rng, training=training)
+    vae_out = vae(x, pa_maps, beta=beta, rng=vae_rng, training=training)
 
     obs_pgm = {
         "thickness": pa[:, 0],
@@ -446,10 +452,10 @@ def _cf_forward(
         pgm_rng, abduct_rng, cf_rng, rec_rng = jax.random.split(particle_keys[i], 4)
         cf_pa = pgm.counterfactual(obs=obs_pgm, intervention=do, rng=pgm_rng)
         cf_pa_maps = _expand_parents(cf_pa["pa"], args.input_res)
-        latents = vae.abduct(batch["x"], pa_maps, t=t_abduct, rng=abduct_rng)
+        latents = vae.abduct(x, pa_maps, t=t_abduct, rng=abduct_rng)
         cf_loc, cf_scale = vae.forward_latents(latents, cf_pa_maps, rng=cf_rng)
         rec_loc, rec_scale = vae.forward_latents(latents, pa_maps, rng=rec_rng)
-        u = (batch["x"] - rec_loc) / jnp.clip(rec_scale, min=1e-12)
+        u = (x - rec_loc) / jnp.clip(rec_scale, min=1e-12)
         cf_x = jnp.clip(cf_loc + cf_scale * u, min=-1, max=1)
         if cf_particles > 1:
             cfs["x"] = cfs["x"] + cf_x
@@ -504,7 +510,16 @@ def _make_losses(args, vae_bundle, pgm_bundle, predictor_bundle):
 def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, lambda_optimizer):
     loss_fn = _make_losses(args, vae_bundle, pgm_bundle, predictor_bundle)
 
-    def step(vae_params, opt_state, lmbda, lambda_opt_state, batch, do, rng):
+    def step(
+        vae_params,
+        opt_state,
+        lmbda,
+        lambda_opt_state,
+        batch,
+        do,
+        rng,
+        global_step,
+    ):
         (loss, out), grads = jax.value_and_grad(loss_fn, argnums=(0, 1), has_aux=True)(
             vae_params, lmbda, batch, do, rng
         )
@@ -513,10 +528,13 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
             vae_grads, lmbda_grads, args.grad_clip
         )
         finite = jnp.isfinite(loss) & jnp.isfinite(grad_norm)
+        finite = finite & (grad_norm < args.grad_skip)
+        lr_scale = _cf_lr_scale(global_step, args.lr_warmup_steps)
 
         def _apply_updates(values):
             params, opt_state, lmbda_value, lambda_opt_state = values
             updates, opt_state = optimizer.update(clipped_vae_grads, opt_state, params)
+            updates = jax.tree_util.tree_map(lambda update: update * lr_scale, updates)
             params = optax.apply_updates(params, updates)
             lambda_updates, lambda_opt_state = lambda_optimizer.update(
                 jax.tree_util.tree_map(lambda x: -x, clipped_lmbda_grads),
@@ -540,6 +558,7 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
         out = dict(out)
         out["grad_norm"] = grad_norm
         out["grad_clipped"] = (grad_norm > args.grad_clip).astype(jnp.float32)
+        out["lr_scale"] = lr_scale
         out["update_skipped"] = jnp.logical_not(finite).astype(jnp.float32)
         return vae_params, opt_state, lmbda, lambda_opt_state, out
 
@@ -727,9 +746,10 @@ def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
         mininterval=0.1,
     )
     for index, batch in enumerate(loader):
-        parents = _expand_parents(batch["pa"], args.input_res)
+        x = batch["x"].astype(jnp.float32)
+        parents = _expand_parents(batch["pa"].astype(jnp.float32), args.input_res)
         outputs = model(
-            batch["x"],
+            x,
             parents,
             beta=args.beta,
             rng=jax.random.PRNGKey(args.seed + index),
@@ -1073,6 +1093,7 @@ def main(args):
                 batch,
                 do,
                 jax.random.PRNGKey(args.seed + state["step"] + i + epoch * 1000),
+                state["step"],
             )
             state["vae_params"] = vae_params
             state["opt_state"] = opt_state
@@ -1095,6 +1116,7 @@ def main(args):
                 + (f", grad_norm: {float(out['grad_norm']):.3f}" if "grad_norm" in out else "")
                 + (
                     f", grad_clipped: {int(float(out['grad_clipped']))}, "
+                    f"lr_scale: {float(out['lr_scale']):.3f}, "
                     f"update_skipped: {int(float(out['update_skipped']))}"
                     if "grad_clipped" in out
                     else ""

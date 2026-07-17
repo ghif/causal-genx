@@ -122,7 +122,7 @@ def test_vae_and_lagrange_gradients_share_one_global_clip_scale():
     np.testing.assert_allclose(clipped_lmbda, 6.0, rtol=1e-6)
 
 
-def test_counterfactual_step_applies_large_finite_clipped_gradients(monkeypatch):
+def test_counterfactual_step_rejects_explosive_gradients(monkeypatch):
     pandas_stub = types.ModuleType("pandas")
     pandas_stub.read_csv = lambda *args, **kwargs: None
     pandas_stub.DataFrame = object
@@ -135,7 +135,7 @@ def test_counterfactual_step_applies_large_finite_clipped_gradients(monkeypatch)
         return loss, {"loss": loss}
 
     monkeypatch.setattr(train_cf, "_make_losses", lambda *_: loss_fn)
-    args = SimpleNamespace(grad_clip=1.0, grad_skip=0.5)
+    args = SimpleNamespace(grad_clip=1.0, grad_skip=0.5, lr_warmup_steps=0)
     optimizer = optax.sgd(0.1)
     lambda_optimizer = optax.sgd(0.1)
     params = {"weight": jnp.asarray(1.0)}
@@ -152,13 +152,24 @@ def test_counterfactual_step_applies_large_finite_clipped_gradients(monkeypatch)
         None,
         None,
         jax.random.PRNGKey(0),
+        jnp.asarray(100),
     )
 
     assert float(out["grad_norm"]) > args.grad_skip
     assert float(out["grad_clipped"]) == 1.0
-    assert float(out["update_skipped"]) == 0.0
-    assert float(new_params["weight"]) < 1.0
-    assert float(new_lmbda) > 1.0
+    assert float(out["update_skipped"]) == 1.0
+    np.testing.assert_allclose(new_params["weight"], 1.0)
+    np.testing.assert_allclose(new_lmbda, 1.0)
+
+
+def test_counterfactual_vae_learning_rate_warmup_uses_global_step():
+    from pgm import train_cf
+
+    np.testing.assert_allclose(train_cf._cf_lr_scale(0, 100), 0.0)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(50, 100), 0.5)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(100, 100), 1.0)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(200, 100), 1.0)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(0, 0), 1.0)
 
 
 def test_counterfactual_ema_matches_pytorch_warmup_schedule():
