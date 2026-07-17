@@ -17,12 +17,15 @@ from pgm.train_pgm import (
     _IndexedDataset,
     _WarmupEMA,
     _main_sup_aux,
+    _configure_sup_aux_compute_policy,
     _sup_aux_assert_compatible_checkpoint,
     _sup_aux_checkpoint_payload,
     _sup_aux_eval_epoch,
     _sup_aux_loss_and_state,
     _sup_aux_make_train_step,
     _sup_aux_merge,
+    _setup_sup_aux_scope,
+    _validate_sup_aux_runtime_device,
 )
 from utils import load_checkpoint, save_checkpoint
 
@@ -37,7 +40,9 @@ class _SyntheticMorphoDataset:
         self.samples = {
             "thickness": np.zeros((self.size,), dtype=np.float32),
             "intensity": np.zeros((self.size,), dtype=np.float32),
-            "digit": np.eye(10, dtype=np.float32)[np.zeros((self.size,), dtype=np.int64)],
+            "digit": np.eye(10, dtype=np.float32)[
+                np.zeros((self.size,), dtype=np.int64)
+            ],
         }
 
     def __len__(self):
@@ -58,14 +63,25 @@ class _SyntheticMorphoDataset:
             "x": np.zeros((batch_size, 1, 32, 32), dtype=np.float32),
             "thickness": np.zeros((batch_size, 1), dtype=np.float32),
             "intensity": np.zeros((batch_size, 1), dtype=np.float32),
-            "digit": np.eye(10, dtype=np.float32)[np.zeros((batch_size,), dtype=np.int64)],
+            "digit": np.eye(10, dtype=np.float32)[
+                np.zeros((batch_size,), dtype=np.int64)
+            ],
         }
 
 
 def _zero_predictor(model: MorphoMNISTSupAuxPredictor) -> None:
     for head_name in ("encoder_t", "encoder_i", "encoder_y"):
         head = getattr(model, head_name)
-        for layer_name in ("conv1", "conv2", "conv3", "conv4", "conv5", "conv6", "fc1", "fc2"):
+        for layer_name in (
+            "conv1",
+            "conv2",
+            "conv3",
+            "conv4",
+            "conv5",
+            "conv6",
+            "fc1",
+            "fc2",
+        ):
             layer = getattr(head, layer_name)
             kernel = getattr(layer, "kernel", None)
             if kernel is not None:
@@ -106,12 +122,16 @@ def test_sup_aux_zeroed_model_matches_analytical_loss():
     expected_scale = np.log1p(np.e**0.0)
     expected_thickness = np.zeros((3, 1), dtype=np.float32)
     expected_digit = np.full((3, 10), 0.1, dtype=np.float32)
-    thickness_log_prob = -0.5 * ((batch["thickness"] / expected_scale) ** 2) - np.log(
-        expected_scale
-    ) - 0.5 * np.log(2.0 * np.pi)
-    intensity_log_prob = -0.5 * ((batch["intensity"] / expected_scale) ** 2) - np.log(
-        expected_scale
-    ) - 0.5 * np.log(2.0 * np.pi)
+    thickness_log_prob = (
+        -0.5 * ((batch["thickness"] / expected_scale) ** 2)
+        - np.log(expected_scale)
+        - 0.5 * np.log(2.0 * np.pi)
+    )
+    intensity_log_prob = (
+        -0.5 * ((batch["intensity"] / expected_scale) ** 2)
+        - np.log(expected_scale)
+        - 0.5 * np.log(2.0 * np.pi)
+    )
     digit_log_prob = np.log(0.1) * np.ones((3,), dtype=np.float32)
     expected_loss = -np.mean(thickness_log_prob + intensity_log_prob + digit_log_prob)
 
@@ -120,13 +140,22 @@ def test_sup_aux_zeroed_model_matches_analytical_loss():
     np.testing.assert_allclose(pred["digit"], expected_digit, atol=1e-6)
     np.testing.assert_allclose(float(loss), float(expected_loss), rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(
-        float(metrics["logp(thickness_aux)"]), float(np.mean(thickness_log_prob)), rtol=1e-6, atol=1e-6
+        float(metrics["logp(thickness_aux)"]),
+        float(np.mean(thickness_log_prob)),
+        rtol=1e-6,
+        atol=1e-6,
     )
     np.testing.assert_allclose(
-        float(metrics["logp(intensity_aux)"]), float(np.mean(intensity_log_prob)), rtol=1e-6, atol=1e-6
+        float(metrics["logp(intensity_aux)"]),
+        float(np.mean(intensity_log_prob)),
+        rtol=1e-6,
+        atol=1e-6,
     )
     np.testing.assert_allclose(
-        float(metrics["logp(digit_aux)"]), float(np.mean(digit_log_prob)), rtol=1e-6, atol=1e-6
+        float(metrics["logp(digit_aux)"]),
+        float(np.mean(digit_log_prob)),
+        rtol=1e-6,
+        atol=1e-6,
     )
 
 
@@ -168,10 +197,51 @@ def test_sup_aux_train_step_updates_and_clips_gradients():
     assert opt_state is not None
 
 
+def test_sup_aux_bf16_compute_keeps_fp32_master_params_and_outputs():
+    args = SimpleNamespace(accelerator="tpu", precision="bf16")
+    compute_dtype = _configure_sup_aux_compute_policy(args)
+    model = MorphoMNISTSupAuxPredictor(compute_dtype=compute_dtype, rngs=nnx.Rngs(2))
+    params = nnx.state(model, nnx.Param).to_pure_dict()
+    assert all(
+        value.dtype == jnp.float32 for value in jax.tree_util.tree_leaves(params)
+    )
+    assert model.encoder_i.conv1.dtype == jnp.bfloat16
+    assert model.encoder_i.bn1.dtype == jnp.bfloat16
+
+    pred = model.predict(
+        x=jnp.zeros((2, 1, 32, 32), dtype=jnp.float32),
+        intensity=jnp.zeros((2, 1), dtype=jnp.float32),
+    )
+    assert all(value.dtype == jnp.float32 for value in pred.values())
+
+
+def test_sup_aux_precision_scope_accepts_accelerator_bf16_only():
+    base = dict(dataset="morphomnist", setup="sup_aux")
+    _setup_sup_aux_scope(SimpleNamespace(**base, accelerator="gpu", precision="bf16"))
+    _setup_sup_aux_scope(SimpleNamespace(**base, accelerator="tpu", precision="bf16"))
+    with np.testing.assert_raises_regex(ValueError, "CPU predictor training"):
+        _setup_sup_aux_scope(
+            SimpleNamespace(**base, accelerator="cpu", precision="bf16")
+        )
+
+
+def test_sup_aux_device_preflight_requires_one_gpu_and_accepts_tpu(monkeypatch):
+    gpu = SimpleNamespace(platform="gpu")
+    monkeypatch.setattr(jax, "devices", lambda: [gpu, gpu])
+    with np.testing.assert_raises_regex(RuntimeError, "one visible GPU"):
+        _validate_sup_aux_runtime_device(SimpleNamespace(accelerator="gpu"))
+
+    tpu = SimpleNamespace(platform="tpu")
+    monkeypatch.setattr(jax, "devices", lambda: [tpu])
+    assert _validate_sup_aux_runtime_device(SimpleNamespace(accelerator="tpu")) is tpu
+
+
 def test_sup_aux_ema_and_checkpoint_round_trip(tmp_path):
     ema = _WarmupEMA.init_from({"value": jnp.array(0.0)}, {"mean": jnp.array(0.0)})
     for index in range(101):
-        ema.update({"value": jnp.array(float(index))}, {"mean": jnp.array(float(index))})
+        ema.update(
+            {"value": jnp.array(float(index))}, {"mean": jnp.array(float(index))}
+        )
     assert ema.step == 101
     assert not ema.initted
     np.testing.assert_allclose(ema.params["value"], 100.0)
@@ -212,7 +282,9 @@ def test_sup_aux_end_to_end_training_and_test_only(tmp_path, monkeypatch):
     def fake_build_sup_aux_datasets(_args):
         return {"train": train_full, "valid": valid, "test": test}, train_subset
 
-    monkeypatch.setattr("pgm.train_pgm._build_sup_aux_datasets", fake_build_sup_aux_datasets)
+    monkeypatch.setattr(
+        "pgm.train_pgm._build_sup_aux_datasets", fake_build_sup_aux_datasets
+    )
 
     class _NoOpSummaryWriter:
         def __init__(self, *args, **kwargs):
@@ -234,6 +306,7 @@ def test_sup_aux_end_to_end_training_and_test_only(tmp_path, monkeypatch):
 
     args = SimpleNamespace(
         accelerator="cpu",
+        gpu_id="0",
         precision="fp32",
         dataset="morphomnist",
         setup="sup_aux",

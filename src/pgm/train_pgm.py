@@ -206,11 +206,7 @@ def _sup_aux_progress_description(
         "logp(thickness_aux)",
         "logp(intensity_aux)",
     ]
-    parts = [
-        f"{key}: {stats[key]:.4f}"
-        for key in ordered_keys
-        if key in stats
-    ]
+    parts = [f"{key}: {stats[key]:.4f}" for key in ordered_keys if key in stats]
     description = f" => {mode} | " + ", ".join(parts)
     if grad_norm is not None:
         description += f", grad_norm: {grad_norm:.3f}"
@@ -219,11 +215,7 @@ def _sup_aux_progress_description(
 
 def _sup_aux_prediction_description(metrics: Dict[str, float]) -> str:
     ordered_keys = ["thickness_mae", "intensity_mae", "digit_acc"]
-    parts = [
-        f"{key}: {metrics[key]:.4f}"
-        for key in ordered_keys
-        if key in metrics
-    ]
+    parts = [f"{key}: {metrics[key]:.4f}" for key in ordered_keys if key in metrics]
     return " - ".join(parts)
 
 
@@ -280,7 +272,9 @@ def _sync_pdf_artifacts(args: argparse.Namespace) -> None:
     if not args.remote_save_dir:
         return
     for pdf_path in sorted(glob(os.path.join(args.save_dir, "*.pdf"))):
-        sync_file(pdf_path, os.path.join(args.remote_save_dir, os.path.basename(pdf_path)))
+        sync_file(
+            pdf_path, os.path.join(args.remote_save_dir, os.path.basename(pdf_path))
+        )
 
 
 class _IndexedDataset:
@@ -353,8 +347,49 @@ def _setup_sup_aux_scope(args: argparse.Namespace) -> None:
         raise ValueError("The pure-JAX parity port supports only --dataset morphomnist")
     if args.setup != "sup_aux":
         raise ValueError("The predictor parity port supports only --setup sup_aux")
-    if args.precision != "fp32":
-        raise ValueError("Predictor parity requires --precision fp32")
+    if args.accelerator == "cpu" and args.precision != "fp32":
+        raise ValueError("CPU predictor training requires --precision fp32")
+
+
+def _validate_sup_aux_runtime_device(args: argparse.Namespace) -> jax.Device:
+    devices = jax.devices()
+    if args.accelerator == "gpu":
+        matching = [device for device in devices if device.platform in {"gpu", "cuda"}]
+        if not matching:
+            raise RuntimeError(
+                "--accelerator gpu requested, but JAX found no CUDA GPU. Install a "
+                "CUDA-enabled JAX build compatible with the driver and CUDA runtime."
+            )
+        if len(matching) != 1:
+            raise RuntimeError(
+                f"Predictor training requires one visible GPU, found {len(matching)}. "
+                "Set --gpu_id or CUDA_VISIBLE_DEVICES to a single device."
+            )
+    else:
+        matching = [device for device in devices if device.platform == args.accelerator]
+        if not matching:
+            raise RuntimeError(
+                f"--accelerator {args.accelerator} requested, but JAX devices are {devices}"
+            )
+    device = matching[0]
+    print(f"JAX device preflight passed: platform={device.platform} device={device}")
+    return device
+
+
+def _configure_sup_aux_compute_policy(args: argparse.Namespace) -> jnp.dtype:
+    compute_dtype = (
+        jnp.bfloat16
+        if args.precision == "bf16" and args.accelerator in {"gpu", "tpu"}
+        else jnp.float32
+    )
+    matmul_precision = "default" if compute_dtype == jnp.bfloat16 else "highest"
+    jax.config.update("jax_default_matmul_precision", matmul_precision)
+    print(
+        "JAX predictor compute policy: "
+        f"precision={args.precision} compute_dtype={compute_dtype} "
+        f"master_params=fp32 optimizer_state=fp32 matmul_precision={matmul_precision}"
+    )
+    return compute_dtype
 
 
 def _configure_sup_aux_dataset_args(args: argparse.Namespace) -> None:
@@ -537,6 +572,8 @@ def _sup_aux_restore_args(args: argparse.Namespace, checkpoint: Dict[str, Any]) 
     saved = checkpoint.get("hparams", {})
     preserved = {
         "accelerator": args.accelerator,
+        "precision": args.precision,
+        "gpu_id": args.gpu_id,
         "data_dir": args.data_dir,
         "load_path": args.load_path,
         "testing": args.testing,
@@ -558,10 +595,18 @@ def _sup_aux_assert_compatible_checkpoint(
             "This checkpoint belongs to the old simplified PGM or a different model kind. "
             "Retrain it with the JAX sup_aux predictor implementation."
         )
-    if jax.tree_util.tree_structure(checkpoint["model_params"]) != jax.tree_util.tree_structure(params):
-        raise ValueError("Checkpoint parameter structure does not match the JAX predictor")
-    if jax.tree_util.tree_structure(checkpoint["batch_stats"]) != jax.tree_util.tree_structure(batch_stats):
-        raise ValueError("Checkpoint batch-stat structure does not match the JAX predictor")
+    if jax.tree_util.tree_structure(
+        checkpoint["model_params"]
+    ) != jax.tree_util.tree_structure(params):
+        raise ValueError(
+            "Checkpoint parameter structure does not match the JAX predictor"
+        )
+    if jax.tree_util.tree_structure(
+        checkpoint["batch_stats"]
+    ) != jax.tree_util.tree_structure(batch_stats):
+        raise ValueError(
+            "Checkpoint batch-stat structure does not match the JAX predictor"
+        )
 
 
 def _joint_figure(x: np.ndarray, y: np.ndarray, title: str, path: str) -> None:
@@ -640,6 +685,8 @@ def _main_sup_aux(args: argparse.Namespace) -> Dict[str, float]:
         checkpoint = load_checkpoint(args.load_path)
         _sup_aux_restore_args(args, checkpoint)
     _setup_sup_aux_scope(args)
+    _validate_sup_aux_runtime_device(args)
+    compute_dtype = _configure_sup_aux_compute_policy(args)
     _configure_sup_aux_dataset_args(args)
     seed_all(args.seed, args.deterministic)
 
@@ -664,9 +711,12 @@ def _main_sup_aux(args: argparse.Namespace) -> Dict[str, float]:
         input_res=args.input_res,
         width=8,
         std_fixed=args.std_fixed,
+        compute_dtype=compute_dtype,
         rngs=rngs,
     )
-    graphdef, params_state, batch_stats_state = nnx.split(model, nnx.Param, nnx.BatchStat)
+    graphdef, params_state, batch_stats_state = nnx.split(
+        model, nnx.Param, nnx.BatchStat
+    )
     model_params = params_state.to_pure_dict()
     model_batch_stats = batch_stats_state.to_pure_dict()
     optimizer = optax.chain(
@@ -680,7 +730,9 @@ def _main_sup_aux(args: argparse.Namespace) -> Dict[str, float]:
     best_loss = float("inf")
 
     if checkpoint is not None:
-        _sup_aux_assert_compatible_checkpoint(checkpoint, model_params, model_batch_stats)
+        _sup_aux_assert_compatible_checkpoint(
+            checkpoint, model_params, model_batch_stats
+        )
         model_params = checkpoint["model_params"]
         model_batch_stats = checkpoint["batch_stats"]
         opt_state = checkpoint["opt_state"]
@@ -773,7 +825,11 @@ def _main_sup_aux(args: argparse.Namespace) -> Dict[str, float]:
         writer.add_scalar("elbo/valid", valid_stats["loss"], step)
 
         metrics = _sup_aux_predict_metrics(
-            args, _sup_aux_merge(graphdef, ema.params, ema.batch_stats), valid_dataset, args.bs, rng
+            args,
+            _sup_aux_merge(graphdef, ema.params, ema.batch_stats),
+            valid_dataset,
+            args.bs,
+            rng,
         )
         logger.info("valid | %s", _sup_aux_prediction_description(metrics))
 
@@ -977,6 +1033,7 @@ def main(args: argparse.Namespace) -> Dict[str, float]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--accelerator", default="cpu", choices=["cpu", "gpu", "tpu"])
+    parser.add_argument("--gpu_id", default="0")
     parser.add_argument("--precision", default="fp32", choices=["fp32", "bf16"])
     parser.add_argument("--exp_name", default="")
     parser.add_argument("--dataset", default="morphomnist")

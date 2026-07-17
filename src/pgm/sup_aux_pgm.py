@@ -36,7 +36,9 @@ def _torch_linear_kernel(key: jax.Array, shape, dtype=jnp.float32) -> jax.Array:
     return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
 
-def _torch_linear_bias(key: jax.Array, shape, dtype=jnp.float32, *, fan_in: int) -> jax.Array:
+def _torch_linear_bias(
+    key: jax.Array, shape, dtype=jnp.float32, *, fan_in: int
+) -> jax.Array:
     bound = 1.0 / jnp.sqrt(float(fan_in))
     return jax.random.uniform(key, shape, dtype, minval=-bound, maxval=bound)
 
@@ -73,6 +75,7 @@ class CNNEncoder(nnx.Module):
         width: int = 8,
         num_outputs: int = 1,
         context_dim: int = 0,
+        compute_dtype: jnp.dtype = jnp.float32,
         rngs: Optional[nnx.Rngs] = None,
     ):
         rngs = rngs or nnx.Rngs(0)
@@ -80,6 +83,7 @@ class CNNEncoder(nnx.Module):
         self.width = int(width)
         self.num_outputs = int(num_outputs)
         self.context_dim = int(context_dim)
+        self.compute_dtype = compute_dtype
 
         def activation(x):
             return jax.nn.leaky_relu(x, negative_slope=0.01)
@@ -93,6 +97,8 @@ class CNNEncoder(nnx.Module):
             strides=(1, 1),
             padding="SAME",
             use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             kernel_init=_torch_conv_kernel,
             rngs=rngs,
         )
@@ -100,7 +106,8 @@ class CNNEncoder(nnx.Module):
             num_features=self.width,
             momentum=0.9,
             epsilon=1e-5,
-            dtype=jnp.float32,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             rngs=rngs,
         )
         self.conv2 = nnx.Conv(
@@ -110,6 +117,8 @@ class CNNEncoder(nnx.Module):
             strides=(2, 2),
             padding="SAME",
             use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             kernel_init=_torch_conv_kernel,
             rngs=rngs,
         )
@@ -117,7 +126,8 @@ class CNNEncoder(nnx.Module):
             num_features=2 * self.width,
             momentum=0.9,
             epsilon=1e-5,
-            dtype=jnp.float32,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             rngs=rngs,
         )
         self.conv3 = nnx.Conv(
@@ -127,6 +137,8 @@ class CNNEncoder(nnx.Module):
             strides=(1, 1),
             padding="SAME",
             use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             kernel_init=_torch_conv_kernel,
             rngs=rngs,
         )
@@ -134,7 +146,8 @@ class CNNEncoder(nnx.Module):
             num_features=2 * self.width,
             momentum=0.9,
             epsilon=1e-5,
-            dtype=jnp.float32,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             rngs=rngs,
         )
         self.conv4 = nnx.Conv(
@@ -144,6 +157,8 @@ class CNNEncoder(nnx.Module):
             strides=(2, 2),
             padding="SAME",
             use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             kernel_init=_torch_conv_kernel,
             rngs=rngs,
         )
@@ -151,7 +166,8 @@ class CNNEncoder(nnx.Module):
             num_features=4 * self.width,
             momentum=0.9,
             epsilon=1e-5,
-            dtype=jnp.float32,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             rngs=rngs,
         )
         self.conv5 = nnx.Conv(
@@ -161,6 +177,8 @@ class CNNEncoder(nnx.Module):
             strides=(1, 1),
             padding="SAME",
             use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             kernel_init=_torch_conv_kernel,
             rngs=rngs,
         )
@@ -168,7 +186,8 @@ class CNNEncoder(nnx.Module):
             num_features=4 * self.width,
             momentum=0.9,
             epsilon=1e-5,
-            dtype=jnp.float32,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             rngs=rngs,
         )
         self.conv6 = nnx.Conv(
@@ -178,6 +197,8 @@ class CNNEncoder(nnx.Module):
             strides=(2, 2),
             padding="SAME",
             use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             kernel_init=_torch_conv_kernel,
             rngs=rngs,
         )
@@ -185,13 +206,16 @@ class CNNEncoder(nnx.Module):
             num_features=8 * self.width,
             momentum=0.9,
             epsilon=1e-5,
-            dtype=jnp.float32,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             rngs=rngs,
         )
         self.fc1 = nnx.Linear(
             8 * self.width + self.context_dim,
             8 * self.width,
             use_bias=False,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             kernel_init=_torch_linear_kernel,
             rngs=rngs,
         )
@@ -199,12 +223,15 @@ class CNNEncoder(nnx.Module):
             num_features=8 * self.width,
             momentum=0.9,
             epsilon=1e-5,
-            dtype=jnp.float32,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             rngs=rngs,
         )
         self.fc2 = nnx.Linear(
             8 * self.width,
             self.num_outputs,
+            dtype=self.compute_dtype,
+            param_dtype=jnp.float32,
             kernel_init=_torch_linear_kernel,
             bias_init=lambda key, shape, dtype=jnp.float32: _torch_linear_bias(
                 key, shape, dtype, fan_in=8 * self.width
@@ -213,7 +240,7 @@ class CNNEncoder(nnx.Module):
         )
 
     def __call__(self, x, y=None):
-        x = jnp.asarray(x, dtype=jnp.float32)
+        x = jnp.asarray(x, dtype=self.compute_dtype)
         if x.ndim != 4:
             raise ValueError(f"Expected a 4D image batch, got shape {x.shape}")
         if x.shape[1] in (1, 3):
@@ -227,7 +254,7 @@ class CNNEncoder(nnx.Module):
         x = self._activation(self.bn6(self.conv6(x)))
         x = x.mean(axis=(1, 2))
         if y is not None:
-            y = jnp.asarray(y, dtype=jnp.float32)
+            y = jnp.asarray(y, dtype=self.compute_dtype)
             x = jnp.concatenate([x, y], axis=-1)
         x = self.fc1(x)
         x = self._activation(self.bn_fc(x))
@@ -247,6 +274,7 @@ class MorphoMNISTSupAuxPredictor(nnx.Module):
         input_res: int = 32,
         width: int = 8,
         std_fixed: float = 0.0,
+        compute_dtype: jnp.dtype = jnp.float32,
         rngs: Optional[nnx.Rngs] = None,
     ):
         rngs = rngs or nnx.Rngs(0)
@@ -254,27 +282,43 @@ class MorphoMNISTSupAuxPredictor(nnx.Module):
         self.input_res = int(input_res)
         self.width = int(width)
         self.std_fixed = float(std_fixed)
+        self.compute_dtype = compute_dtype
         input_shape = (self.input_channels, self.input_res, self.input_res)
         self.encoder_t = CNNEncoder(
-            input_shape, width=self.width, num_outputs=2, context_dim=1, rngs=rngs
+            input_shape,
+            width=self.width,
+            num_outputs=2,
+            context_dim=1,
+            compute_dtype=self.compute_dtype,
+            rngs=rngs,
         )
         self.encoder_i = CNNEncoder(
-            input_shape, width=self.width, num_outputs=2, context_dim=0, rngs=rngs
+            input_shape,
+            width=self.width,
+            num_outputs=2,
+            context_dim=0,
+            compute_dtype=self.compute_dtype,
+            rngs=rngs,
         )
         self.encoder_y = CNNEncoder(
-            input_shape, width=self.width, num_outputs=10, context_dim=0, rngs=rngs
+            input_shape,
+            width=self.width,
+            num_outputs=10,
+            context_dim=0,
+            compute_dtype=self.compute_dtype,
+            rngs=rngs,
         )
 
     def _thickness_params(self, x, intensity):
         loc, logscale = jnp.split(self.encoder_t(x, y=intensity), 2, axis=-1)
-        return jnp.tanh(loc), logscale
+        return jnp.tanh(loc.astype(jnp.float32)), logscale.astype(jnp.float32)
 
     def _intensity_params(self, x):
         loc, logscale = jnp.split(self.encoder_i(x), 2, axis=-1)
-        return jnp.tanh(loc), logscale
+        return jnp.tanh(loc.astype(jnp.float32)), logscale.astype(jnp.float32)
 
     def _digit_logits(self, x):
-        return self.encoder_y(x)
+        return self.encoder_y(x).astype(jnp.float32)
 
     def predict(self, *, x, intensity, **_):
         t_loc, _ = self._thickness_params(x, intensity)
