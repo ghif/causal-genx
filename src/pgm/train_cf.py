@@ -513,7 +513,6 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
             vae_grads, lmbda_grads, args.grad_clip
         )
         finite = jnp.isfinite(loss) & jnp.isfinite(grad_norm)
-        finite = finite & (grad_norm < args.grad_skip)
 
         def _apply_updates(values):
             params, opt_state, lmbda_value, lambda_opt_state = values
@@ -540,6 +539,7 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
 
         out = dict(out)
         out["grad_norm"] = grad_norm
+        out["grad_clipped"] = (grad_norm > args.grad_clip).astype(jnp.float32)
         out["update_skipped"] = jnp.logical_not(finite).astype(jnp.float32)
         return vae_params, opt_state, lmbda, lambda_opt_state, out
 
@@ -1093,6 +1093,12 @@ def main(args):
                 f"[train] lmbda: {float(state['lmbda']):.3f}, "
                 + ", ".join(f"{k}: {v / max(1, seen):.3f}" for k, v in totals.items())
                 + (f", grad_norm: {float(out['grad_norm']):.3f}" if "grad_norm" in out else "")
+                + (
+                    f", grad_clipped: {int(float(out['grad_clipped']))}, "
+                    f"update_skipped: {int(float(out['update_skipped']))}"
+                    if "grad_clipped" in out
+                    else ""
+                )
             )
 
             if args.benchmark_steps > 0 and state["step"] - benchmark_start_step >= args.benchmark_steps:

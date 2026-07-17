@@ -8,6 +8,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 
 from pgm.cf_parity import (
     batch_progress_kwargs,
@@ -119,6 +120,45 @@ def test_vae_and_lagrange_gradients_share_one_global_clip_scale():
     np.testing.assert_allclose(norm, 13.0)
     np.testing.assert_allclose(clipped_vae["weight"], [1.5, 2.0], rtol=1e-6)
     np.testing.assert_allclose(clipped_lmbda, 6.0, rtol=1e-6)
+
+
+def test_counterfactual_step_applies_large_finite_clipped_gradients(monkeypatch):
+    pandas_stub = types.ModuleType("pandas")
+    pandas_stub.read_csv = lambda *args, **kwargs: None
+    pandas_stub.DataFrame = object
+    monkeypatch.setitem(sys.modules, "pandas", pandas_stub)
+
+    from pgm import train_cf
+
+    def loss_fn(vae_params, lmbda, *_):
+        loss = 10.0 * (vae_params["weight"] + lmbda)
+        return loss, {"loss": loss}
+
+    monkeypatch.setattr(train_cf, "_make_losses", lambda *_: loss_fn)
+    args = SimpleNamespace(grad_clip=1.0, grad_skip=0.5)
+    optimizer = optax.sgd(0.1)
+    lambda_optimizer = optax.sgd(0.1)
+    params = {"weight": jnp.asarray(1.0)}
+    lmbda = jnp.asarray(1.0)
+    step = train_cf._make_train_step(
+        args, None, None, None, optimizer, lambda_optimizer
+    )
+
+    new_params, _, new_lmbda, _, out = step(
+        params,
+        optimizer.init(params),
+        lmbda,
+        lambda_optimizer.init(lmbda),
+        None,
+        None,
+        jax.random.PRNGKey(0),
+    )
+
+    assert float(out["grad_norm"]) > args.grad_skip
+    assert float(out["grad_clipped"]) == 1.0
+    assert float(out["update_skipped"]) == 0.0
+    assert float(new_params["weight"]) < 1.0
+    assert float(new_lmbda) > 1.0
 
 
 def test_counterfactual_ema_matches_pytorch_warmup_schedule():
