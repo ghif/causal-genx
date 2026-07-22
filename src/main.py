@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import logging
+import warnings
 
 from runtime import configure_backend_from_argv
 
@@ -34,6 +35,13 @@ def setup_tensorboard(args):
 
 
 def main(args):
+    # The named Stage 3 module owns execution. This compatibility parser keeps
+    # existing launch scripts working without maintaining a second loop.
+    from training.image_model import run_legacy_args
+
+    return run_legacy_args(args)
+
+    # Kept temporarily as a numerical-parity reference during migration.
     seed_all(args.seed, args.deterministic)
     if (
         getattr(args, "tpu_auto_scale", False)
@@ -141,6 +149,7 @@ def main(args):
 
 
 if __name__ == "__main__":
+    warnings.warn("src/main.py is a compatibility entrypoint; use scripts/run.py train-image-model --config ...", DeprecationWarning, stacklevel=1)
     parser = argparse.ArgumentParser()
     parser = add_arguments(parser)
     args = setup_hparams(parser)

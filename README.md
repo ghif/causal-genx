@@ -29,11 +29,12 @@ BibTeX:
 
 ### Example Results
 
-The JAX port follows the same high-level goal as the Torch repository, but the MorphoMNIST workflow is best understood as a **three-stage causal pipeline**:
+The JAX port follows the same high-level goal as the Torch repository, but the MorphoMNIST workflow is best understood as a **four-stage causal pipeline**:
 
 1. learn the structured causal variables for the dataset
-2. train the image model conditioned on those variables
-3. combine both pieces to generate counterfactual images under interventions
+2. train the auxiliary image-to-parent predictor
+3. train the image model conditioned on those variables
+4. combine all trained pieces to generate counterfactual images under interventions
 
 Current development focus is **MorphoMNIST on Mac CPU**, which is the primary acceptance path for the port and the clearest end-to-end example of that pipeline.
 
@@ -46,30 +47,32 @@ Current development focus is **MorphoMNIST on Mac CPU**, which is the primary ac
  ┣ 📜requirements-gpu.txt             # NVIDIA GPU / A100 dependencies
  ┣ 📜requirements-tpu.txt             # Google Cloud TPU dependencies
  ┣ 📜jax-porting.md                  # migration and parity plan
- ┗ 📂src                             # main source code directory
-   ┣ 📜__init__.py
-   ┣ 📜datasets.py                   # MorphoMNIST dataset loading and preprocessing
-   ┣ 📜hps.py                        # hyperparameters and CLI arguments
-   ┣ 📜main.py                       # main training entrypoint
-   ┣ 📜models.py                     # JAX/Flax image models and lightweight SCM pieces
-   ┣ 📜run_local.sh                  # example launcher for local CPU training
-   ┣ 📜trainer.py                    # training code for the image mechanism
-   ┣ 📜utils.py                      # helpers for logging, checkpointing, EMA, plotting
-   ┗ 📂pgm
-     ┣ 📜__init__.py
-     ┣ 📜dscm.py                     # deep structural causal model composition
-     ┣ 📜flow_pgm.py                 # MorphoMNIST structured-variable causal model
-     ┣ 📜train_cf.py                 # counterfactual training / evaluation entrypoint
-     ┗ 📜train_pgm.py                # structured mechanism training entrypoint
+ ┣ 📂scripts
+ ┃ ┣ 📜run.py                        # sole public runner for the four stages
+ ┃ ┗ 📜morphomnist_visualizer.py
+ ┣ 📂configs                         # one complete YAML per training stage
+ ┃ ┣ 📜morphomnist_scm.yaml
+ ┃ ┣ 📜morphomnist_predictor.yaml
+ ┃ ┣ 📜morphomnist_image_model.yaml
+ ┃ ┗ 📜morphomnist_counterfactual.yaml
+ ┗ 📂src                             # reusable lower-level implementation
+   ┣ 📂data                          # MorphoMNIST provider and parent conditioning
+   ┣ 📂causal                        # SCM, predictor, and deep-SCM mechanisms
+   ┣ 📂models                        # VAE/HVAE image model
+   ┣ 📂training                      # SCM → predictor → image → CF stage modules
+   ┣ 📜artifacts.py                  # metadata and compatibility validation
+   ┣ 📜config.py                     # typed stage configuration
+   ┗ 📂pgm                           # deprecated compatibility modules
 ```
 
 ### Overview
 
 The original repository used Pyro for the structured causal mechanisms and PyTorch for the image mechanism. This port replaces that stack with a **pure JAX** implementation, but it preserves the same causal workflow:
 
-1. Train the structured variables first.
-2. Train the image model conditioned on those variables.
-3. Reuse both trained pieces for abduction and counterfactual generation.
+1. Train the SCM for structured causal variables.
+2. Train the auxiliary image-to-parent predictor.
+3. Train the image model conditioned on the causal variables.
+4. Fine-tune the image model for counterfactual generation.
 
 In other words, the image model is only one stage in the pipeline. The full MorphoMNIST story is:
 
@@ -127,11 +130,27 @@ The structured-variable and counterfactual code paths are currently centered on 
 
 ### Run
 
+The primary interface is the single experiment runner. Each file in `configs/`
+is a complete, standalone experiment definition; override a value with
+`section.key=value` when needed.
+
+```bash
+python scripts/run.py train-scm --config configs/morphomnist_scm.yaml
+python scripts/run.py train-predictor --config configs/morphomnist_predictor.yaml
+python scripts/run.py train-image-model --config configs/morphomnist_image_model.yaml
+python scripts/run.py finetune-counterfactual --config configs/morphomnist_counterfactual.yaml
+```
+
+Use `--dry-run` to validate a config without accessing data or starting a job.
+The older `src/` entrypoints and shell launchers remain available for existing
+automation but are deprecated compatibility paths.
+
 For MorphoMNIST, the recommended training order is:
 
 1. train the parent SCM
-2. train the image mechanism
-3. run counterfactual composition / evaluation
+2. train the auxiliary predictor
+3. train the image mechanism
+4. run counterfactual composition / evaluation
 
 The scripts below match that order.
 
@@ -140,13 +159,24 @@ The scripts below match that order.
 Run the structured-variable model first:
 
 ```bash
-cd causal-genx/src
-python pgm/train_pgm.py --hps morphomnist --exp_name morphomnist_pgm
+python scripts/run.py train-scm --config configs/morphomnist_scm.yaml
 ```
 
 This learns the causal variables for MorphoMNIST, namely digit, thickness, and intensity.
 
-#### 2. Train the image mechanism
+#### 2. Train the auxiliary predictor
+
+This is a separate image-to-parent prediction job. It does not train or update the SCM.
+
+```bash
+python scripts/run.py train-predictor --config configs/morphomnist_predictor.yaml
+```
+
+#### 3. Train the image mechanism
+
+```bash
+python scripts/run.py train-image-model --config configs/morphomnist_image_model.yaml
+```
 
 To launch local CPU training of the JAX image mechanism, run the launcher from inside `src/`:
 
@@ -205,9 +235,9 @@ cd causal-genx/src
 python main.py --exp_name my_experiment --data_dir gs://medical-airnd/causal-gen/datasets/morphomnist
 ```
 
-#### 3. Run counterfactual composition
+#### 4. Run counterfactual composition
 
-After both checkpoints exist, run:
+After the SCM, predictor, and image-mechanism checkpoints exist, run:
 
 ```bash
 cd causal-genx/src

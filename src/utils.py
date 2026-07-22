@@ -178,7 +178,7 @@ def experiment_run_dir(root_dir: str, hps: str, exp_name: str, default_name: str
 
 
 def materialize_nnx(graphdef, params):
-    return nnx.merge(graphdef, nnx.State(params))
+    return nnx.merge(graphdef, params)
 
 
 def viz_path_for_step(save_dir: str, step: int) -> str:

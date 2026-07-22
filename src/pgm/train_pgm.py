@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import warnings
 from glob import glob
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, Optional
@@ -137,7 +138,7 @@ def make_train_step(graphdef: Any, optimizer: optax.GradientTransformation):
         (loss, metrics), grads = jax.value_and_grad(_loss, argnums=1, has_aux=True)(
             graphdef, params, batch
         )
-        grad_norm = optax.global_norm(grads)
+        grad_norm = optax.tree.norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, metrics, grad_norm
@@ -417,7 +418,7 @@ def _build_sup_aux_datasets(args: argparse.Namespace):
 
 
 def _sup_aux_merge(graphdef: Any, params: Any, batch_stats: Any):
-    return nnx.merge(graphdef, nnx.State(params), nnx.State(batch_stats))
+    return nnx.merge(graphdef, params, batch_stats)
 
 
 def _sup_aux_loss_and_state(
@@ -455,7 +456,7 @@ def _sup_aux_make_train_step(graphdef: Any, optimizer: optax.GradientTransformat
         (loss, (metrics, new_params, new_batch_stats)), grads = jax.value_and_grad(
             _loss_fn, has_aux=True
         )(params)
-        grad_norm = optax.global_norm(grads)
+        grad_norm = optax.tree.norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, new_batch_stats, opt_state, metrics, grad_norm
@@ -872,6 +873,14 @@ def _main_sup_aux(args: argparse.Namespace) -> Dict[str, float]:
 def main(args: argparse.Namespace) -> Dict[str, float]:
     if args.setup == "sup_aux":
         return _main_sup_aux(args)
+    # SCM execution moved to training.scm. Keep this parser-only entrypoint so
+    # established launch scripts and argument names remain usable.
+    from training.scm import run_legacy_args
+
+    return run_legacy_args(args)
+
+    # Kept below temporarily as a migration reference for numerical parity.
+    # It is intentionally unreachable; the public SCM path above is native.
     from datasets import morphomnist
 
     _validate_scope(args)
@@ -1065,4 +1074,5 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
+    warnings.warn("src/pgm/train_pgm.py is a compatibility entrypoint; use scripts/run.py train-scm or train-predictor --config ...", DeprecationWarning, stacklevel=1)
     main(build_parser().parse_args())

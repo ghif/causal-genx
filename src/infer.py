@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import warnings
 from pathlib import Path
 
 from runtime import configure_backend_from_argv
@@ -178,4 +179,5 @@ def main():
 
 
 if __name__ == "__main__":
+    warnings.warn("src/infer.py is a compatibility entrypoint; use scripts/run.py infer --config ...", DeprecationWarning, stacklevel=1)
     main()

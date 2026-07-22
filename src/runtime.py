@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 
@@ -16,6 +18,25 @@ def _argv_value(flag: str) -> Optional[str]:
 
 
 def configure_backend(accelerator: str = "cpu", gpu_id: Optional[str] = None) -> str:
+    # Configure before importing JAX. The cache makes expensive XLA programs,
+    # such as the full HVAE train step, reusable across separate CLI runs.
+    cache_root = os.environ.setdefault(
+        "JAX_COMPILATION_CACHE_DIR",
+        str(Path(tempfile.gettempdir()) / "causal-genx-jax-cache"),
+    )
+    os.environ.setdefault("JAX_ENABLE_COMPILATION_CACHE", "true")
+    os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+    matplotlib_cache = os.environ.setdefault(
+        "MPLCONFIGDIR",
+        str(Path(tempfile.gettempdir()) / "causal-genx-matplotlib-cache"),
+    )
+    try:
+        Path(cache_root).mkdir(parents=True, exist_ok=True)
+        Path(matplotlib_cache).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # JAX can still run without a persistent cache if the selected temp
+        # location is unavailable or read-only.
+        pass
     if accelerator == "cpu":
         os.environ.setdefault("JAX_PLATFORMS", "cpu")
         os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")

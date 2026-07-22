@@ -1,14 +1,14 @@
 # CPU-only JAX stack for causal-genx
 # Install into a fresh conda env, then `pip install -r causal-genx/requirements.txt`
 
-jax[cpu]
-flax
-optax
-orbax-checkpoint
+jax[cpu]>=0.11.0
+flax>=0.12.8
+optax>=0.2.8
+orbax-checkpoint>=0.12.1
 tensorboard
 # NumPy 1.26 has no Python 3.13 wheels and would require a local C compiler.
 # Let JAX select a compatible NumPy release (NumPy 2 on Python 3.13+).
-numpy
+numpy>=2.0
 pandas
 pillow
 imageio
@@ -17,3 +17,10 @@ fsspec
 scipy
 tqdm
 gcsfs==2024.6.1
+gradio==4.44.1
+# Python 3.13 removed stdlib audioop; Gradio imports it through pydub.
+audioop-lts==0.2.2; python_version >= "3.13"
+fastapi>=0.112.0,<0.113.0
+huggingface-hub>=0.19.3,<1.0
+pydantic>=2.0,<2.10
+PyYAML>=6.0

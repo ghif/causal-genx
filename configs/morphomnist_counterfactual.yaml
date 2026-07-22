@@ -1,0 +1,30 @@
+version: "1"
+seed: 7
+dataset:
+  name: morphomnist
+  root: gs://medical-airnd/causal-gen/datasets/morphomnist
+  input_res: 32
+  pad: 4
+  context_norm: "[-1,1]"
+causal_schema:
+  version: "1"
+  variables: [thickness, intensity, digit]
+  edges: [[digit, thickness], [thickness, intensity]]
+model:
+  name: hierarchical_vae
+  context_dim: 12
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.01
+  batch_size: 32
+runtime:
+  accelerator: cpu
+  precision: fp32
+artifacts:
+  root: checkpoints
+  run_name: morphomnist_counterfactual
+workflow:
+  type: finetune-counterfactual
+  scm_checkpoint: checkpoints/morphomnist/pgm_jax-cpu_22-07-2026/checkpoints
+  predictor_checkpoint: checkpoints/morphomnist/morphomnist_predictor/pgm/checkpoints
+  image_model_checkpoint: checkpoints/morphomnist/morphomnist_vae/run/checkpoints

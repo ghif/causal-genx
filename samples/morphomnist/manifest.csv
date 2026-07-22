@@ -1,0 +1,11 @@
+filename,split,source_index,global_index,digit,thickness,intensity,source_object,random_seed
+sample_01_train_13313_digit_2.png,train,13313,13313,2,3.1804652,196.50847,gs://medical-airnd/causal-gen/datasets/morphomnist/train-images-idx3-ubyte.gz,9206126695058166344
+sample_02_train_55121_digit_1.png,train,55121,55121,1,2.1764908,148.905,gs://medical-airnd/causal-gen/datasets/morphomnist/train-images-idx3-ubyte.gz,9206126695058166344
+sample_03_test_01452_digit_9.png,test,1452,61452,9,3.5458372,226.2396,gs://medical-airnd/causal-gen/datasets/morphomnist/t10k-images-idx3-ubyte.gz,9206126695058166344
+sample_04_train_51104_digit_8.png,train,51104,51104,8,2.2116385,129.89584,gs://medical-airnd/causal-gen/datasets/morphomnist/train-images-idx3-ubyte.gz,9206126695058166344
+sample_05_test_05919_digit_9.png,test,5919,65919,9,2.9143844,154.53711,gs://medical-airnd/causal-gen/datasets/morphomnist/t10k-images-idx3-ubyte.gz,9206126695058166344
+sample_06_train_04165_digit_2.png,train,4165,4165,2,3.339252,233.78308,gs://medical-airnd/causal-gen/datasets/morphomnist/train-images-idx3-ubyte.gz,9206126695058166344
+sample_07_train_05067_digit_3.png,train,5067,5067,3,3.0528016,217.71693,gs://medical-airnd/causal-gen/datasets/morphomnist/train-images-idx3-ubyte.gz,9206126695058166344
+sample_08_train_15872_digit_3.png,train,15872,15872,3,2.7250087,181.90079,gs://medical-airnd/causal-gen/datasets/morphomnist/train-images-idx3-ubyte.gz,9206126695058166344
+sample_09_train_41114_digit_9.png,train,41114,41114,9,2.4431264,189.3371,gs://medical-airnd/causal-gen/datasets/morphomnist/train-images-idx3-ubyte.gz,9206126695058166344
+sample_10_train_15341_digit_8.png,train,15341,15341,8,2.782848,207.75946,gs://medical-airnd/causal-gen/datasets/morphomnist/train-images-idx3-ubyte.gz,9206126695058166344

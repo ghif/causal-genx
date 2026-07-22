@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -143,9 +144,9 @@ class Bundle:
     batch_stats: Any = None
 
     def materialize(self):
-        states = [nnx.State(self.params)]
+        states = [self.params]
         if self.batch_stats is not None:
-            states.append(nnx.State(self.batch_stats))
+            states.append(self.batch_stats)
         return nnx.merge(self.graphdef, *states)
 
     def tree_flatten(self):
@@ -1205,6 +1206,7 @@ def main(args):
 
 
 if __name__ == "__main__":
+    warnings.warn("src/pgm/train_cf.py is a compatibility entrypoint; use scripts/run.py finetune-counterfactual --config ...", DeprecationWarning, stacklevel=1)
     parser = argparse.ArgumentParser()
     parser = add_arguments(parser)
     parser.set_defaults(lr=1e-4, eval_freq=1)
