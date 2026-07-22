@@ -800,14 +800,15 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
                 z_i = []
                 for z in zs:
                     if getattr(model, "cond_prior", False):
-                        z_dict = {}
-                        for k, v in z.items():
-                            z_dict[k] = _repeat_batch(v[ii], args.context_dim)
-                        z_i.append(z_dict)
+                        # The native JAX HVAE returns each conditional latent
+                        # as an array. The Torch implementation returned a
+                        # {"z": ...} mapping, so do not assume ``items()``
+                        # exists here.
+                        z_i.append(_repeat_batch(z[ii], args.context_dim))
                     else:
                         z_i.append(_repeat_batch(z[ii], args.context_dim))
                 if getattr(model, "cond_prior", False):
-                    latents = [z_i[j]["z"] for j in range(l)]
+                    latents = z_i[:l]
                 else:
                     latents = z_i[:l]
                 _append_counterfactual_rows(latents, pa_ctx, cf_pa_ctx, x_ctx, alpha, t)

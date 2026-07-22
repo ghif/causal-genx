@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 import jax
 from flax import nnx
 
@@ -25,6 +27,7 @@ from utils import (
     open_file,
     path_exists,
     seed_all,
+    write_images,
 )
 
 from .common import legacy_run_dir
@@ -238,6 +241,33 @@ def run(config: ExperimentConfig) -> str:
     """Run image-model training directly from a typed experiment config."""
     _run(_run_arguments(config))
     return str(output_dir(config))
+
+
+def dry_run_image(config: ExperimentConfig) -> str:
+    """Build the configured model and exercise visualization without training."""
+    args = _run_arguments(config)
+    args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "run")
+    args.remote_save_dir = ""
+    ensure_dir(args.save_dir)
+    model = _build_model(args)
+    graphdef, params_state = nnx.split(model, nnx.Param)
+    params = params_state.to_pure_dict()
+    # Keep this smoke path independent of dataset/pandas availability while
+    # preserving the real image and parent tensor shapes.
+    batch = {
+        "x": np.zeros((args.viz_batch_size, args.input_channels, args.input_res, args.input_res), dtype=np.uint8),
+        "pa": np.zeros((args.viz_batch_size, args.context_dim), dtype=np.float32),
+    }
+    batch = preprocess_batch(args, batch, compact_pa=True)
+    path = write_images(
+        args,
+        graphdef,
+        params,
+        batch,
+        jax.random.PRNGKey(args.seed),
+        step=0,
+    )
+    return f"dry-run-image wrote {path} ({args.viz_batch_size} requested samples)"
 
 
 def run_legacy_args(args: Any) -> None:
