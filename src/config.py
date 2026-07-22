@@ -16,6 +16,7 @@ class DatasetConfig(BaseModel):
     root: str = "gs://medical-airnd/causal-gen/datasets/morphomnist"
     input_res: PositiveInt = 32
     pad: int = 4
+    hflip: float = 0.5
     context_norm: str = "[-1,1]"
 
 
@@ -24,12 +25,27 @@ class RuntimeConfig(BaseModel):
     accelerator: Literal["cpu", "gpu", "tpu"] = "cpu"
     precision: Literal["fp32", "bf16"] = "fp32"
     gpu_id: str | None = None
+    expected_local_device_count: PositiveInt | None = None
+    expected_global_device_count: PositiveInt | None = None
+    expected_process_count: PositiveInt | None = None
 
 
 class ModelConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="allow")
     name: Literal["hierarchical_vae", "simple_vae"] = "hierarchical_vae"
     context_dim: PositiveInt = 12
+    cond_prior: bool = False
+    enc_arch: str = "32b3d2,16b3d2,8b3d2,4b3d4,1b4"
+    dec_arch: str = "1b4,4b4,8b4,16b4,32b4"
+    widths: list[PositiveInt] = [16, 32, 64, 128, 256]
+    bottleneck: PositiveInt = 4
+    z_dim: PositiveInt = 16
+    z_max_res: PositiveInt = 192
+    bias_max_res: PositiveInt = 64
+    x_like: str = "diag_dgauss"
+    std_init: float = 0.0
+    q_correction: bool = False
+    kl_free_bits: float = 0.0
 
 
 class ArtifactConfig(BaseModel):
@@ -44,6 +60,8 @@ class OptimizerConfig(BaseModel):
     lr: float
     weight_decay: float
     batch_size: PositiveInt
+    lr_warmup_steps: int = 100
+    betas: tuple[float, float] = (0.9, 0.9)
 
 
 class ScmTrainingConfig(BaseModel):
@@ -70,10 +88,22 @@ class ImageModelTrainingConfig(BaseModel):
     type: Literal["train-image-model"]
     epochs: PositiveInt = 5000
     speed_log_freq: PositiveInt = 50
+    viz_batch_size: PositiveInt = 32
     eval_freq: PositiveInt = 5
     checkpoint_freq: PositiveInt = 1
+    resume: str = ""
+    ema_rate: float = 0.999
+    beta: float = 1.0
+    beta_warmup_steps: int = 0
+    grad_clip: float = 350.0
+    grad_skip: float = 500.0
+    accu_steps: PositiveInt = 1
+    checkpoint_smoke_test: bool = False
+    checkpoint_smoke_steps: PositiveInt = 1
     benchmark_steps: int = 0
     benchmark_warmup_steps: int = 20
+    execution_mode: Literal["auto", "single_device", "replicated"] = "auto"
+    drop_remainder: bool = False
 
 
 class CounterfactualTrainingConfig(BaseModel):

@@ -28,6 +28,7 @@ workflow:
   type: train-image-model
   epochs: 5000
   speed_log_freq: 50
+  viz_batch_size: 32
   eval_freq: 5
   checkpoint_freq: 1
   benchmark_steps: 0

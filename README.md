@@ -141,6 +141,22 @@ python scripts/run.py train-image-model --config configs/morphomnist_image_model
 python scripts/run.py finetune-counterfactual --config configs/morphomnist_counterfactual.yaml
 ```
 
+For a single-VM TPU v6e-4 image-model run, install the TPU dependencies on
+the TPU VM and use the topology-specific config:
+
+```bash
+pip install -r requirements-tpu.txt
+python scripts/run.py train-image-model \
+  --config configs/morphomnist_image_model_tpu_v6e4.yaml
+```
+
+The runner performs a hardware preflight before importing the training stage.
+The v6e-4 profile requires backend `tpu`, four local/global devices, one JAX
+process, BF16 inputs, and replicated data-parallel training with a global batch
+of 512 (128 samples per chip). It fails instead of silently falling back to CPU.
+Use an explicit override such as `artifacts.run_name=my_v6e4_run`; do not reuse a
+completed run name.
+
 Use `--dry-run` to validate a config without accessing data or starting a job.
 The older `src/` entrypoints and shell launchers remain available for existing
 automation but are deprecated compatibility paths.
@@ -264,7 +280,7 @@ It is not called automatically by `main.py`, `train_pgm.py`, or `train_cf.py`.
 - `run_tpu.sh` launches `main.py` with `--accelerator=tpu` and `--precision=bf16`
 - MorphoMNIST is loaded from `gs://medical-airnd/causal-gen/datasets/morphomnist`
 - checkpoints default to a local `../checkpoints` directory from inside `src/`
-- `eval_freq` controls how often validation is reported, while `checkpoint_freq` controls how often checkpoint saving is even eligible; a checkpoint is written only when the validation loss improves on that scheduled epoch
+- `eval_freq` controls validation and visualization, while `checkpoint_freq` independently controls periodic training-state saves
 - CPU is the intended execution target
 
 ### Notes
@@ -338,10 +354,10 @@ That means the same Orbax checkpoint root is available locally and in the bucket
 Visualization artifacts follow the same training-step convention and are written as:
 
 ```text
-<save_dir>/viz-step-<training_step>.png
+<save_dir>/viz-<training_step>.png
 ```
 
-For example, the end-of-epoch validation image for global step 400 is saved as `viz-step-400.png`.
+For example, the end-of-epoch validation image for global step 400 is saved as `viz-400.png`.
 
 ### License
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 from pathlib import Path
 
@@ -26,21 +27,42 @@ def main(argv: list[str] | None = None) -> int:
     from config import load_experiment
     from runtime import configure_backend
     config = load_experiment(args.config, overrides)
-    configure_backend(config.runtime.accelerator, config.runtime.gpu_id)
-    if args.dry_run:
-        from training.common import legacy_run_dir
-        output = legacy_run_dir(config) if args.command in {"train-scm", "train-predictor", "train-image-model"} else config.artifacts.root
-        print(f"validated stage={config.workflow.type} output={output}")
-        return 0
-    from training.counterfactual import run as finetune_counterfactual
-    from training.image_model import run as train_image_model
-    from training.inference import run as infer
-    from training.predictor import run as train_predictor
-    from training.scm import run as train_scm
-    stages = {"train-scm": train_scm, "train-predictor": train_predictor, "train-image-model": train_image_model, "finetune-counterfactual": finetune_counterfactual, "infer": infer}
     if args.command != config.workflow.type:
         parser.error(f"command {args.command!r} does not match config workflow.type={config.workflow.type!r}")
-    print(stages[args.command](config))
+    configure_backend(config.runtime.accelerator, config.runtime.gpu_id)
+    if args.dry_run:
+        output = (
+            ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name
+            if args.command in {"train-scm", "train-predictor", "train-image-model"}
+            else config.artifacts.root
+        )
+        print(f"validated stage={config.workflow.type} output={output}")
+        return 0
+    from runtime import validate_backend
+    summary = validate_backend(
+        config.runtime.accelerator,
+        expected_local_device_count=config.runtime.expected_local_device_count,
+        expected_global_device_count=config.runtime.expected_global_device_count,
+        expected_process_count=config.runtime.expected_process_count,
+    )
+    print(
+        "runtime_preflight "
+        f"backend={summary.backend} device_kind={summary.device_kind} "
+        f"local_devices={summary.local_device_count} global_devices={summary.global_device_count} "
+        f"processes={summary.process_count} process_index={summary.process_index} jax={summary.jax_version}",
+        flush=True,
+    )
+    stage_modules = {
+        "train-scm": "training.scm",
+        "train-predictor": "training.predictor",
+        "train-image-model": "training.image_model",
+        "finetune-counterfactual": "training.counterfactual",
+        "infer": "training.inference",
+    }
+    # Import only the selected stage, after runtime initialization. This avoids
+    # unrelated model modules initializing JAX or accelerator libraries.
+    stage = importlib.import_module(stage_modules[args.command]).run
+    print(stage(config))
     return 0
 
 

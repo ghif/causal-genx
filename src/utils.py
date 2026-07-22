@@ -13,10 +13,6 @@ from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 import time
 
-from runtime import configure_backend_from_argv
-
-configure_backend_from_argv()
-
 import imageio.v2 as imageio
 import jax
 import jax.numpy as jnp
@@ -182,7 +178,8 @@ def materialize_nnx(graphdef, params):
 
 
 def viz_path_for_step(save_dir: str, step: int) -> str:
-    return os.path.join(save_dir, f"viz-step-{int(step)}.png")
+    # Keep the legacy artifact name used by the PyTorch trainer.
+    return os.path.join(save_dir, f"viz-{int(step)}.png")
 
 
 def sync_file(local_path: str, remote_path: str) -> None:

@@ -13,27 +13,32 @@ causal_schema:
 model:
   name: hierarchical_vae
   context_dim: 12
-  # Keep the typed entrypoint identical to src/run_local.sh.
   cond_prior: true
 optimizer:
   lr: 0.001
   weight_decay: 0.01
-  batch_size: 32
+  # Global batch: 128 examples on each of the four v6e chips.
+  batch_size: 512
+  lr_warmup_steps: 100
 runtime:
-  accelerator: cpu
-  precision: fp32
+  accelerator: tpu
+  precision: bf16
+  # v6e-4 is one VM with four locally addressable TPU chips.
+  expected_local_device_count: 4
+  expected_global_device_count: 4
+  expected_process_count: 1
 artifacts:
   root: checkpoints
-  run_name: hvae_jax-cpu_22-07-2026
+  run_name: hvae_jax-tpu-v6e4
   remote_root: gs://medical-airnd/causal-gen/checkpoints
 workflow:
   type: train-image-model
   epochs: 5000
-  speed_log_freq: 50
+  execution_mode: replicated
+  drop_remainder: true
+  speed_log_freq: 20
   viz_batch_size: 32
-  # run_local.sh validates, writes visualizations, and considers a best-loss
-  # checkpoint on this same cadence.
-  eval_freq: 5
-  checkpoint_freq: 10
+  eval_freq: 10
+  checkpoint_freq: 20
   benchmark_steps: 0
   benchmark_warmup_steps: 20

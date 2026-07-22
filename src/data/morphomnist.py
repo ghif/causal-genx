@@ -8,10 +8,6 @@ import struct
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from runtime import configure_backend_from_argv
-
-configure_backend_from_argv()
-
 import jax.numpy as jnp
 import numpy as np
 from PIL import Image, ImageOps

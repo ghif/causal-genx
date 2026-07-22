@@ -2,6 +2,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from config import load_experiment
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -9,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_each_standalone_config_validates_with_runner():
     for command, config in (
         ("train-image-model", "morphomnist_image_model.yaml"),
+        ("train-image-model", "morphomnist_image_model_tpu_v6e4.yaml"),
         ("train-scm", "morphomnist_scm.yaml"),
         ("train-predictor", "morphomnist_predictor.yaml"),
         ("finetune-counterfactual", "morphomnist_counterfactual.yaml"),
@@ -31,4 +34,6 @@ def test_scm_dry_run_reports_legacy_run_directory():
         capture_output=True,
         check=True,
     )
-    assert "checkpoints/morphomnist/pgm_jax-cpu-v2_22-07-2026" in result.stdout
+    config = load_experiment(ROOT / "configs/morphomnist_scm.yaml")
+    expected = Path(config.artifacts.root) / config.dataset.name / config.artifacts.run_name
+    assert str(expected) in result.stdout

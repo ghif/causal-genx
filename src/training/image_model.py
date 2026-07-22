@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 from pathlib import Path
@@ -21,6 +22,8 @@ from utils import (
     ensure_dir,
     experiment_run_dir,
     load_checkpoint,
+    open_file,
+    path_exists,
     seed_all,
 )
 
@@ -47,8 +50,21 @@ def _run_arguments(config: ExperimentConfig) -> Hparams:
         "data_dir": config.dataset.root,
         "input_res": config.dataset.input_res,
         "pad": config.dataset.pad,
+        "hflip": config.dataset.hflip,
         "parents_x": list(MORPHOMNIST_SCHEMA.variable_names),
         "context_dim": MORPHOMNIST_SCHEMA.encoded_dim,
+        "cond_prior": config.model.cond_prior,
+        "enc_arch": config.model.enc_arch,
+        "dec_arch": config.model.dec_arch,
+        "widths": config.model.widths,
+        "bottleneck": config.model.bottleneck,
+        "z_dim": config.model.z_dim,
+        "z_max_res": config.model.z_max_res,
+        "bias_max_res": config.model.bias_max_res,
+        "x_like": config.model.x_like,
+        "std_init": config.model.std_init,
+        "q_correction": config.model.q_correction,
+        "kl_free_bits": config.model.kl_free_bits,
         "accelerator": config.runtime.accelerator,
         "precision": config.runtime.precision,
         "ckpt_dir": config.artifacts.root,
@@ -59,18 +75,35 @@ def _run_arguments(config: ExperimentConfig) -> Hparams:
         "bs": config.optimizer.batch_size,
         "lr": config.optimizer.lr,
         "wd": config.optimizer.weight_decay,
+        "lr_warmup_steps": config.optimizer.lr_warmup_steps,
+        "betas": list(config.optimizer.betas),
         "vae": "hierarchical" if config.model.name == "hierarchical_vae" else "simple",
         "speed_log_freq": workflow.speed_log_freq,
+        "viz_batch_size": workflow.viz_batch_size,
         "eval_freq": workflow.eval_freq,
         "checkpoint_freq": workflow.checkpoint_freq,
+        "resume": workflow.resume,
+        "ema_rate": workflow.ema_rate,
+        "beta": workflow.beta,
+        "beta_warmup_steps": workflow.beta_warmup_steps,
+        "grad_clip": workflow.grad_clip,
+        "grad_skip": workflow.grad_skip,
+        "accu_steps": workflow.accu_steps,
+        "checkpoint_smoke_test": workflow.checkpoint_smoke_test,
+        "checkpoint_smoke_steps": workflow.checkpoint_smoke_steps,
         "benchmark_steps": workflow.benchmark_steps,
         "benchmark_warmup_steps": workflow.benchmark_warmup_steps,
+        "execution_mode": workflow.execution_mode,
+        "drop_remainder": workflow.drop_remainder,
+        # Batch sizing is explicit in clean configs; retain auto-scaling only
+        # for the deprecated shell launcher.
+        "tpu_auto_scale": False,
     })
     return args
 
 
 def _setup_logging(args: Hparams) -> logging.Logger:
-    """Preserve the legacy terminal log format; trainer owns trainlog.txt."""
+    """Keep terminal logging separate from eval-gated trainlog persistence."""
     ensure_dir(args.save_dir)
     logging.basicConfig(
         level=logging.INFO,
@@ -104,6 +137,18 @@ def _build_model(args: Hparams):
     )
 
 
+def _resume_hparams(path: str) -> dict[str, Any]:
+    """Read checkpoint hparams without materializing its parameter trees."""
+    root = path.rstrip("/")
+    if os.path.basename(root).isdigit():
+        root = os.path.dirname(root)
+    hparams_path = f"{root}/hparams.json"
+    if not path_exists(hparams_path):
+        return {}
+    with open_file(hparams_path, "r") as handle:
+        return json.load(handle)
+
+
 def _run(args: Hparams) -> None:
     """The former ``main.main`` body, kept deliberately outcome-compatible."""
     seed_all(args.seed, args.deterministic)
@@ -111,6 +156,27 @@ def _run(args: Hparams) -> None:
         if args.bs == 128:
             args.bs = 512
         args.drop_remainder = True
+    has_resume_checkpoint = False
+    if args.resume:
+        if not path_exists(args.resume):
+            raise FileNotFoundError(f"Checkpoint not found at: {args.resume}")
+        has_resume_checkpoint = True
+        saved = _resume_hparams(args.resume)
+        if saved:
+            # Preserve the Torch resume contract: checkpoint hparams recreate
+            # the trained model, while the active runtime stays explicit.
+            saved = {
+                key: value
+                for key, value in saved.items()
+                if key not in {"resume", "accelerator", "device"}
+            }
+            data_dir, requested_lr, resume_path = args.data_dir, args.lr, args.resume
+            args.update(saved)
+            if data_dir:
+                args.data_dir = data_dir
+            if requested_lr < args.lr:
+                args.lr = requested_lr
+            args.resume = resume_path
     args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "run")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
     args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.hps, args.exp_name, "run")
@@ -118,8 +184,9 @@ def _run(args: Hparams) -> None:
     ensure_dir(args.checkpoint_dir)
     logger = _setup_logging(args)
     logger.info(
-        "runtime accelerator=%s backend=%s local_device_count=%d jax=%s global_batch_size=%d lr=%g",
-        args.accelerator, jax.default_backend(), jax.local_device_count(), jax.__version__, args.bs, args.lr,
+        "runtime accelerator=%s backend=%s local_device_count=%d global_device_count=%d process_count=%d process_index=%d jax=%s global_batch_size=%d lr=%g",
+        args.accelerator, jax.default_backend(), jax.local_device_count(), jax.device_count(),
+        jax.process_count(), jax.process_index(), jax.__version__, args.bs, args.lr,
     )
     logger.info(
         "jax_compilation_cache=%s",
@@ -140,7 +207,7 @@ def _run(args: Hparams) -> None:
     logger.info("initializing optimizer state")
     state, tx = init_state(model, args, sample, rng)
     logger.info("optimizer state initialized")
-    if args.resume and os.path.exists(args.resume):
+    if has_resume_checkpoint:
         logger.info("restoring checkpoint from %s", args.resume)
         template = {
             "epoch": state.epoch,
@@ -150,6 +217,8 @@ def _run(args: Hparams) -> None:
             "ema_params": state.ema.params,
             "opt_state": state.opt_state,
         }
+        # The metadata restore above occurs before model construction. This
+        # templated restore assigns arrays to the live model's sharding.
         checkpoint = load_checkpoint(args.resume, template=template)
         state.params = checkpoint["params"]
         state.ema.params = checkpoint["ema_params"]

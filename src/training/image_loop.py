@@ -6,17 +6,13 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from runtime import configure_backend_from_argv
-
-configure_backend_from_argv()
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
 
-from utils import BackgroundArtifactWriter, EMA, append_text_file, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, write_images
+from utils import BackgroundArtifactWriter, EMA, append_text_file, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, sync_tree, write_images
 
 
 def preprocess_batch(args, batch, expand_pa: bool = False, compact_pa: bool = False):
@@ -44,8 +40,15 @@ def _block_until_ready(tree):
     return tree
 
 
+def _first_local_replica(x):
+    """Read one replica locally without a cross-device gather on modern JAX."""
+    if isinstance(x, jax.Array) and x.addressable_shards:
+        return jnp.squeeze(x.addressable_shards[0].data, axis=0)
+    return x[0]
+
+
 def _unreplicate(tree):
-    return jax.tree_util.tree_map(lambda x: x[0], tree)
+    return jax.tree_util.tree_map(_first_local_replica, tree)
 
 
 def _replicate(tree, devices):
@@ -59,7 +62,11 @@ def _replicate(tree, devices):
     return jax.tree_util.tree_map(_put, tree)
 
 
-def _shard_batch(batch, n_devices: int):
+def _shard_batch(batch, devices):
+    n_devices = len(devices)
+    mesh = jax.sharding.Mesh(np.asarray(devices), ("devices",))
+    sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("devices"))
+
     def _reshape(x):
         x = jnp.asarray(x)
         if x.shape[0] % n_devices != 0:
@@ -67,7 +74,8 @@ def _shard_batch(batch, n_devices: int):
                 f"Batch size {x.shape[0]} must be divisible by local device count {n_devices} for TPU replication."
             )
         per_device = x.shape[0] // n_devices
-        return x.reshape((n_devices, per_device) + x.shape[1:])
+        reshaped = x.reshape((n_devices, per_device) + x.shape[1:])
+        return jax.device_put(reshaped, sharding)
 
     return jax.tree_util.tree_map(_reshape, batch)
 
@@ -159,7 +167,7 @@ def make_eval_step(graphdef):
     return jax.jit(_step)
 
 
-def make_pmap_train_step(graphdef, tx, ema_decay: float, grad_skip: float):
+def make_pmap_train_step(graphdef, tx, ema_decay: float, grad_skip: float, devices):
     def _step(params, opt_state, ema_params, batch, beta, rng):
         def _loss(p):
             return loss_fn(graphdef, p, batch, beta, rng)
@@ -188,7 +196,12 @@ def make_pmap_train_step(graphdef, tx, ema_decay: float, grad_skip: float):
         return candidate_params, candidate_opt_state, candidate_ema, out
 
     # State is replicated once outside the loop and remains resident on device.
-    return jax.pmap(_step, axis_name="devices", in_axes=(0, 0, 0, 0, None, 0))
+    return jax.pmap(
+        _step,
+        axis_name="devices",
+        in_axes=(0, 0, 0, 0, None, 0),
+        devices=devices,
+    )
 
 
 def _tree_allclose(a, b, atol: float = 1e-6, rtol: float = 1e-6) -> bool:
@@ -296,6 +309,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             f"Global batch size {args.bs} must be divisible by TPU local device count {device_count}."
         )
     if use_tpu_pmap:
+        devices = jax.local_devices()[:device_count]
         logger.info(
             "tpu_multi_core_training=enabled local_device_count=%d global_batch_size=%d per_device_batch_size=%d",
             device_count,
@@ -303,9 +317,8 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             args.bs // device_count,
         )
         train_step_fn = make_pmap_train_step(
-            graphdef, tx, state.ema.decay, args.grad_skip
+            graphdef, tx, state.ema.decay, args.grad_skip, devices
         )
-        devices = jax.local_devices()[:device_count]
         state = TrainState(
             params=_replicate(state.params, devices),
             opt_state=_replicate(state.opt_state, devices),
@@ -323,9 +336,11 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
     eval_step_fn = make_eval_step(graphdef)
     beta_warmup = linear_warmup(args.beta_warmup_steps) if getattr(args, "beta_warmup_steps", 0) > 0 else None
 
-    def _iter_eval_batches(dataset):
-        for start in range(0, len(dataset), args.bs):
-            batch_idx = np.arange(start, min(start + args.bs, len(dataset)))
+    def _iter_eval_batches(dataset, batch_size=None):
+        """Yield deterministic batches with an explicit consumer batch size."""
+        batch_size = int(batch_size or args.bs)
+        for start in range(0, len(dataset), batch_size):
+            batch_idx = np.arange(start, min(start + batch_size, len(dataset)))
             if hasattr(dataset, "make_batch"):
                 yield dataset.make_batch(batch_idx, shuffle=False)
             else:
@@ -375,13 +390,12 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             for step in range(steps_per_epoch):
                 fetch_t0 = time.perf_counter()
                 batch = preprocess_batch(args, next(train_iter), compact_pa=True)
-                viz_batch = batch
                 batch_ready_t0 = time.perf_counter()
                 rng = jax.random.PRNGKey(args.seed + state.step + step + epoch * 1000)
                 beta_scale = float(beta_warmup(state.step)) if beta_warmup is not None else 1.0
                 beta = args.beta * beta_scale
                 if use_tpu_pmap:
-                    batch = _shard_batch(batch, device_count)
+                    batch = _shard_batch(batch, devices)
                     rng = jax.random.split(rng, device_count)
                 if run_steps == 0:
                     first_compile_started = time.perf_counter()
@@ -397,7 +411,7 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     rng,
                 )
                 if use_tpu_pmap:
-                    metric_out = jax.tree_util.tree_map(lambda x: x[0], out)
+                    metric_out = jax.tree_util.tree_map(_first_local_replica, out)
                 else:
                     _block_until_ready(out)
                     metric_out = out
@@ -480,6 +494,12 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     speed_window_step = step + 1
 
                 if getattr(args, "checkpoint_smoke_test", False):
+                    # Visualization is an independent validation artifact. Do
+                    # not reuse the training batch: viz_batch_size may be
+                    # larger or smaller than the optimizer batch size.
+                    viz_batch = next(
+                        _iter_eval_batches(datasets["valid"], args.viz_batch_size)
+                    )
                     viz_path = write_images(
                         args,
                         graphdef,
@@ -513,9 +533,14 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             train_stats_sum = {k: float(_block_until_ready(v)) for k, v in train_stats_sum.items()}
             train_time = time.perf_counter() - epoch_step_t0
 
+            # Evaluation follows the legacy zero-based gate (after epochs
+            # 1, 1+eval_freq, ...). Checkpoint frequency counts completed
+            # epochs (after checkpoint_freq, 2*checkpoint_freq, ...).
+            # Evaluation/visualization and persistence are independent: a
+            # checkpoint due epoch must not trigger an extra validation pass.
+            eval_due = epoch % max(1, args.eval_freq) == 0
             checkpoint_due = (epoch + 1) % max(1, args.checkpoint_freq) == 0
-            eval_due = (epoch + 1) % max(1, args.eval_freq) == 0
-            validation_due = checkpoint_due or eval_due
+            validation_due = eval_due
             valid_nelbo = valid_nll = valid_kl = float("nan")
             valid_viz_batch = None
             if validation_due:
@@ -523,9 +548,12 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 valid_nelbo = valid_stats["elbo"]
                 valid_nll = valid_stats["nll"]
                 valid_kl = valid_stats["kl"]
-                valid_viz_batch = next(_iter_eval_batches(datasets["valid"]))
-            if checkpoint_due and valid_nelbo < state.best_loss:
+                valid_viz_batch = next(
+                    _iter_eval_batches(datasets["valid"], args.viz_batch_size)
+                )
+            if eval_due and valid_nelbo < state.best_loss:
                 state.best_loss = valid_nelbo
+            if checkpoint_due:
                 save_state(args, state, tx, epoch + 1, artifact_writer=artifact_writer)
             if hasattr(writer, "add_scalar"):
                 writer.add_scalar("nelbo/train", train_stats_sum["elbo"] / max(1, steps_per_epoch), epoch + 1)
@@ -541,16 +569,6 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     writer.add_scalar("valid/elbo", valid_nelbo, epoch + 1)
                     writer.add_scalar("valid/nll", valid_nll, epoch + 1)
                     writer.add_scalar("valid/kl", valid_kl, epoch + 1)
-            if not getattr(args, "checkpoint_smoke_test", False) and eval_due:
-                viz_path = write_images(
-                    args,
-                    graphdef,
-                    _portable_state(state).ema.params,
-                    valid_viz_batch,
-                    jax.random.PRNGKey(args.seed + epoch),
-                    step=state.step,
-                )
-                logger.info("viz_image=%s", viz_path, extra={"eval_log": True})
             epoch_time = time.perf_counter() - t0
             epoch_iter_per_sec = steps_per_epoch / max(train_time, 1e-12)
             epoch_sample_per_sec = steps_per_epoch * args.bs / max(train_time, 1e-12)
@@ -565,6 +583,14 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 extra={"eval_log": eval_due},
             )
             if eval_due:
+                viz_path = write_images(
+                    args,
+                    graphdef,
+                    _portable_state(state).ema.params,
+                    valid_viz_batch,
+                    jax.random.PRNGKey(args.seed + epoch),
+                    step=state.step,
+                )
                 logger.info(
                     "=> valid | nelbo: %.4f - nll: %.4f - kl: %.4f - steps: %d",
                     valid_nelbo,
@@ -572,6 +598,18 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     valid_kl,
                     state.step,
                     extra={"eval_log": True},
+                )
+                trainlog_lines = [
+                    f"viz_image={viz_path}",
+                    f"epoch={epoch + 1} train nelbo={train_stats_sum['elbo'] / max(1, steps_per_epoch):.4f} nll={train_stats_sum['nll'] / max(1, steps_per_epoch):.4f} kl={train_stats_sum['kl'] / max(1, steps_per_epoch):.4f} steps={state.step} it_s={epoch_iter_per_sec:.3f} sample_s={epoch_sample_per_sec:.3f}",
+                    f"epoch={epoch + 1} valid nelbo={valid_nelbo:.4f} nll={valid_nll:.4f} kl={valid_kl:.4f} steps={state.step}",
+                    f"epoch={epoch + 1} train_time={train_time:.1f}s total_time={epoch_time:.1f}s epoch_iter_s={epoch_iter_per_sec:.3f} epoch_sample_s={epoch_sample_per_sec:.3f}",
+                ]
+                remote_trainlog = os.path.join(args.remote_save_dir, "trainlog.txt") if getattr(args, "remote_save_dir", "") else None
+                append_text_file(
+                    os.path.join(args.save_dir, "trainlog.txt"),
+                    "\n".join(trainlog_lines) + "\n",
+                    remote_path=remote_trainlog,
                 )
                 logger.info(
                     "epoch=%d train_time=%.1fs total_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
@@ -581,21 +619,6 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     epoch_iter_per_sec,
                     epoch_sample_per_sec,
                     extra={"eval_log": True},
-                )
-                trainlog_lines = [
-                    f"epoch={epoch + 1} train nelbo={train_stats_sum['elbo'] / max(1, steps_per_epoch):.4f} "
-                    f"nll={train_stats_sum['nll'] / max(1, steps_per_epoch):.4f} "
-                    f"kl={train_stats_sum['kl'] / max(1, steps_per_epoch):.4f} "
-                    f"steps={state.step} it_s={epoch_iter_per_sec:.3f} sample_s={epoch_sample_per_sec:.3f}",
-                    f"epoch={epoch + 1} valid nelbo={valid_nelbo:.4f} nll={valid_nll:.4f} kl={valid_kl:.4f} steps={state.step}",
-                    f"epoch={epoch + 1} train_time={train_time:.1f}s total_time={epoch_time:.1f}s epoch_iter_s={epoch_iter_per_sec:.3f} epoch_sample_s={epoch_sample_per_sec:.3f}",
-                ]
-                trainlog_lines.insert(0, f"viz_image={viz_path}")
-                remote_trainlog = os.path.join(args.remote_save_dir, "trainlog.txt") if getattr(args, "remote_save_dir", "") else None
-                append_text_file(
-                    os.path.join(args.save_dir, "trainlog.txt"),
-                    "\n".join(trainlog_lines) + "\n",
-                    remote_path=remote_trainlog,
                 )
             else:
                 logger.info(

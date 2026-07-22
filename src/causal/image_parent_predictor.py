@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-# ruff: noqa: E402 -- backend selection must happen before importing JAX.
-
 from typing import Optional
-
-from runtime import configure_backend_from_argv
-
-configure_backend_from_argv()
 
 import jax
 import jax.numpy as jnp

@@ -1,14 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
-
-import os
-
-from runtime import configure_backend_from_argv
-
-configure_backend_from_argv()
-
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import jax
 import jax.numpy as jnp

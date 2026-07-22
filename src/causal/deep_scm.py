@@ -1,11 +1,5 @@
 from __future__ import annotations
 
-import os
-
-from runtime import configure_backend_from_argv
-
-configure_backend_from_argv()
-
 from typing import Dict, Optional
 
 import jax.numpy as jnp
