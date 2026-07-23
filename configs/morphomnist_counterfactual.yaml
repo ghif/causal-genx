@@ -15,16 +15,35 @@ model:
   context_dim: 12
 optimizer:
   lr: 0.0001
-  weight_decay: 0.01
+  weight_decay: 0.1
   batch_size: 32
 runtime:
   accelerator: cpu
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: morphomnist_counterfactual
+  run_name: cf_jax-cpu_23-07-2026
+  remote_root: gs://medical-airnd/causal-gen/checkpoints
 workflow:
   type: finetune-counterfactual
-  scm_checkpoint: checkpoints/morphomnist/pgm_jax-cpu_22-07-2026/checkpoints
-  predictor_checkpoint: checkpoints/morphomnist/morphomnist_predictor/pgm/checkpoints
-  image_model_checkpoint: checkpoints/morphomnist/morphomnist_vae/run/checkpoints
+  scm_checkpoint: gs://medical-airnd/causal-gen/checkpoints/morphomnist/pgm_jax-cpu-v2_13-07-2026/checkpoints
+  predictor_checkpoint: gs://medical-airnd/causal-gen/checkpoints/morphomnist/predictor_jax-gpu-g4_17-07-2026/checkpoints
+  image_model_checkpoint: gs://medical-airnd/causal-gen/checkpoints/morphomnist/jax-gpu-g4_13-07-2026/checkpoints
+  epochs: 5000
+  eval_freq: 1
+  plot_freq: 500
+  alpha: 0.1
+  lmbda_init: 0.0
+  lr_lagrange: 0.01
+  damping: 100.0
+  do_pa: null
+  cf_particles: 1
+  elbo_constraint: 1.841216802597046
+  ema_rate: 0.999
+  model_validation_batches: 1
+  # The historical GCS mirror lacks Orbax commit_success.txt markers for these
+  # otherwise readable checkpoints; this enables the logged recovery path.
+  trust_incomplete_checkpoint: true
+  resume_checkpoint: ""
+  testing: false
+  benchmark_steps: 0

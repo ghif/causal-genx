@@ -7,7 +7,7 @@ from config import load_experiment
 from contracts import CausalGraphSpec, VariableKind, VariableSpec
 from datasets import _DATASET_FACTORIES
 from config import ExperimentConfig
-from training import image_model, predictor, scm
+from training import counterfactual, image_model, predictor, scm
 
 
 def test_parent_encoder_uses_schema_order_and_validates_dimensions():
@@ -158,6 +158,65 @@ def test_native_predictor_arguments_match_legacy_artifact_profile():
     assert args.bs == 32
     assert args.epochs == 1000
     assert args.setup == "sup_aux"
+
+
+def test_native_counterfactual_arguments_match_legacy_run_sh_profile():
+    config = load_experiment("configs/morphomnist_counterfactual.yaml")
+    args = counterfactual._run_arguments(config)
+    assert args.accelerator == "cpu"
+    assert args.precision == "fp32"
+    assert args.ckpt_dir == "checkpoints"
+    assert args.remote_ckpt_dir == "gs://medical-airnd/causal-gen/checkpoints"
+    assert args.bs == 32
+    assert args.lr == 1e-4
+    assert args.wd == 0.1
+    assert args.eval_freq == 1
+    assert args.plot_freq == 500
+    assert args.alpha == 0.1
+    assert args.damping == 100.0
+    assert args.do_pa is None
+    assert args.trust_incomplete_checkpoint is True
+    assert args.pgm_path == config.workflow.scm_checkpoint
+    assert args.predictor_path == config.workflow.predictor_checkpoint
+    assert args.vae_path == config.workflow.image_model_checkpoint
+    assert str(counterfactual.output_dir(config)).endswith(
+        f"checkpoints/morphomnist/{config.artifacts.run_name}/cf"
+    )
+
+
+def test_train_cf_compatibility_module_forwards_to_stage_implementation():
+    from pgm import train_cf
+
+    assert train_cf is counterfactual
+
+
+def test_counterfactual_stage_runs_native_implementation(monkeypatch):
+    config = load_experiment("configs/morphomnist_counterfactual.yaml")
+    captured = {}
+
+    def validate(*paths, **kwargs):
+        captured["paths"] = paths
+        captured["validation_kwargs"] = kwargs
+        return paths
+
+    def native(args):
+        captured["args"] = args
+
+    monkeypatch.setattr(counterfactual, "validate_stage_artifacts", validate)
+    monkeypatch.setattr(counterfactual, "main", native)
+
+    output = counterfactual.run(config)
+
+    assert captured["paths"] == (
+        config.workflow.scm_checkpoint,
+        config.workflow.predictor_checkpoint,
+        config.workflow.image_model_checkpoint,
+    )
+    assert captured["validation_kwargs"] == {
+        "remote_root": config.artifacts.remote_root,
+    }
+    assert captured["args"].wd == 0.1
+    assert output.endswith(f"{config.artifacts.run_name}/cf")
 
 
 def test_predictor_artifact_contract_accepts_legacy_shape(tmp_path):

@@ -34,11 +34,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--dry-run-image is only supported for train-image-model")
     configure_backend(config.runtime.accelerator, config.runtime.gpu_id)
     if args.dry_run:
-        output = (
-            ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name
-            if args.command in {"train-scm", "train-predictor", "train-image-model"}
-            else config.artifacts.root
-        )
+        if args.command in {"train-scm", "train-predictor", "train-image-model"}:
+            output = ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name
+        elif args.command == "finetune-counterfactual":
+            output = ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name / "cf"
+        else:
+            output = config.artifacts.root
         print(f"validated stage={config.workflow.type} output={output}")
         return 0
     if args.dry_run_image:

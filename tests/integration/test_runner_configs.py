@@ -37,3 +37,21 @@ def test_scm_dry_run_reports_legacy_run_directory():
     config = load_experiment(ROOT / "configs/morphomnist_scm.yaml")
     expected = Path(config.artifacts.root) / config.dataset.name / config.artifacts.run_name
     assert str(expected) in result.stdout
+
+
+def test_counterfactual_dry_run_reports_legacy_cf_directory():
+    result = subprocess.run(
+        [sys.executable, "scripts/run.py", "finetune-counterfactual", "--config", "configs/morphomnist_counterfactual.yaml", "--dry-run"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    config = load_experiment(ROOT / "configs/morphomnist_counterfactual.yaml")
+    expected = (
+        Path(config.artifacts.root)
+        / config.dataset.name
+        / config.artifacts.run_name
+        / "cf"
+    )
+    assert str(expected) in result.stdout

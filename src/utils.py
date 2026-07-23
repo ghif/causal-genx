@@ -329,6 +329,7 @@ def _restore_orbax_step_direct(
     template: Optional[Dict[str, Any]],
     fallback_sharding: Optional[Any],
     suppress_warnings: bool = False,
+    strict: bool = True,
 ) -> Dict[str, Any]:
     parent_dir = os.path.dirname(step_dir.rstrip("/"))
     step_name = os.path.basename(step_dir.rstrip("/"))
@@ -340,7 +341,27 @@ def _restore_orbax_step_direct(
     with _orbax_warning_filter(suppress_warnings):
         manager = _checkpoint_manager(parent_dir, create=False)
         try:
-            restore_args = ocp.args.StandardRestore(item=template, fallback_sharding=fallback_sharding)
+            if strict:
+                restore_args = ocp.args.StandardRestore(
+                    item=template,
+                    fallback_sharding=fallback_sharding,
+                    strict=True,
+                )
+            else:
+                # Historical GCS mirrors may be restored with just the EMA
+                # leaves required by inference. PyTreeRestore is the Orbax
+                # API that explicitly permits an item subtree; ``strict`` on
+                # StandardRestore only controls array shape compatibility.
+                leaf_restore_args = None
+                if template is not None and fallback_sharding is not None:
+                    leaf_restore_args = jax.tree.map(
+                        lambda _: ocp.ArrayRestoreArgs(sharding=fallback_sharding), template
+                    )
+                restore_args = ocp.args.PyTreeRestore(
+                    item=template,
+                    restore_args=leaf_restore_args,
+                    partial_restore=True,
+                )
             ckpt_args = ocp.args.Composite(default=restore_args)
             # Checkpointer.restore rejects directories without commit_success.txt.
             # Calling the handler is the explicit escape hatch for checkpoints whose
@@ -537,6 +558,7 @@ def load_checkpoint_with_path(
     template: Optional[Dict[str, Any]] = None,
     fallback_sharding: Optional[Any] = None,
     allow_incomplete: bool = False,
+    partial_restore: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     resolved_path = resolve_checkpoint_path(path, allow_incomplete=allow_incomplete)
     if _is_legacy_checkpoint_file(resolved_path):
@@ -550,6 +572,7 @@ def load_checkpoint_with_path(
         template,
         fallback_sharding,
         suppress_warnings=allow_incomplete and not _is_complete_orbax_step_dir(resolved_path),
+        strict=not partial_restore,
     )
     return restored, resolved_path
 
@@ -559,12 +582,14 @@ def load_checkpoint(
     template: Optional[Dict[str, Any]] = None,
     fallback_sharding: Optional[Any] = None,
     allow_incomplete: bool = False,
+    partial_restore: bool = False,
 ) -> Dict[str, Any]:
     restored, _ = load_checkpoint_with_path(
         path,
         template=template,
         fallback_sharding=fallback_sharding,
         allow_incomplete=allow_incomplete,
+        partial_restore=partial_restore,
     )
     return restored
 

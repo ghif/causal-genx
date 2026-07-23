@@ -256,11 +256,22 @@ python main.py --exp_name my_experiment --data_dir gs://medical-airnd/causal-gen
 After the SCM, predictor, and image-mechanism checkpoints exist, run:
 
 ```bash
-cd causal-genx/src
-python pgm/train_cf.py --hps morphomnist --exp_name morphomnist_cf
+python scripts/run.py finetune-counterfactual \
+  --config configs/morphomnist_counterfactual.yaml \
+  artifacts.run_name=morphomnist_cf
 ```
 
-Point `--pgm_path` and `--vae_path` at the parent-SCM and image-model checkpoint roots you want to combine. This script does not train a new model from scratch; it loads the two trained pieces and performs counterfactual abduction + intervention.
+Set `workflow.scm_checkpoint`, `workflow.predictor_checkpoint`, and
+`workflow.image_model_checkpoint` in the standalone config to the three
+upstream checkpoint roots. The stage preserves the historical `cf/` artifact
+layout, checkpoint payload, logs, TensorBoard events, and GCS synchronization.
+`src/pgm/train_cf.py` remains a deprecated compatibility wrapper.
+
+Relative checkpoint paths are resolved locally first, then below
+`artifacts.remote_root`; use an explicit `gs://...` path to require GCS. Set
+`workflow.trust_incomplete_checkpoint: true` only for a known historical mirror
+whose Orbax payload is present but lacks `commit_success.txt`; the run records
+that recovery choice in its logs and checkpoint hparams.
 
 For counterfactual or structured-mechanism training, the matching JAX entrypoints live under `src/pgm/`.
 
@@ -298,7 +309,8 @@ If you want to add a new dataset or causal mechanism, the rough flow is:
 3. Adjust hyperparameters and defaults in `src/hps.py`.
 4. Train the parent SCM with `src/pgm/train_pgm.py`.
 5. Train the image mechanism with `src/main.py`.
-6. Use `src/pgm/train_cf.py` to compose the trained pieces for counterfactual evaluation.
+6. Use `scripts/run.py finetune-counterfactual --config ...` to fine-tune and
+   evaluate the counterfactual composition.
 
 ### Checkpointing
 

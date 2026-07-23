@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from config import ExperimentConfig
+from utils import is_remote_path, open_file, path_exists
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -64,19 +66,53 @@ def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bo
         yield morphomnist_batch(batch)
 
 
-def validate_stage_artifacts(scm_checkpoint: str, predictor_checkpoint: str, image_model_checkpoint: str) -> None:
-    """Validate local stage identity before counterfactual fine-tuning."""
+def resolve_checkpoint_reference(checkpoint: str, remote_root: str = "") -> str:
+    """Resolve an artifact reference locally or below the configured GCS root.
+
+    Explicit ``gs://`` paths are authoritative. A relative legacy reference such
+    as ``checkpoints/morphomnist/<run>/checkpoints`` uses its local copy when
+    present, then falls back to ``remote_root`` with the leading
+    ``checkpoints/`` component removed.
+    """
+    if is_remote_path(checkpoint) or path_exists(checkpoint) or not remote_root:
+        return checkpoint
+    if os.path.isabs(checkpoint):
+        return checkpoint
+
+    relative = checkpoint.replace("\\", "/").lstrip("./")
+    root = remote_root.rstrip("/")
+    root_name = root.rsplit("/", 1)[-1]
+    if relative == root_name:
+        relative = ""
+    elif relative.startswith(root_name + "/"):
+        relative = relative[len(root_name) + 1 :]
+    candidate = posixpath.join(root, relative)
+    return candidate if path_exists(candidate) else checkpoint
+
+
+def _read_artifact_hparams(checkpoint: str) -> dict[str, Any]:
+    hparams_path = posixpath.join(checkpoint.rstrip("/"), "hparams.json")
+    if not path_exists(hparams_path):
+        raise ValueError(f"Missing stage metadata: {hparams_path}")
+    with open_file(hparams_path, "r") as handle:
+        return json.load(handle)
+
+
+def validate_stage_artifacts(
+    scm_checkpoint: str,
+    predictor_checkpoint: str,
+    image_model_checkpoint: str,
+    *,
+    remote_root: str = "",
+) -> tuple[str, str, str]:
+    """Resolve and validate the three counterfactual input artifacts."""
+    scm_checkpoint = resolve_checkpoint_reference(scm_checkpoint, remote_root)
+    predictor_checkpoint = resolve_checkpoint_reference(predictor_checkpoint, remote_root)
+    image_model_checkpoint = resolve_checkpoint_reference(image_model_checkpoint, remote_root)
     expected = ((scm_checkpoint, "sup_pgm"), (predictor_checkpoint, "sup_aux"))
     for checkpoint, setup in expected:
-        hparams = Path(checkpoint) / "hparams.json"
-        if not hparams.is_file():
-            raise ValueError(f"Missing stage metadata: {hparams}")
-        with hparams.open(encoding="utf-8") as handle:
-            if json.load(handle).get("setup") != setup:
-                raise ValueError(f"{checkpoint} is not a {setup} artifact")
-    image_hparams = Path(image_model_checkpoint) / "hparams.json"
-    if not image_hparams.is_file():
-        raise ValueError(f"Missing image-model metadata: {image_hparams}")
-    with image_hparams.open(encoding="utf-8") as handle:
-        if "vae" not in json.load(handle):
-            raise ValueError(f"{image_model_checkpoint} is not an image-model artifact")
+        if _read_artifact_hparams(checkpoint).get("setup") != setup:
+            raise ValueError(f"{checkpoint} is not a {setup} artifact")
+    if "vae" not in _read_artifact_hparams(image_model_checkpoint):
+        raise ValueError(f"{image_model_checkpoint} is not an image-model artifact")
+    return scm_checkpoint, predictor_checkpoint, image_model_checkpoint

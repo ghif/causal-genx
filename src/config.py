@@ -107,11 +107,31 @@ class ImageModelTrainingConfig(BaseModel):
 
 
 class CounterfactualTrainingConfig(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        protected_namespaces=(),
+    )
     type: Literal["finetune-counterfactual"]
     scm_checkpoint: str
     predictor_checkpoint: str
     image_model_checkpoint: str
+    epochs: PositiveInt = 5000
+    eval_freq: PositiveInt = 1
+    plot_freq: PositiveInt = 500
+    alpha: float = 0.1
+    lmbda_init: float = 0.0
+    lr_lagrange: float = 1e-2
+    damping: float = 100.0
+    do_pa: str | None = None
+    cf_particles: PositiveInt = 1
+    elbo_constraint: float = 1.841216802597046
+    ema_rate: float = 0.999
+    model_validation_batches: int = 1
+    trust_incomplete_checkpoint: bool = False
+    resume_checkpoint: str = ""
+    testing: bool = False
+    benchmark_steps: int = 0
 
 
 class InferenceConfig(BaseModel):
