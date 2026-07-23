@@ -7,15 +7,12 @@ import os
 import random
 import shutil
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
 
 import time
-
-from runtime import configure_backend_from_argv
-
-configure_backend_from_argv()
 
 import imageio.v2 as imageio
 import jax
@@ -171,18 +168,18 @@ def checkpoint_root_dir(save_dir: str) -> str:
     return os.path.abspath(os.path.join(save_dir, "checkpoints"))
 
 
-def experiment_run_dir(root_dir: str, hps: str, exp_name: str, default_name: str) -> str:
+def experiment_run_dir(root_dir: str, dataset_id: str, exp_name: str, default_name: str) -> str:
     if not root_dir:
         return ""
-    return os.path.join(root_dir, hps, exp_name or default_name)
+    return os.path.join(root_dir, dataset_id, exp_name or default_name)
 
 
 def materialize_nnx(graphdef, params):
-    return nnx.merge(graphdef, nnx.State(params))
+    return nnx.merge(graphdef, params)
 
 
 def viz_path_for_step(save_dir: str, step: int) -> str:
-    return os.path.join(save_dir, f"viz-step-{int(step)}.png")
+    return os.path.join(save_dir, f"viz-{int(step)}.png")
 
 
 def sync_file(local_path: str, remote_path: str) -> None:
@@ -205,8 +202,9 @@ def sync_tree(local_dir: str, remote_dir: str) -> None:
             sync_file(local_path, os.path.join(remote_path, name))
 
 
-def _is_legacy_checkpoint_file(path: str) -> bool:
-    return path.endswith(".pt") or path.endswith(".pkl")
+def _reject_non_orbax_checkpoint(path: str) -> None:
+    if path.endswith((".pt", ".pkl")):
+        raise ValueError("Only Orbax checkpoint directories are supported; .pt and .pkl files are not supported.")
 
 
 def _checkpoint_manager(root_dir: str, *, create: bool) -> ocp.CheckpointManager:
@@ -214,7 +212,10 @@ def _checkpoint_manager(root_dir: str, *, create: bool) -> ocp.CheckpointManager
         max_to_keep=3,
         create=create,
         save_interval_steps=1,
-        enable_async_checkpointing=False,
+        # The artifact worker owns completion, so Orbax may overlap its array
+        # serialization with host-side artifact preparation without affecting
+        # the training thread.
+        enable_async_checkpointing=True,
     )
     return ocp.CheckpointManager(root_dir, options=options)
 
@@ -332,6 +333,7 @@ def _restore_orbax_step_direct(
     template: Optional[Dict[str, Any]],
     fallback_sharding: Optional[Any],
     suppress_warnings: bool = False,
+    strict: bool = True,
 ) -> Dict[str, Any]:
     parent_dir = os.path.dirname(step_dir.rstrip("/"))
     step_name = os.path.basename(step_dir.rstrip("/"))
@@ -343,7 +345,27 @@ def _restore_orbax_step_direct(
     with _orbax_warning_filter(suppress_warnings):
         manager = _checkpoint_manager(parent_dir, create=False)
         try:
-            restore_args = ocp.args.StandardRestore(item=template, fallback_sharding=fallback_sharding)
+            if strict:
+                restore_args = ocp.args.StandardRestore(
+                    item=template,
+                    fallback_sharding=fallback_sharding,
+                    strict=True,
+                )
+            else:
+                # Historical GCS mirrors may be restored with just the EMA
+                # leaves required by inference. PyTreeRestore is the Orbax
+                # API that explicitly permits an item subtree; ``strict`` on
+                # StandardRestore only controls array shape compatibility.
+                leaf_restore_args = None
+                if template is not None and fallback_sharding is not None:
+                    leaf_restore_args = jax.tree.map(
+                        lambda _: ocp.ArrayRestoreArgs(sharding=fallback_sharding), template
+                    )
+                restore_args = ocp.args.PyTreeRestore(
+                    item=template,
+                    restore_args=leaf_restore_args,
+                    partial_restore=True,
+                )
             ckpt_args = ocp.args.Composite(default=restore_args)
             # Checkpointer.restore rejects directories without commit_success.txt.
             # Calling the handler is the explicit escape hatch for checkpoints whose
@@ -383,13 +405,7 @@ def _load_hparams_if_present(root_dir: str, restored: Dict[str, Any]) -> None:
 
 
 def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None, custom_metadata: Optional[Dict[str, Any]] = None) -> None:
-    if _is_legacy_checkpoint_file(path):
-        ensure_parent_dir(path)
-        import pickle
-
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
-        return
+    _reject_non_orbax_checkpoint(path)
 
     path = os.path.abspath(path)
     ensure_dir(path)
@@ -422,14 +438,60 @@ def _save_checkpoint_and_sync(
 ) -> None:
     save_checkpoint(data, path, step=step, custom_metadata=custom_metadata)
     if local_tree_dir and remote_tree_dir:
-        sync_tree(local_tree_dir, remote_tree_dir)
+        # A full-tree mirror reuploads every retained Orbax step on each save.
+        # The checkpoint just written and its run-level hparams are sufficient.
+        save_step = int(step if step is not None else data.get("step", 0))
+        sync_tree(
+            os.path.join(local_tree_dir, str(save_step)),
+            os.path.join(remote_tree_dir, str(save_step)),
+        )
+        hparams_path = os.path.join(local_tree_dir, "hparams.json")
+        if os.path.exists(hparams_path):
+            sync_file(hparams_path, os.path.join(remote_tree_dir, "hparams.json"))
 
 
 class BackgroundArtifactWriter:
-    """Serialize artifact saves on the caller thread."""
+    """Bounded, ordered artifact worker that never blocks the training loop.
+
+    One job may run while one newer job is retained.  Submitting another job
+    replaces that pending job, which keeps slow storage from building an
+    unbounded backlog of stale checkpoints and visualizations.
+    """
 
     def __init__(self):
         self._closed = False
+        self._condition = threading.Condition()
+        self._running = False
+        self._pending = None
+        self._error: BaseException | None = None
+        self._submitted = 0
+        self._coalesced = 0
+        self._worker = threading.Thread(
+            target=self._run, name="causal-gen-artifacts", daemon=True
+        )
+        self._worker.start()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._closed:
+                    self._condition.wait()
+                if self._pending is None and self._closed:
+                    self._condition.notify_all()
+                    return
+                fn, args, kwargs = self._pending
+                self._pending = None
+                self._running = True
+            try:
+                fn(*args, **kwargs)
+            except BaseException as exc:  # surfaced by flush/close on the host
+                with self._condition:
+                    if self._error is None:
+                        self._error = exc
+            finally:
+                with self._condition:
+                    self._running = False
+                    self._condition.notify_all()
 
     def _submit_job(
         self,
@@ -437,9 +499,27 @@ class BackgroundArtifactWriter:
         *args,
         **kwargs,
     ):
-        if self._closed:
-            raise RuntimeError("BackgroundArtifactWriter is closed.")
-        return fn(*args, **kwargs)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("BackgroundArtifactWriter is closed.")
+            if self._pending is not None:
+                self._coalesced += 1
+            self._pending = (fn, args, kwargs)
+            self._submitted += 1
+            self._condition.notify()
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        with self._condition:
+            return {
+                "submitted": self._submitted,
+                "coalesced": self._coalesced,
+                "running": int(self._running),
+                "pending": int(self._pending is not None),
+            }
+
+    def submit(self, fn, *args, **kwargs) -> None:
+        self._submit_job(fn, *args, **kwargs)
 
     def submit_checkpoint(
         self,
@@ -476,12 +556,27 @@ class BackgroundArtifactWriter:
         return viz_path
 
     def flush(self):
-        return None
+        with self._condition:
+            while self._pending is not None or self._running:
+                self._condition.wait()
+            if self._error is not None:
+                raise RuntimeError("Background artifact writer failed.") from self._error
 
     def close(self):
         if self._closed:
             return
-        self._closed = True
+        error = None
+        try:
+            self.flush()
+        except BaseException as exc:
+            error = exc
+        finally:
+            with self._condition:
+                self._closed = True
+                self._condition.notify_all()
+            self._worker.join()
+        if error is not None:
+            raise error
 
 
 AsyncCheckpointWriter = BackgroundArtifactWriter
@@ -490,8 +585,7 @@ AsyncCheckpointWriter = BackgroundArtifactWriter
 def resolve_checkpoint_path(path: str, allow_incomplete: bool = False) -> str:
     """Resolve a checkpoint root to the exact file or numeric Orbax step restored."""
     path = path.rstrip("/")
-    if _is_legacy_checkpoint_file(path):
-        return path
+    _reject_non_orbax_checkpoint(path)
 
     if _is_orbax_step_dir(path):
         if allow_incomplete or _is_complete_orbax_step_dir(path):
@@ -502,7 +596,7 @@ def resolve_checkpoint_path(path: str, allow_incomplete: bool = False) -> str:
             return latest
         raise ValueError(
             f"Checkpoint {path} is missing commit_success.txt. "
-            "Pass allow_incomplete=True (infer.py: --trust_incomplete_checkpoint) "
+            "Enable workflow.trust_incomplete_checkpoint to restore it anyway. "
             "to restore it anyway."
         )
 
@@ -530,8 +624,6 @@ def resolve_checkpoint_path(path: str, allow_incomplete: bool = False) -> str:
 
 
 def checkpoint_is_complete(path: str) -> bool:
-    if _is_legacy_checkpoint_file(path):
-        return True
     return _is_complete_orbax_step_dir(path)
 
 
@@ -540,19 +632,15 @@ def load_checkpoint_with_path(
     template: Optional[Dict[str, Any]] = None,
     fallback_sharding: Optional[Any] = None,
     allow_incomplete: bool = False,
+    partial_restore: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     resolved_path = resolve_checkpoint_path(path, allow_incomplete=allow_incomplete)
-    if _is_legacy_checkpoint_file(resolved_path):
-        import pickle
-
-        with open(resolved_path, "rb") as f:
-            return pickle.load(f), resolved_path
-
     restored = _restore_orbax_step_direct(
         resolved_path,
         template,
         fallback_sharding,
         suppress_warnings=allow_incomplete and not _is_complete_orbax_step_dir(resolved_path),
+        strict=not partial_restore,
     )
     return restored, resolved_path
 
@@ -562,12 +650,14 @@ def load_checkpoint(
     template: Optional[Dict[str, Any]] = None,
     fallback_sharding: Optional[Any] = None,
     allow_incomplete: bool = False,
+    partial_restore: bool = False,
 ) -> Dict[str, Any]:
     restored, _ = load_checkpoint_with_path(
         path,
         template=template,
         fallback_sharding=fallback_sharding,
         allow_incomplete=allow_incomplete,
+        partial_restore=partial_restore,
     )
     return restored
 
@@ -779,7 +869,7 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
         sample, _ = model.sample(parents=pa_jax, return_loc=True, t=temp, rng=rng_key)
         rows.append(postprocess(sample))
 
-    if "morphomnist" in getattr(args, "hps", ""):
+    if getattr(args, "dataset_id", "") == "morphomnist":
         base_pa = np.asarray(pa)[:bs]
         if base_pa.ndim == 4:
             base_pa = base_pa[:, 0, 0, :]
@@ -803,14 +893,15 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
                 z_i = []
                 for z in zs:
                     if getattr(model, "cond_prior", False):
-                        z_dict = {}
-                        for k, v in z.items():
-                            z_dict[k] = _repeat_batch(v[ii], args.context_dim)
-                        z_i.append(z_dict)
+                        # The native JAX HVAE returns each conditional latent
+                        # as an array. The Torch implementation returned a
+                        # {"z": ...} mapping, so do not assume ``items()``
+                        # exists here.
+                        z_i.append(_repeat_batch(z[ii], args.context_dim))
                     else:
                         z_i.append(_repeat_batch(z[ii], args.context_dim))
                 if getattr(model, "cond_prior", False):
-                    latents = [z_i[j]["z"] for j in range(l)]
+                    latents = z_i[:l]
                 else:
                     latents = z_i[:l]
                 _append_counterfactual_rows(latents, pa_ctx, cf_pa_ctx, x_ctx, alpha, t)

@@ -1,0 +1,36 @@
+version: "1"
+seed: 7
+dataset:
+  name: morphomnist
+  root: gs://medical-airnd/causal-gen/datasets/morphomnist
+  input_res: 32
+  pad: 4
+  context_norm: "[-1,1]"
+causal_schema:
+  version: "1"
+  variables: [thickness, intensity, digit]
+  edges: [[digit, thickness], [thickness, intensity]]
+model:
+  name: hierarchical_vae
+  context_dim: 12
+optimizer:
+  lr: 0.001
+  weight_decay: 0.01
+  batch_size: 128
+runtime:
+  accelerator: gpu
+  precision: bf16
+artifacts:
+  root: checkpoints
+  run_name: hvae_jax-gpu_22-07-2026
+  remote_root: gs://medical-airnd/causal-gen/checkpoints
+workflow:
+  type: train-image-model
+  epochs: 5000
+  speed_log_freq: 50
+  viz_batch_size: 32
+  # This is the single artifact cadence: validate, then asynchronously save
+  # checkpoint, visualization, and train log only for a new best ELBO.
+  checkpoint_freq: 1
+  benchmark_steps: 0
+  benchmark_warmup_steps: 20

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "causal-genx"
+version = "0.1.0"
+description = "Composable JAX workflows for causal generative modelling"
+requires-python = ">=3.10"
+dependencies = [
+  "pydantic>=2.0,<2.10",
+  "PyYAML>=6.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["artifacts", "config", "contracts", "runtime", "utils"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

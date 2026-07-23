@@ -12,20 +12,15 @@ import numpy as np
 import optax
 from flax import nnx
 
-from pgm.sup_aux_pgm import MorphoMNISTSupAuxPredictor, _set_variable_value
-from pgm.train_pgm import (
-    _IndexedDataset,
-    _WarmupEMA,
-    _main_sup_aux,
-    _configure_sup_aux_compute_policy,
-    _sup_aux_assert_compatible_checkpoint,
-    _sup_aux_checkpoint_payload,
-    _sup_aux_eval_epoch,
-    _sup_aux_loss_and_state,
-    _sup_aux_make_train_step,
-    _sup_aux_merge,
-    _setup_sup_aux_scope,
-    _validate_sup_aux_runtime_device,
+from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor, _set_variable_value
+from training.predictor import (
+    _IndexedDataset, WarmupEMA as _WarmupEMA, _run as _main_sup_aux,
+    _compute_dtype as _configure_sup_aux_compute_policy,
+    _assert_compatible_checkpoint as _sup_aux_assert_compatible_checkpoint,
+    _checkpoint_payload as _sup_aux_checkpoint_payload,
+    _eval_epoch as _sup_aux_eval_epoch, _loss_and_state as _sup_aux_loss_and_state,
+    _make_train_step as _sup_aux_make_train_step, _merge as _sup_aux_merge,
+    _validate_scope as _setup_sup_aux_scope, _validate_runtime_device as _validate_sup_aux_runtime_device,
 )
 from utils import load_checkpoint, save_checkpoint
 
@@ -216,7 +211,7 @@ def test_sup_aux_bf16_compute_keeps_fp32_master_params_and_outputs():
 
 
 def test_sup_aux_precision_scope_accepts_accelerator_bf16_only():
-    base = dict(dataset="morphomnist", setup="sup_aux")
+    base = dict(dataset="morphomnist", setup="sup_aux", input_channels=1, input_res=32, pad=4)
     _setup_sup_aux_scope(SimpleNamespace(**base, accelerator="gpu", precision="bf16"))
     _setup_sup_aux_scope(SimpleNamespace(**base, accelerator="tpu", precision="bf16"))
     with np.testing.assert_raises_regex(ValueError, "CPU predictor training"):
@@ -234,6 +229,21 @@ def test_sup_aux_device_preflight_requires_one_gpu_and_accepts_tpu(monkeypatch):
     tpu = SimpleNamespace(platform="tpu")
     monkeypatch.setattr(jax, "devices", lambda: [tpu])
     assert _validate_sup_aux_runtime_device(SimpleNamespace(accelerator="tpu")) is tpu
+
+
+def test_sup_aux_execution_mode_selects_single_or_replicated_tpu(monkeypatch):
+    from training.predictor import _use_tpu_replication
+
+    monkeypatch.setattr(jax, "local_device_count", lambda: 1)
+    assert not _use_tpu_replication(SimpleNamespace(accelerator="gpu", execution_mode="auto"))
+    assert not _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="auto"))
+    with np.testing.assert_raises_regex(ValueError, "requires accelerator=tpu with multiple local devices"):
+        _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="replicated"))
+
+    monkeypatch.setattr(jax, "local_device_count", lambda: 4)
+    assert _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="auto"))
+    assert _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="replicated"))
+    assert not _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="single_device"))
 
 
 def test_sup_aux_ema_and_checkpoint_round_trip(tmp_path):
@@ -283,7 +293,7 @@ def test_sup_aux_end_to_end_training_and_test_only(tmp_path, monkeypatch):
         return {"train": train_full, "valid": valid, "test": test}, train_subset
 
     monkeypatch.setattr(
-        "pgm.train_pgm._build_sup_aux_datasets", fake_build_sup_aux_datasets
+        "training.predictor._build_datasets", fake_build_sup_aux_datasets
     )
 
     class _NoOpSummaryWriter:
@@ -302,7 +312,7 @@ def test_sup_aux_end_to_end_training_and_test_only(tmp_path, monkeypatch):
         def close(self):
             return None
 
-    monkeypatch.setattr("pgm.train_pgm.SummaryWriter", _NoOpSummaryWriter)
+    monkeypatch.setattr("training.predictor.SummaryWriter", _NoOpSummaryWriter)
 
     args = SimpleNamespace(
         accelerator="cpu",

@@ -1,0 +1,45 @@
+version: "1"
+seed: 7
+dataset:
+  name: morphomnist
+  root: gs://medical-airnd/causal-gen/datasets/morphomnist
+  input_res: 32
+  pad: 4
+  context_norm: "[-1,1]"
+causal_schema:
+  version: "1"
+  variables: [thickness, intensity, digit]
+  edges: [[digit, thickness], [thickness, intensity]]
+model:
+  name: hierarchical_vae
+  context_dim: 12
+  cond_prior: true
+optimizer:
+  lr: 0.001
+  weight_decay: 0.01
+  # Global batch: 128 examples on each of the four v6e chips.
+  batch_size: 512
+  lr_warmup_steps: 100
+runtime:
+  accelerator: tpu
+  precision: bf16
+  # v6e-4 is one VM with four locally addressable TPU chips.
+  expected_local_device_count: 4
+  expected_global_device_count: 4
+  expected_process_count: 1
+artifacts:
+  root: checkpoints
+  run_name: hvae_jax-tpu-v6e4-v2_23-07-2026
+  remote_root: gs://medical-airnd/causal-gen/checkpoints
+workflow:
+  type: train-image-model
+  epochs: 5000
+  execution_mode: replicated
+  drop_remainder: true
+  speed_log_freq: 20
+  viz_batch_size: 32
+  # This is the single artifact cadence: validate, then asynchronously save
+  # checkpoint, visualization, and train log only for a new best ELBO.
+  checkpoint_freq: 20
+  benchmark_steps: 0
+  benchmark_warmup_steps: 20

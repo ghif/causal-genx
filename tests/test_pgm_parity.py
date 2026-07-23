@@ -9,19 +9,19 @@ import numpy as np
 import optax
 from flax import nnx
 
-from pgm.flow_pgm import (
+from causal.flow_scm import (
     MorphoMNISTPGM,
     _normal_log_prob,
     _normalize_inverse,
     _set_variable_value,
     monotonic_rational_spline,
 )
-from pgm.train_pgm import (
+from training.scm import (
     PGMEMA,
     _progress_description,
     _sync_pdf_artifacts,
     epoch_batches,
-    make_train_step,
+    _make_train_step as make_train_step,
     preprocess,
 )
 import utils
@@ -313,7 +313,7 @@ def test_pdf_artifacts_are_synced_to_remote_run_dir(tmp_path, monkeypatch):
     def fake_sync_file(local_path, remote_path):
         copied.append((os.path.basename(local_path), os.path.basename(remote_path)))
 
-    monkeypatch.setattr("pgm.train_pgm.sync_file", fake_sync_file)
+    monkeypatch.setattr("training.scm.sync_file", fake_sync_file)
     args = SimpleNamespace(
         save_dir=str(save_dir),
         remote_save_dir=str(remote_dir),

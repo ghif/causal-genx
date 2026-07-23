@@ -1,2 +1,0 @@
-"""JAX PGM utilities."""
-

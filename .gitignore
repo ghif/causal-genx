@@ -1,0 +1,23 @@
+.DS_Store
+AGENTS.md
+docs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Generated experiment artifacts; use tracked fixtures under tests/ instead.
+checkpoints/
+results/
+test_ckpt/
+*.tfevents.*
+events.out.tfevents.*
+infer-preview-step-*.png
+viz-*.png
+trainlog.txt
+
+samples/
+notebook/

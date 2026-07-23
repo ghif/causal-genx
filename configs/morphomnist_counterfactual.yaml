@@ -1,0 +1,51 @@
+version: "1"
+seed: 7
+dataset:
+  name: morphomnist
+  root: gs://medical-airnd/causal-gen/datasets/morphomnist
+  input_res: 32
+  pad: 4
+  context_norm: "[-1,1]"
+causal_schema:
+  version: "1"
+  variables: [thickness, intensity, digit]
+  edges: [[digit, thickness], [thickness, intensity]]
+model:
+  name: hierarchical_vae
+  context_dim: 12
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.1
+  batch_size: 32
+runtime:
+  accelerator: cpu
+  precision: fp32
+artifacts:
+  root: checkpoints
+  run_name: cf_jax-cpu_23-07-2026
+  remote_root: gs://medical-airnd/causal-gen/checkpoints
+workflow:
+  type: finetune-counterfactual
+  scm_checkpoint: gs://medical-airnd/causal-gen/checkpoints/morphomnist/scm_jax-cpu-v2_23-07-2026/checkpoints
+  predictor_checkpoint: gs://medical-airnd/causal-gen/checkpoints/morphomnist/predictor_jax-tpu-v6e-4_23-07-2026/checkpoints
+  image_model_checkpoint: gs://medical-airnd/causal-gen/checkpoints/morphomnist/hvae_jax-tpu-v6e4-v2_23-07-2026/checkpoints
+  epochs: 500
+  speed_log_freq: 50
+  checkpoint_freq: 1
+  execution_mode: auto
+  drop_remainder: false
+  alpha: 0.1
+  lmbda_init: 0.0
+  lr_lagrange: 0.01
+  damping: 100.0
+  do_pa: null
+  cf_particles: 1
+  elbo_constraint: 1.841216802597046
+  ema_rate: 0.999
+  model_validation_batches: 1
+  # The historical GCS mirror lacks Orbax commit_success.txt markers for these
+  # otherwise readable checkpoints; this enables the logged recovery path.
+  trust_incomplete_checkpoint: true
+  resume_checkpoint: ""
+  testing: false
+  benchmark_steps: 0
