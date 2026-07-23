@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
-from glob import glob
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
@@ -26,22 +26,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 from flax import nnx
-from tqdm import tqdm
 
 from causal.flow_scm import MorphoMNISTPGM
 from config import ExperimentConfig, ScmTrainingConfig
 from data.morphomnist import morphomnist
 from utils import (
+    BackgroundArtifactWriter,
     SummaryWriter,
     checkpoint_root_dir,
     ensure_dir,
     experiment_run_dir,
     load_checkpoint,
     materialize_nnx,
-    save_checkpoint,
     seed_all,
     sync_file,
-    sync_tree,
     tree_copy,
 )
 
@@ -67,7 +65,8 @@ class ScmRunArguments:
     wd: float
     input_res: int
     pad: int
-    eval_freq: int
+    speed_log_freq: int
+    checkpoint_freq: int
     plot_samples: int
     widths: list[int]
     benchmark_steps: int = 0
@@ -126,7 +125,8 @@ def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
         wd=config.optimizer.weight_decay,
         input_res=config.dataset.input_res,
         pad=config.dataset.pad,
-        eval_freq=workflow.eval_freq,
+        speed_log_freq=workflow.speed_log_freq,
+        checkpoint_freq=workflow.checkpoint_freq,
         plot_samples=workflow.plot_samples,
         widths=list(workflow.widths),
         benchmark_steps=workflow.benchmark_steps,
@@ -242,14 +242,12 @@ def _progress_description(mode: str, stats: Dict[str, float], grad_norm: Optiona
 def _eval_epoch(graphdef: Any, params: Any, dataset: Any, batch_size: int, rng: np.random.Generator) -> Dict[str, float]:
     totals: Dict[str, float] = {}
     count = 0
-    progress = tqdm(epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng), total=(len(dataset) + batch_size - 1) // batch_size, miniters=max(1, len(dataset) // batch_size // 100), mininterval=5)
-    for batch in progress:
+    for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
         _, metrics = _loss(graphdef, params, batch)
         size = int(batch["digit"].shape[0])
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + float(value) * size
         count += size
-        progress.set_description(_progress_description("eval", _mean_metrics(totals, count)))
     return _mean_metrics(totals, count)
 
 
@@ -272,8 +270,111 @@ def _plot_joint(args: ScmRunArguments, graphdef: Any, params: Any, dataset: Any,
 
 def _sync_pdf_artifacts(args: ScmRunArguments) -> None:
     if args.remote_save_dir:
-        for path in sorted(glob(os.path.join(args.save_dir, "*.pdf"))):
-            sync_file(path, os.path.join(args.remote_save_dir, os.path.basename(path)))
+        for path in sorted(Path(args.save_dir).glob("*.pdf")):
+            sync_file(str(path), os.path.join(args.remote_save_dir, path.name))
+
+
+def _checkpoint_due(epoch: int, checkpoint_freq: int) -> bool:
+    """Return whether a completed one-based epoch may validate and persist artifacts."""
+    return epoch % max(1, checkpoint_freq) == 0
+
+
+def _sync_tensorboard_artifacts(args: ScmRunArguments) -> None:
+    if not args.remote_save_dir:
+        return
+    for event_path in sorted(Path(args.save_dir).glob("events.out.tfevents.*")):
+        sync_file(str(event_path), os.path.join(args.remote_save_dir, event_path.name))
+
+
+def _sync_metric_artifacts(args: ScmRunArguments) -> None:
+    """Synchronize flushed logs, TensorBoard events, and SCM plots to GCS."""
+    if not args.remote_save_dir:
+        return
+    sync_file(
+        os.path.join(args.save_dir, "trainlog.txt"),
+        os.path.join(args.remote_save_dir, "trainlog.txt"),
+    )
+    _sync_tensorboard_artifacts(args)
+    _sync_pdf_artifacts(args)
+
+
+def _submit_best_checkpoint(
+    artifact_writer: BackgroundArtifactWriter,
+    args: ScmRunArguments,
+    params: Any,
+    ema: PGMEMA,
+    opt_state: Any,
+    epoch: int,
+    step: int,
+    best_loss: float,
+) -> None:
+    payload = _checkpoint_payload(args, params, ema, opt_state, epoch, step, best_loss)
+    remote_checkpoint_dir = (
+        os.path.join(args.remote_save_dir, "checkpoints") if args.remote_save_dir else None
+    )
+    artifact_writer.submit_checkpoint(
+        payload,
+        args.checkpoint_dir,
+        step=step,
+        custom_metadata={"epoch": epoch, "best_loss": best_loss},
+        local_tree_dir=args.checkpoint_dir if remote_checkpoint_dir else None,
+        remote_tree_dir=remote_checkpoint_dir,
+    )
+
+
+def _write_epoch_summary(
+    writer: Any,
+    *,
+    epoch: int,
+    step: int,
+    train_stats: Dict[str, float],
+    train_time: float,
+    total_time: float,
+    iter_per_sec: float,
+    sample_per_sec: float,
+    grad_norm: float,
+    valid_stats: Dict[str, float] | None = None,
+) -> None:
+    """Persist a completed SCM epoch, with validation metrics when checkpoint-due."""
+    for key, value in train_stats.items():
+        writer.add_scalar(f"train/{key}", value, step)
+    if valid_stats is not None:
+        for key, value in valid_stats.items():
+            writer.add_scalar(f"valid/{key}", value, step)
+        writer.add_scalar("elbo/valid", valid_stats["loss"], step)
+    writer.add_scalar("elbo/train", train_stats["loss"], step)
+    writer.add_scalar("epoch/number", epoch, step)
+    writer.add_scalar("epoch/global_step", step, step)
+    writer.add_scalar("epoch/train_time_sec", train_time, step)
+    writer.add_scalar("epoch/total_time_sec", total_time, step)
+    writer.add_scalar("epoch/iter_per_sec", iter_per_sec, step)
+    writer.add_scalar("epoch/sample_per_sec", sample_per_sec, step)
+    writer.add_scalar("epoch/grad_norm", grad_norm, step)
+
+
+def _log_epoch_summary(
+    logger: logging.Logger,
+    *,
+    epoch: int,
+    step: int,
+    train_stats: Dict[str, float],
+    train_time: float,
+    total_time: float,
+    iter_per_sec: float,
+    sample_per_sec: float,
+    grad_norm: float,
+    valid_stats: Dict[str, float] | None = None,
+) -> None:
+    logger.info(
+        "%s - steps: %d - it/s: %.3f - samples/s: %.3f",
+        _progress_description("train", train_stats, grad_norm).strip(), step, iter_per_sec, sample_per_sec,
+    )
+    if valid_stats is not None:
+        logger.info("%s - steps: %d", _progress_description("valid", valid_stats).strip(), step)
+    logger.info(
+        "epoch=%d train_time=%.1fs total_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
+        epoch, train_time, total_time, iter_per_sec, sample_per_sec,
+    )
 
 
 def _checkpoint_payload(args: ScmRunArguments, params: Any, ema: PGMEMA, opt_state: Any, epoch: int, step: int, best_loss: float) -> Dict[str, Any]:
@@ -328,36 +429,105 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
         _plot_joint(args, graphdef, ema.params, datasets["test"], 0); _sync_pdf_artifacts(args); writer.close(); return stats
     for key in sorted(vars(args)): logger.info("--%s=%s", key, getattr(args, key))
     train_step = _make_train_step(graphdef, optimizer); final_stats: Dict[str, float] = {}
-    for epoch in range(start_epoch, args.epochs):
-        logger.info("Epoch %d:", epoch + 1); totals: Dict[str, float] = {}; seen = 0; last_grad_norm = 0.0
-        total_batches = len(datasets["train"]) // args.bs
-        progress = tqdm(epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng), total=total_batches, miniters=max(1, total_batches // 100), mininterval=5)
-        for batch in progress:
-            params, opt_state, metrics, grad_norm = train_step(params, opt_state, batch); ema.update(params); size = int(batch["digit"].shape[0])
-            for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
-            seen += size; step += 1; last_grad_norm = float(grad_norm)
-            progress.set_description(_progress_description("train", _mean_metrics(totals, seen), last_grad_norm))
-            if args.benchmark_steps and step >= args.benchmark_steps: break
-        train_stats = _mean_metrics(totals, seen)
-        if epoch % args.eval_freq != 0:
-            if args.benchmark_steps and step >= args.benchmark_steps: break
-            continue
-        # Validation and plots use EMA weights so saved samples match inference.
-        valid_stats = _eval_epoch(graphdef, ema.params, datasets["valid"], args.bs, rng); final_stats = valid_stats
-        logger.info("loss | train: %.4f - valid: %.4f - steps: %d", train_stats["loss"], valid_stats["loss"], step)
-        for key in train_stats: writer.add_scalar(f"train/{key}", train_stats[key], step); writer.add_scalar(f"valid/{key}", valid_stats[key], step)
-        writer.add_scalar("elbo/train", train_stats["loss"], step); writer.add_scalar("elbo/valid", valid_stats["loss"], step)
-        _plot_joint(args, graphdef, ema.params, datasets["train"], step); _sync_pdf_artifacts(args)
-        if valid_stats["loss"] < best_loss:
-            # A lower negative log likelihood defines the durable best artifact.
-            best_loss = valid_stats["loss"]; save_checkpoint(_checkpoint_payload(args, params, ema, opt_state, epoch + 1, step, best_loss), args.checkpoint_dir, step=step, custom_metadata={"epoch": epoch + 1, "best_loss": best_loss})
-            if args.remote_save_dir: sync_tree(args.checkpoint_dir, os.path.join(args.remote_save_dir, "checkpoints"))
-            logger.info("Model saved: %s", args.checkpoint_dir)
-        writer.flush()
-        if args.remote_save_dir:
-            sync_file(os.path.join(args.save_dir, "trainlog.txt"), os.path.join(args.remote_save_dir, "trainlog.txt")); _sync_pdf_artifacts(args)
-        if args.benchmark_steps and step >= args.benchmark_steps: break
-    writer.close(); return final_stats
+    artifact_writer = BackgroundArtifactWriter()
+    metric_artifact_writer = BackgroundArtifactWriter()
+    total_batches = len(datasets["train"]) // args.bs
+    total_train_steps = max(1, total_batches) * max(1, args.epochs - start_epoch)
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            logger.info("Epoch %d:", epoch + 1)
+            totals: Dict[str, float] = {}; seen = 0; last_grad_norm = 0.0
+            epoch_t0 = epoch_step_t0 = speed_window_t0 = time.perf_counter()
+            speed_window_step = 0
+            speed_window_samples = 0
+            for batch_index, batch in enumerate(
+                epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng), start=1
+            ):
+                params, opt_state, metrics, grad_norm = train_step(params, opt_state, batch)
+                ema.update(params)
+                size = int(batch["digit"].shape[0])
+                for key, value in metrics.items():
+                    totals[key] = totals.get(key, 0.0) + float(value) * size
+                seen += size; step += 1; last_grad_norm = float(grad_norm)
+                if batch_index % max(1, args.speed_log_freq) == 0:
+                    sync_t0 = time.perf_counter()
+                    window_steps = batch_index - speed_window_step
+                    step_dt = (sync_t0 - speed_window_t0) / max(1, window_steps)
+                    iter_per_sec = 1.0 / max(step_dt, 1e-12)
+                    sample_per_sec = (seen - speed_window_samples) / max(sync_t0 - speed_window_t0, 1e-12)
+                    epoch_elapsed = sync_t0 - epoch_step_t0
+                    epoch_iter_per_sec = batch_index / max(epoch_elapsed, 1e-12)
+                    epoch_sample_per_sec = seen / max(epoch_elapsed, 1e-12)
+                    train_steps_done = (epoch - start_epoch) * total_batches + batch_index
+                    eta_sec = max(0, total_train_steps - train_steps_done) / max(epoch_iter_per_sec, 1e-12)
+                    logger.info(
+                        "epoch=%d step=%d/%d global_step=%d %s step_time=%.2fs iter/s=%.3f sample/s=%.3f epoch_iter/s=%.3f epoch_sample/s=%.3f eta=%.1fs",
+                        epoch + 1, batch_index, total_batches, step,
+                        _progress_description("train", _mean_metrics(totals, seen), last_grad_norm).removeprefix(" => train | "),
+                        step_dt, iter_per_sec, sample_per_sec, epoch_iter_per_sec,
+                        epoch_sample_per_sec, eta_sec,
+                    )
+                    writer.add_scalar("speed/step_time_sec", step_dt, step)
+                    writer.add_scalar("speed/iter_per_sec", iter_per_sec, step)
+                    writer.add_scalar("speed/sample_per_sec", sample_per_sec, step)
+                    writer.add_scalar("speed/epoch_iter_per_sec", epoch_iter_per_sec, step)
+                    writer.add_scalar("speed/epoch_sample_per_sec", epoch_sample_per_sec, step)
+                    writer.add_scalar("speed/eta_sec", eta_sec, step)
+                    writer.add_scalar("train/grad_norm", last_grad_norm, step)
+                    speed_window_t0 = sync_t0
+                    speed_window_step = batch_index
+                    speed_window_samples = seen
+                if args.benchmark_steps and step >= args.benchmark_steps:
+                    break
+            train_stats = _mean_metrics(totals, seen)
+            train_time = time.perf_counter() - epoch_step_t0
+            checkpoint_due = _checkpoint_due(epoch + 1, args.checkpoint_freq)
+            valid_stats: Dict[str, float] | None = None
+            if checkpoint_due:
+                # Validation and plots use EMA weights so saved samples match inference.
+                valid_stats = _eval_epoch(graphdef, ema.params, datasets["valid"], args.bs, rng)
+                final_stats = valid_stats
+                _plot_joint(args, graphdef, ema.params, datasets["train"], step)
+            epoch_iter_per_sec = total_batches / max(train_time, 1e-12)
+            epoch_sample_per_sec = seen / max(train_time, 1e-12)
+            total_time = time.perf_counter() - epoch_t0
+            _write_epoch_summary(
+                writer, epoch=epoch + 1, step=step, train_stats=train_stats,
+                valid_stats=valid_stats, train_time=train_time, total_time=total_time,
+                iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
+                grad_norm=last_grad_norm,
+            )
+            _log_epoch_summary(
+                logger, epoch=epoch + 1, step=step, train_stats=train_stats,
+                valid_stats=valid_stats, train_time=train_time, total_time=total_time,
+                iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
+                grad_norm=last_grad_norm,
+            )
+            if checkpoint_due and valid_stats is not None and valid_stats["loss"] < best_loss:
+                best_loss = valid_stats["loss"]
+                _submit_best_checkpoint(
+                    artifact_writer, args, params, ema, opt_state,
+                    epoch + 1, step, best_loss,
+                )
+                logger.info("Model checkpoint enqueued: %s queue=%s", args.checkpoint_dir, artifact_writer.stats)
+            writer.flush()
+            if checkpoint_due and args.remote_save_dir:
+                metric_artifact_writer.submit(_sync_metric_artifacts, args)
+                logger.info(
+                    "metric_artifacts_enqueued epoch=%d step=%d queue=%s",
+                    epoch + 1, step, metric_artifact_writer.stats,
+                )
+            if args.benchmark_steps and step >= args.benchmark_steps:
+                break
+    finally:
+        try:
+            artifact_writer.close()
+        finally:
+            try:
+                metric_artifact_writer.close()
+            finally:
+                writer.close()
+    return final_stats
 
 
 def run(config: ExperimentConfig) -> str:

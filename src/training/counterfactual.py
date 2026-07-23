@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import random
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import jax
@@ -21,28 +23,24 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
-from tqdm import tqdm
 
 from config import CounterfactualTrainingConfig, ExperimentConfig
 from data.morphomnist import morphomnist
 from models.image_vae import HVAE
 from .counterfactual_support import (
-    batch_progress_kwargs,
     clip_counterfactual_grads,
     damped_lagrangian_loss,
-    epoch_progress_kwargs,
     format_checkpoint_summary,
     format_checkpoint_validation_summary,
     format_run_summary,
     inherit_image_training_config,
-    intervention_progress_kwargs,
-    format_torch_style_eval_progress,
     set_module_training_mode,
 )
 from causal.flow_scm import MorphoMNISTPGM
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
 from training.image_loop import init_state, preprocess_batch
 from utils import (
+    BackgroundArtifactWriter,
     EMA,
     SummaryWriter,
     checkpoint_is_complete,
@@ -51,10 +49,8 @@ from utils import (
     experiment_run_dir,
     load_checkpoint_with_path,
     open_file,
-    save_checkpoint,
     seed_all,
     sync_file,
-    sync_tree,
     tree_copy,
 )
 
@@ -662,16 +658,12 @@ def _eval_split(
     stats = {k: 0.0 for k in ["loss", "aux_loss", "elbo", "nll", "kl", "n"]}
     preds = {k: [] for k in ["thickness", "intensity", "digit"]}
     targets = {k: [] for k in ["thickness", "intensity", "digit"]}
-    total_batches = len(dataset) // args.bs if split == "train" else (len(dataset) + args.bs - 1) // args.bs
-    loader = tqdm(
-        _epoch_batches(dataset, args.bs, shuffle=(split == "train"), drop_last=(split == "train"), rng=rng),
-        total=total_batches,
-        **batch_progress_kwargs(split),
-    )
     grad_norm = 0.0
     predictor = predictor_bundle.materialize()
     predictor.eval()
-    for i, raw_batch in enumerate(loader):
+    for i, raw_batch in enumerate(
+        _epoch_batches(dataset, args.bs, shuffle=(split == "train"), drop_last=(split == "train"), rng=rng)
+    ):
         batch = preprocess_batch(args, raw_batch, compact_pa=True)
         do_k = _choose_intervention(args, dag_vars)
         do = _make_intervention(args, batch, do_k, train_samples, train=(split == "train"))
@@ -698,14 +690,6 @@ def _eval_split(
             for k in targets.keys():
                 t_k = do[k] if k in do else out["cfs"][k]
                 targets[k].append(np.asarray(t_k))
-        loader.set_description(
-            f"[{split}] lmbda: {float(state['lmbda']):.3f}, "
-            + ", ".join(
-                f"{k}: {v / max(1, stats['n']):.3f}" for k, v in stats.items() if k != "n"
-            )
-            + (f", grad_norm: {grad_norm:.3f}" if split == "train" else "")
-        )
-
     mean_stats = {k: v / stats["n"] for k, v in stats.items() if k != "n"}
     if split == "train":
         return mean_stats, None
@@ -779,15 +763,7 @@ def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
     model.eval()
     totals = {key: 0.0 for key in ("elbo", "nll", "kl")}
     count = 0
-    total_batches = (len(dataset) + args.bs - 1) // args.bs
-    loader = tqdm(
-        _full_model_validation_batches(args, dataset),
-        total=total_batches,
-        desc="=> eval",
-        leave=True,
-        mininterval=0.1,
-    )
-    for index, batch in enumerate(loader):
+    for index, batch in enumerate(_full_model_validation_batches(args, dataset)):
         x = batch["x"].astype(jnp.float32)
         parents = _expand_parents(batch["pa"].astype(jnp.float32), args.input_res)
         outputs = model(
@@ -801,16 +777,6 @@ def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
         for key in totals:
             totals[key] += float(outputs[key]) * size
         count += size
-        loader.set_description(
-            format_torch_style_eval_progress(
-                {
-                    "loss": totals["elbo"] / count,
-                    "nll": totals["nll"] / count,
-                    "kl": totals["kl"] / count,
-                },
-                ("nll", "kl"),
-            )
-        )
     means = _validated_means("VAE", args.resolved_vae_path, totals, count)
     print(
         format_checkpoint_validation_summary(
@@ -830,15 +796,7 @@ def _validate_pgm_checkpoint(args, bundle: Bundle, dataset) -> None:
         "logp(intensity)": 0.0,
     }
     count = 0
-    total_batches = (len(dataset) + args.bs - 1) // args.bs
-    loader = tqdm(
-        _full_model_validation_batches(args, dataset),
-        total=total_batches,
-        desc="=> eval",
-        leave=True,
-        mininterval=0.1,
-    )
-    for batch in loader:
+    for batch in _full_model_validation_batches(args, dataset):
         pa = batch["pa"]
         outputs = model.log_prob(pa[:, 0], pa[:, 1], pa[:, 2:])
         batch_means = {
@@ -851,12 +809,6 @@ def _validate_pgm_checkpoint(args, bundle: Bundle, dataset) -> None:
         for key, value in batch_means.items():
             totals[key] += value * size
         count += size
-        loader.set_description(
-            format_torch_style_eval_progress(
-                {key: totals[key] / count for key in totals},
-                ("logp(digit)", "logp(thickness)", "logp(intensity)"),
-            )
-        )
     means = _validated_means("PGM", args.resolved_pgm_path, totals, count)
     print(
         format_checkpoint_validation_summary(
@@ -878,15 +830,7 @@ def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
     count = 0
     preds = {k: [] for k in ["thickness", "intensity", "digit"]}
     targets = {k: [] for k in ["thickness", "intensity", "digit"]}
-    total_batches = (len(dataset) + args.bs - 1) // args.bs
-    loader = tqdm(
-        _full_model_validation_batches(args, dataset),
-        total=total_batches,
-        desc="=> eval",
-        leave=True,
-        mininterval=0.1,
-    )
-    for batch_index, batch in enumerate(loader):
+    for batch_index, batch in enumerate(_full_model_validation_batches(args, dataset)):
         pa = batch["pa"]
         outputs = model.model_anticausal(
             x=batch["x"],
@@ -918,20 +862,6 @@ def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
             preds[key].append(np.asarray(value))
         for key in targets.keys():
             targets[key].append(np.asarray(pa[:, 0:1] if key == "thickness" else pa[:, 1:2] if key == "intensity" else pa[:, 2:]))
-        running = {
-            key: totals[key] / count
-            for key in totals
-        }
-        loader.set_description(
-            format_torch_style_eval_progress(
-                running,
-                (
-                    "logp(thickness_aux)",
-                    "logp(intensity_aux)",
-                    "logp(digit_aux)",
-                ),
-            )
-        )
     _validated_means("predictor", args.resolved_predictor_path, totals, count)
     metrics = _predictor_metrics(
         args,
@@ -942,9 +872,8 @@ def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
     print("test | " + " - ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
 
 
-def _save_cf_checkpoint(args, state, epoch: int) -> str:
-    """Persist the fine-tuned VAE, optimizer state, multiplier, and provenance."""
-    payload = {
+def _cf_checkpoint_payload(args, state, epoch: int) -> Dict[str, Any]:
+    return {
         "epoch": epoch,
         "step": state["step"],
         "best_loss": state["best_loss"],
@@ -956,10 +885,124 @@ def _save_cf_checkpoint(args, state, epoch: int) -> str:
         "hparams": vars(args),
         "format_version": 1,
     }
-    save_checkpoint(payload, args.checkpoint_dir, step=state["step"], custom_metadata={"epoch": epoch, "best_loss": float(state["best_loss"])})
-    if getattr(args, "remote_save_dir", ""):
-        sync_tree(args.checkpoint_dir, os.path.join(args.remote_save_dir, "checkpoints"))
-    return args.checkpoint_dir
+
+
+def _submit_best_cf_checkpoint(artifact_writer: BackgroundArtifactWriter, args, state, epoch: int) -> None:
+    """Snapshot an improved counterfactual state for asynchronous persistence."""
+    payload = _cf_checkpoint_payload(args, state, epoch)
+    remote_checkpoint_dir = (
+        os.path.join(args.remote_save_dir, "checkpoints")
+        if getattr(args, "remote_save_dir", "")
+        else None
+    )
+    artifact_writer.submit_checkpoint(
+        payload,
+        args.checkpoint_dir,
+        step=state["step"],
+        custom_metadata={"epoch": epoch, "best_loss": float(state["best_loss"])},
+        local_tree_dir=args.checkpoint_dir if remote_checkpoint_dir else None,
+        remote_tree_dir=remote_checkpoint_dir,
+    )
+
+
+def _sync_tensorboard_artifacts(args) -> None:
+    if not getattr(args, "remote_save_dir", ""):
+        return
+    for event_path in sorted(Path(args.save_dir).glob("events.out.tfevents.*")):
+        sync_file(str(event_path), os.path.join(args.remote_save_dir, event_path.name))
+
+
+def _sync_metric_artifacts(args) -> None:
+    """Synchronize flushed counterfactual logs and TensorBoard events to GCS."""
+    if not getattr(args, "remote_save_dir", ""):
+        return
+    sync_file(
+        os.path.join(args.save_dir, "trainlog.txt"),
+        os.path.join(args.remote_save_dir, "trainlog.txt"),
+    )
+    _sync_tensorboard_artifacts(args)
+
+
+def _checkpoint_due(epoch: int, checkpoint_freq: int) -> bool:
+    return epoch % max(1, checkpoint_freq) == 0
+
+
+def _intervention_tag(variable: str | None) -> str:
+    return "observational" if variable is None else f"do_{variable}"
+
+
+def _write_epoch_summary(
+    writer: Any,
+    *,
+    epoch: int,
+    step: int,
+    train_stats: Dict[str, float],
+    lmbda: float,
+    diagnostics: Dict[str, float],
+    train_time: float,
+    total_time: float,
+    iter_per_sec: float,
+    sample_per_sec: float,
+    validation: Dict[str, tuple[Dict[str, float], Dict[str, float]]] | None = None,
+) -> None:
+    for key, value in train_stats.items():
+        writer.add_scalar(f"train/{key}", value, step)
+    writer.add_scalar("loss/train", train_stats["loss"], step)
+    writer.add_scalar("aux_loss/train", train_stats["aux_loss"], step)
+    writer.add_scalar("train/lmbda", lmbda, step)
+    for key, value in diagnostics.items():
+        writer.add_scalar(f"train/{key}", value, step)
+    writer.add_scalar("epoch/number", epoch, step)
+    writer.add_scalar("epoch/global_step", step, step)
+    writer.add_scalar("epoch/train_time_sec", train_time, step)
+    writer.add_scalar("epoch/total_time_sec", total_time, step)
+    writer.add_scalar("epoch/iter_per_sec", iter_per_sec, step)
+    writer.add_scalar("epoch/sample_per_sec", sample_per_sec, step)
+    if validation is None:
+        return
+    for intervention, (stats, metrics) in validation.items():
+        for key, value in stats.items():
+            writer.add_scalar(f"valid/{intervention}/{key}", value, step)
+        for key, value in metrics.items():
+            writer.add_scalar(f"valid/{intervention}/{key}", value, step)
+    observational_stats, observational_metrics = validation["observational"]
+    for key, value in observational_stats.items():
+        writer.add_scalar(f"valid/{key}", value, step)
+    for key, value in observational_metrics.items():
+        writer.add_scalar(f"valid/{key}", value, step)
+    writer.add_scalar("loss/valid", observational_stats["loss"], step)
+    writer.add_scalar("aux_loss/valid", observational_stats["aux_loss"], step)
+
+
+def _log_epoch_summary(
+    logger: logging.Logger,
+    *,
+    epoch: int,
+    step: int,
+    train_stats: Dict[str, float],
+    lmbda: float,
+    diagnostics: Dict[str, float],
+    train_time: float,
+    total_time: float,
+    iter_per_sec: float,
+    sample_per_sec: float,
+    validation: Dict[str, tuple[Dict[str, float], Dict[str, float]]] | None = None,
+) -> None:
+    train_description = " - ".join(f"{key}: {value:.4f}" for key, value in train_stats.items())
+    logger.info(
+        "=> train | %s - lmbda: %.4f - grad_norm: %.4f - steps: %d - it/s: %.3f - samples/s: %.3f",
+        train_description, lmbda, diagnostics.get("grad_norm", 0.0), step, iter_per_sec, sample_per_sec,
+    )
+    if validation is not None:
+        for intervention, (stats, metrics) in validation.items():
+            description = " - ".join(
+                f"{key}: {value:.4f}" for key, value in {**stats, **metrics}.items()
+            )
+            logger.info("=> valid %s | %s - steps: %d", intervention, description, step)
+    logger.info(
+        "epoch=%d train_time=%.1fs total_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
+        epoch, train_time, total_time, iter_per_sec, sample_per_sec,
+    )
 
 
 def main(args):
@@ -1072,8 +1115,8 @@ def main(args):
             "ema_rate",
             "alpha",
             "do_pa",
-            "eval_freq",
-            "plot_freq",
+            "speed_log_freq",
+            "checkpoint_freq",
             "cf_particles",
             "load_path",
             "pgm_path",
@@ -1114,24 +1157,26 @@ def main(args):
 
     benchmark_start_step = state["step"]
     benchmark_done = False
-    for epoch in tqdm(
-        range(state["epoch"], args.epochs),
-        **epoch_progress_kwargs(),
-    ):
+    artifact_writer = BackgroundArtifactWriter()
+    metric_artifact_writer = BackgroundArtifactWriter()
+    steps_per_epoch = max(1, len(datasets["train"]) // args.bs)
+    total_train_steps = steps_per_epoch * max(1, args.epochs - state["epoch"])
+    try:
+      for epoch in range(state["epoch"], args.epochs):
         logger.info("Epoch %d:", epoch + 1)
         totals: Dict[str, float] = {}
         seen = 0
-        last_valid_stats: Optional[Dict[str, float]] = None
-        last_valid_metrics: Optional[Dict[str, float]] = None
-        steps_in_epoch = max(1, len(datasets["train"]) // args.bs)
-        progress = tqdm(
-            _epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng),
-            total=steps_in_epoch,
-            **batch_progress_kwargs("train"),
-        )
+        diagnostics = {"grad_norm": 0.0, "grad_clipped": 0.0, "lr_scale": 1.0, "update_skipped": 0.0}
+        epoch_t0 = epoch_step_t0 = speed_window_t0 = time.perf_counter()
+        speed_window_step = 0
+        speed_window_samples = 0
 
-        for i, raw_batch in enumerate(progress):
+        for batch_index, raw_batch in enumerate(
+            _epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng), start=1
+        ):
+            fetch_t0 = time.perf_counter()
             batch = preprocess_batch(args, raw_batch, compact_pa=True)
+            batch_ready_t0 = time.perf_counter()
             # Randomly intervene on one permitted causal variable each step.
             do_k = _choose_intervention(args, dag_vars)
             do = _make_intervention(args, batch, do_k, train_samples, train=True)
@@ -1142,7 +1187,7 @@ def main(args):
                 state["lambda_opt_state"],
                 batch,
                 do,
-                jax.random.PRNGKey(args.seed + state["step"] + i + epoch * 1000),
+                jax.random.PRNGKey(args.seed + state["step"] + batch_index + epoch * 1000),
                 state["step"],
             )
             state["vae_params"] = vae_params
@@ -1160,53 +1205,62 @@ def main(args):
             totals["elbo"] = totals.get("elbo", 0.0) + float(out["elbo"]) * bs
             totals["nll"] = totals.get("nll", 0.0) + float(out["nll"]) * bs
             totals["kl"] = totals.get("kl", 0.0) + float(out["kl"]) * bs
-            progress.set_description(
-                f"[train] lmbda: {float(state['lmbda']):.3f}, "
-                + ", ".join(f"{k}: {v / max(1, seen):.3f}" for k, v in totals.items())
-                + (f", grad_norm: {float(out['grad_norm']):.3f}" if "grad_norm" in out else "")
-                + (
-                    f", grad_clipped: {int(float(out['grad_clipped']))}, "
-                    f"lr_scale: {float(out['lr_scale']):.3f}, "
-                    f"update_skipped: {int(float(out['update_skipped']))}"
-                    if "grad_clipped" in out
-                    else ""
+            diagnostics = {
+                "grad_norm": float(out.get("grad_norm", 0.0)),
+                "grad_clipped": float(out.get("grad_clipped", 0.0)),
+                "lr_scale": float(out.get("lr_scale", 1.0)),
+                "update_skipped": float(out.get("update_skipped", 0.0)),
+            }
+            if batch_index % max(1, args.speed_log_freq) == 0:
+                sync_t0 = time.perf_counter()
+                window_steps = batch_index - speed_window_step
+                step_dt = (sync_t0 - speed_window_t0) / max(1, window_steps)
+                data_dt = batch_ready_t0 - fetch_t0
+                compute_dt = max(0.0, step_dt - data_dt)
+                iter_per_sec = 1.0 / max(step_dt, 1e-12)
+                sample_per_sec = (seen - speed_window_samples) / max(sync_t0 - speed_window_t0, 1e-12)
+                epoch_elapsed = sync_t0 - epoch_step_t0
+                epoch_iter_per_sec = batch_index / max(epoch_elapsed, 1e-12)
+                epoch_sample_per_sec = seen / max(epoch_elapsed, 1e-12)
+                train_steps_done = (epoch - state["epoch"]) * steps_per_epoch + batch_index
+                eta_sec = max(0, total_train_steps - train_steps_done) / max(epoch_iter_per_sec, 1e-12)
+                train_stats = {key: value / max(1, seen) for key, value in totals.items()}
+                logger.info(
+                    "epoch=%d step=%d/%d global_step=%d %s data_time=%.2fs compute_time=%.2fs step_time=%.2fs iter/s=%.3f sample/s=%.3f epoch_iter/s=%.3f epoch_sample/s=%.3f eta=%.1fs",
+                    epoch + 1, batch_index, steps_per_epoch, state["step"],
+                    " - ".join(f"{key}: {value:.4f}" for key, value in train_stats.items()),
+                    data_dt, compute_dt, step_dt, iter_per_sec, sample_per_sec,
+                    epoch_iter_per_sec, epoch_sample_per_sec, eta_sec,
                 )
-            )
+                writer.add_scalar("speed/data_time_sec", data_dt, state["step"])
+                writer.add_scalar("speed/compute_time_sec", compute_dt, state["step"])
+                writer.add_scalar("speed/step_time_sec", step_dt, state["step"])
+                writer.add_scalar("speed/iter_per_sec", iter_per_sec, state["step"])
+                writer.add_scalar("speed/sample_per_sec", sample_per_sec, state["step"])
+                writer.add_scalar("speed/epoch_iter_per_sec", epoch_iter_per_sec, state["step"])
+                writer.add_scalar("speed/epoch_sample_per_sec", epoch_sample_per_sec, state["step"])
+                writer.add_scalar("speed/eta_sec", eta_sec, state["step"])
+                for key, value in diagnostics.items():
+                    writer.add_scalar(f"train/{key}", value, state["step"])
+                writer.add_scalar("train/lmbda", float(state["lmbda"]), state["step"])
+                speed_window_t0 = sync_t0
+                speed_window_step = batch_index
+                speed_window_samples = seen
 
             if args.benchmark_steps > 0 and state["step"] - benchmark_start_step >= args.benchmark_steps:
                 benchmark_done = True
                 break
-
-            if i % max(1, args.plot_freq) == 0:
-                copy_do_pa = copy.deepcopy(args.do_pa)
-                for pa_k in tqdm(
-                    dag_vars + [None],
-                    **intervention_progress_kwargs(),
-                ):
-                    args.do_pa = pa_k
-                    valid_stats, valid_metrics = _eval_split(
-                        args,
-                        "valid",
-                        datasets,
-                        state,
-                        vae_bundle,
-                        pgm_bundle,
-                        predictor_bundle,
-                        eval_step,
-                        train_samples,
-                        rng,
-                    )
-                    last_valid_stats, last_valid_metrics = valid_stats, valid_metrics
-                args.do_pa = copy_do_pa
 
         if benchmark_done:
             logger.info("Benchmark completed after %d training step(s).", args.benchmark_steps)
             break
 
         train_stats = {k: v / max(1, seen) for k, v in totals.items()}
-        loginfo("train", logger, train_stats)
-
-        if epoch % max(1, args.eval_freq) == 0:
+        train_time = time.perf_counter() - epoch_step_t0
+        checkpoint_due = _checkpoint_due(epoch + 1, args.checkpoint_freq)
+        validation: Dict[str, tuple[Dict[str, float], Dict[str, float]]] | None = None
+        if checkpoint_due:
+            validation = {}
             copy_do_pa = copy.deepcopy(args.do_pa)
             for pa_k in dag_vars + [None]:
                 args.do_pa = pa_k
@@ -1222,37 +1276,43 @@ def main(args):
                     train_samples,
                     rng,
                 )
-                loginfo(f"valid do({pa_k})", logger, valid_stats)
-                loginfo(f"valid do({pa_k})", logger, valid_metrics)
-                last_valid_stats, last_valid_metrics = valid_stats, valid_metrics
+                validation[_intervention_tag(pa_k)] = (valid_stats, valid_metrics)
             args.do_pa = copy_do_pa
-
-            if last_valid_stats is not None:
-                for k, v in train_stats.items():
-                    writer.add_scalar("train/" + k, v, state["step"])
-                    writer.add_scalar("valid/" + k, last_valid_stats[k], state["step"])
-                for k, v in (last_valid_metrics or {}).items():
-                    writer.add_scalar("valid/" + k, v, state["step"])
-                writer.add_scalar("loss/train", train_stats["loss"], state["step"])
-                writer.add_scalar("loss/valid", last_valid_stats["loss"], state["step"])
-                writer.add_scalar("aux_loss/train", train_stats["aux_loss"], state["step"])
-                writer.add_scalar("aux_loss/valid", last_valid_stats["aux_loss"], state["step"])
-
-                if last_valid_stats["loss"] < state["best_loss"]:
-                    # Save only the best validated counterfactual image mechanism.
-                    state["best_loss"] = last_valid_stats["loss"]
-                    _save_cf_checkpoint(args, state, epoch + 1)
-                    logger.info("Model saved: %s", args.checkpoint_dir)
-
+        epoch_iter_per_sec = steps_per_epoch / max(train_time, 1e-12)
+        epoch_sample_per_sec = seen / max(train_time, 1e-12)
+        total_time = time.perf_counter() - epoch_t0
+        _write_epoch_summary(
+            writer, epoch=epoch + 1, step=state["step"], train_stats=train_stats,
+            lmbda=float(state["lmbda"]), diagnostics=diagnostics,
+            train_time=train_time, total_time=total_time,
+            iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
+            validation=validation,
+        )
+        _log_epoch_summary(
+            logger, epoch=epoch + 1, step=state["step"], train_stats=train_stats,
+            lmbda=float(state["lmbda"]), diagnostics=diagnostics,
+            train_time=train_time, total_time=total_time,
+            iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
+            validation=validation,
+        )
+        if checkpoint_due and validation is not None:
+            observational_stats, _ = validation["observational"]
+            if observational_stats["loss"] < state["best_loss"]:
+                state["best_loss"] = observational_stats["loss"]
+                _submit_best_cf_checkpoint(artifact_writer, args, state, epoch + 1)
+                logger.info("Model checkpoint enqueued: %s queue=%s", args.checkpoint_dir, artifact_writer.stats)
         writer.flush()
-        if getattr(args, "remote_save_dir", ""):
-            sync_file(
-                os.path.join(args.save_dir, "trainlog.txt"),
-                os.path.join(args.remote_save_dir, "trainlog.txt"),
-            )
-            sync_tree(args.checkpoint_dir, os.path.join(args.remote_save_dir, "checkpoints"))
-
-    writer.close()
+        if checkpoint_due and getattr(args, "remote_save_dir", ""):
+            metric_artifact_writer.submit(_sync_metric_artifacts, args)
+            logger.info("metric_artifacts_enqueued epoch=%d step=%d queue=%s", epoch + 1, state["step"], metric_artifact_writer.stats)
+    finally:
+      try:
+        artifact_writer.close()
+      finally:
+        try:
+          metric_artifact_writer.close()
+        finally:
+          writer.close()
 
 
 def run(config: ExperimentConfig) -> str:

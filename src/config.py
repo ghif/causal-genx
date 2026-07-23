@@ -70,7 +70,8 @@ class ScmTrainingConfig(BaseModel):
     scm_model: str = "morphomnist_scm"
     strict_artifact_contract: bool = True
     epochs: PositiveInt = 1000
-    eval_freq: PositiveInt = 1
+    speed_log_freq: PositiveInt = 50
+    checkpoint_freq: PositiveInt = 1
     plot_samples: PositiveInt = 10000
     widths: list[PositiveInt] = [32, 32]
     benchmark_steps: int = 0
@@ -121,8 +122,8 @@ class CounterfactualTrainingConfig(BaseModel):
     predictor_checkpoint: str
     image_model_checkpoint: str
     epochs: PositiveInt = 5000
-    eval_freq: PositiveInt = 1
-    plot_freq: PositiveInt = 500
+    speed_log_freq: PositiveInt = 50
+    checkpoint_freq: PositiveInt = 1
     alpha: float = 0.1
     lmbda_init: float = 0.0
     lr_lagrange: float = 1e-2

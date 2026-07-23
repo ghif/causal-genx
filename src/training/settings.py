@@ -136,7 +136,7 @@ def counterfactual_settings(config: ExperimentConfig) -> CounterfactualSettings:
         testing=workflow.testing, pgm_path=workflow.scm_checkpoint, predictor_path=workflow.predictor_checkpoint,
         vae_path=workflow.image_model_checkpoint, alpha=workflow.alpha, lmbda_init=workflow.lmbda_init,
         lr_lagrange=workflow.lr_lagrange, damping=workflow.damping, do_pa=workflow.do_pa,
-        plot_freq=workflow.plot_freq, cf_particles=workflow.cf_particles, elbo_constraint=workflow.elbo_constraint,
+        cf_particles=workflow.cf_particles, elbo_constraint=workflow.elbo_constraint,
         model_validation_batches=workflow.model_validation_batches,
         trust_incomplete_checkpoint=workflow.trust_incomplete_checkpoint)
 
@@ -155,8 +155,8 @@ def image_model_settings_for_counterfactual(config: ExperimentConfig) -> dict[st
         widths=list(config.model.widths), bottleneck=config.model.bottleneck, z_dim=config.model.z_dim,
         z_max_res=config.model.z_max_res, bias_max_res=config.model.bias_max_res, x_like=config.model.x_like,
         std_init=config.model.std_init, q_correction=config.model.q_correction, kl_free_bits=config.model.kl_free_bits,
-        vae="hierarchical" if config.model.name == "hierarchical_vae" else "simple", speed_log_freq=50,
-        viz_batch_size=config.optimizer.batch_size, eval_freq=workflow.eval_freq, checkpoint_freq=1, resume="",
+        vae="hierarchical" if config.model.name == "hierarchical_vae" else "simple", speed_log_freq=workflow.speed_log_freq,
+        viz_batch_size=config.optimizer.batch_size, eval_freq=workflow.checkpoint_freq, checkpoint_freq=workflow.checkpoint_freq, resume="",
         ema_rate=workflow.ema_rate, beta=1.0, beta_warmup_steps=0, grad_clip=350.0, grad_skip=500.0,
         accu_steps=1, checkpoint_smoke_test=False, checkpoint_smoke_steps=1, benchmark_steps=workflow.benchmark_steps,
         benchmark_warmup_steps=20, execution_mode="single_device", drop_remainder=False,

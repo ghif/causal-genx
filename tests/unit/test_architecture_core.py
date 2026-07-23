@@ -261,8 +261,61 @@ def test_native_scm_arguments_match_reference_profile():
     assert args.remote_ckpt_dir == "gs://medical-airnd/causal-gen/checkpoints"
     assert args.bs == 16
     assert args.epochs == 1000
+    assert args.speed_log_freq == 50
+    assert args.checkpoint_freq == 1
     assert args.widths == [32, 32]
     assert args.setup == "sup_pgm"  # retained checkpoint identity, not dispatch.
+
+
+def test_scm_checkpoint_frequency_is_typed_and_controls_checkpoint_schedule():
+    config = load_experiment(
+        "configs/morphomnist_scm.yaml",
+        ["workflow.speed_log_freq=7", "workflow.checkpoint_freq=3"],
+    )
+
+    args = scm._run_arguments(config)
+    assert args.speed_log_freq == 7
+    assert args.checkpoint_freq == 3
+    assert scm._checkpoint_due(3, args.checkpoint_freq)
+    assert not scm._checkpoint_due(2, args.checkpoint_freq)
+    with pytest.raises(ValueError, match="eval_freq"):
+        load_experiment("configs/morphomnist_scm.yaml", ["workflow.eval_freq=1"])
+
+
+def test_scm_epoch_summary_writes_complete_metrics_and_trainlog(caplog):
+    scalars = []
+
+    class RecordingWriter:
+        def add_scalar(self, tag, value, step):
+            scalars.append((tag, value, step))
+
+    train_stats = {"loss": 1.0, "logp(digit)": -0.1, "logp(thickness)": -0.2, "logp(intensity)": -0.3}
+    valid_stats = {key: value + 0.5 for key, value in train_stats.items()}
+    scm._write_epoch_summary(
+        RecordingWriter(), epoch=2, step=12, train_stats=train_stats,
+        valid_stats=valid_stats, train_time=3.0, total_time=5.0,
+        iter_per_sec=4.0, sample_per_sec=128.0, grad_norm=0.75,
+    )
+    logger = logging.getLogger("scm-epoch-summary-test")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        scm._log_epoch_summary(
+            logger, epoch=2, step=12, train_stats=train_stats,
+            valid_stats=valid_stats, train_time=3.0, total_time=5.0,
+            iter_per_sec=4.0, sample_per_sec=128.0, grad_norm=0.75,
+        )
+
+    scalar_tags = {tag for tag, _, _ in scalars}
+    assert {f"train/{key}" for key in train_stats} <= scalar_tags
+    assert {f"valid/{key}" for key in valid_stats} <= scalar_tags
+    assert {
+        "elbo/train", "elbo/valid", "epoch/number", "epoch/global_step",
+        "epoch/train_time_sec", "epoch/total_time_sec", "epoch/iter_per_sec",
+        "epoch/sample_per_sec", "epoch/grad_norm",
+    } <= scalar_tags
+    assert all(step == 12 for _, _, step in scalars)
+    assert "=> train |" in caplog.text
+    assert "=> valid |" in caplog.text
+    assert "train_time=3.0s total_time=5.0s" in caplog.text
 
 
 def test_native_predictor_arguments_match_artifact_profile():
@@ -286,8 +339,8 @@ def test_native_counterfactual_arguments_match_profile():
     assert args.bs == 32
     assert args.lr == 1e-4
     assert args.wd == 0.1
-    assert args.eval_freq == 1
-    assert args.plot_freq == 500
+    assert args.speed_log_freq == 50
+    assert args.checkpoint_freq == 1
     assert args.alpha == 0.1
     assert args.damping == 100.0
     assert args.do_pa is None
@@ -298,6 +351,47 @@ def test_native_counterfactual_arguments_match_profile():
     assert str(counterfactual.output_dir(config)).endswith(
         f"checkpoints/morphomnist/{config.artifacts.run_name}/cf"
     )
+    with pytest.raises(ValueError, match="eval_freq"):
+        load_experiment("configs/morphomnist_counterfactual.yaml", ["workflow.eval_freq=1"])
+    with pytest.raises(ValueError, match="plot_freq"):
+        load_experiment("configs/morphomnist_counterfactual.yaml", ["workflow.plot_freq=10"])
+
+
+def test_counterfactual_epoch_summary_records_train_and_intervention_metrics(caplog):
+    scalars = []
+
+    class RecordingWriter:
+        def add_scalar(self, tag, value, step):
+            scalars.append((tag, value, step))
+
+    train_stats = {"loss": 1.0, "aux_loss": 0.2, "elbo": 0.8, "nll": 0.6, "kl": 0.2}
+    valid_stats = {key: value + 0.1 for key, value in train_stats.items()}
+    validation = {
+        "do_digit": (valid_stats, {"thickness_mae": 0.3}),
+        "observational": (valid_stats, {"digit_acc": 0.9}),
+    }
+    diagnostics = {"grad_norm": 0.7, "grad_clipped": 0.0, "lr_scale": 1.0, "update_skipped": 0.0}
+    counterfactual._write_epoch_summary(
+        RecordingWriter(), epoch=2, step=12, train_stats=train_stats, lmbda=0.4,
+        diagnostics=diagnostics, train_time=3.0, total_time=5.0,
+        iter_per_sec=4.0, sample_per_sec=128.0, validation=validation,
+    )
+    logger = logging.getLogger("counterfactual-epoch-summary-test")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        counterfactual._log_epoch_summary(
+            logger, epoch=2, step=12, train_stats=train_stats, lmbda=0.4,
+            diagnostics=diagnostics, train_time=3.0, total_time=5.0,
+            iter_per_sec=4.0, sample_per_sec=128.0, validation=validation,
+        )
+
+    scalar_tags = {tag for tag, _, _ in scalars}
+    assert {f"train/{key}" for key in train_stats} <= scalar_tags
+    assert "valid/do_digit/thickness_mae" in scalar_tags
+    assert "valid/observational/digit_acc" in scalar_tags
+    assert {"epoch/global_step", "epoch/train_time_sec", "epoch/total_time_sec", "epoch/iter_per_sec", "epoch/sample_per_sec"} <= scalar_tags
+    assert all(step == 12 for _, _, step in scalars)
+    assert "=> train |" in caplog.text
+    assert "=> valid observational |" in caplog.text
 
 
 def test_counterfactual_stage_runs_native_implementation(monkeypatch):
