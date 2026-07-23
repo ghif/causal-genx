@@ -1,288 +1,163 @@
-## Causal Generative Modelling: Image Counterfactuals, JAX Port
-Forked from [ghif/causal-gen](https://github.com/ghif/causal-gen).
+# Causal-GenX
 
-### :hugs: Huggingface demos :hugs:
+Causal-GenX is a native JAX/Flax implementation of causal generative image
+modelling and counterfactual generation. It is a complete port of the original
+PyTorch/Pyro research code—not a fork that depends on the original runtime.
 
-- [Imaginable Imaging](https://huggingface.co/spaces/mira-causality/imaginable-imaging) (**NEW**✨)
-- [Counterfactuals](https://huggingface.co/spaces/mira-causality/counterfactuals)
+The current reference workflow is MorphoMNIST. It trains a causal SCM, an
+image-to-variable predictor, and a conditional VAE/HVAE before fine-tuning the
+image mechanism for counterfactual generation. JAX/Flax, Optax, Orbax, and
+TensorBoard are used throughout.
 
-This repository is the **pure JAX** port of the original Torch/Pyro codebase for the ICML 2023 paper:
+## Start here
 
->[**High Fidelity Image Counterfactuals with Probabilistic Causal Models**](https://arxiv.org/abs/2306.15764)\
->Fabio De Sousa Ribeiro<sup>1</sup>, Tian Xia<sup>1</sup>, Miguel Monteiro<sup>1</sup>, Nick Pawlowski<sup>2</sup>, Ben Glocker<sup>1</sup>\
-><sup>1</sup>Imperial College London, <sup>2</sup>Microsoft Research Cambridge, UK
-
-BibTeX:
-```bibtex
-@InProceedings{pmlr-v202-de-sousa-ribeiro23a,
-  title={High Fidelity Image Counterfactuals with Probabilistic Causal Models},
-  author={De Sousa Ribeiro, Fabio and Xia, Tian and Monteiro, Miguel and Pawlowski, Nick and Glocker, Ben},
-  booktitle={Proceedings of the 40th International Conference on Machine Learning},
-  pages={7390--7425},
-  year={2023},
-  volume={202},
-  series={Proceedings of Machine Learning Research},
-  month={23--29 Jul},
-  url={https://proceedings.mlr.press/v202/de-sousa-ribeiro23a.html}
-}
-```
-
-### Example Results
-
-The JAX port follows the same high-level goal as the Torch repository, but the MorphoMNIST workflow is best understood as a **four-stage causal pipeline**:
-
-1. learn the structured causal variables for the dataset
-2. train the auxiliary image-to-parent predictor
-3. train the image model conditioned on those variables
-4. combine all trained pieces to generate counterfactual images under interventions
-
-Current development focus is **MorphoMNIST on Mac CPU**, which is the primary acceptance path for the port and the clearest end-to-end example of that pipeline.
-
-### Project Structure
-
-```text
-📦causal-genx
- ┣ 📜README.md                        # this file
- ┣ 📜requirements.txt                # CPU-only JAX environment dependencies
- ┣ 📜requirements-gpu.txt             # NVIDIA GPU / A100 dependencies
- ┣ 📜requirements-tpu.txt             # Google Cloud TPU dependencies
- ┣ 📜jax-porting.md                  # migration and parity plan
- ┣ 📂scripts
- ┃ ┣ 📜run.py                        # sole public runner for training and inference
- ┃ ┗ 📜morphomnist_visualizer.py
- ┣ 📂configs                         # one complete YAML per training stage
- ┃ ┣ 📜morphomnist_scm.yaml
- ┃ ┣ 📜morphomnist_predictor.yaml
- ┃ ┣ 📜morphomnist_image_model.yaml
- ┃ ┣ 📜morphomnist_counterfactual.yaml
- ┃ ┗ 📜morphomnist_inference.yaml
- ┗ 📂src                             # reusable lower-level implementation
-   ┣ 📂data                          # MorphoMNIST provider and parent conditioning
-   ┣ 📂causal                        # SCM, predictor, and deep-SCM mechanisms
-   ┣ 📂models                        # VAE/HVAE image model
-   ┣ 📂training                      # SCM → predictor → image → CF stage modules
-   ┣ 📜artifacts.py                  # metadata and compatibility validation
-   ┣ 📜config.py                     # typed stage configuration
-   ┗ 📂training                      # five named workflow modules
-```
-
-### Overview
-
-The original repository used Pyro for the structured causal mechanisms and PyTorch for the image mechanism. This port replaces that stack with a **pure JAX** implementation, but it preserves the same causal workflow:
-
-1. Train the SCM for structured causal variables.
-2. Train the auxiliary image-to-parent predictor.
-3. Train the image model conditioned on the causal variables.
-4. Fine-tune the image model for counterfactual generation.
-
-In other words, the image model is only one stage in the pipeline. The full MorphoMNIST story is:
-
-- parent variables such as digit, thickness, and intensity are learned as causal mechanisms
-- the image `x` is then modeled conditional on those parents
-- counterfactual images are produced by keeping abducted latent factors fixed while intervening on the parents
-
-The current port is intentionally CPU-first and keeps the model and artifact layout close to the Torch version so it is easy to compare runs.
-
-### Requirements
-
-Create and activate a backend-specific JAX environment, then install the matching requirements file.
+Create a backend-appropriate environment and install dependencies:
 
 ```bash
 conda activate med-jax
-pip install -r requirements.txt
+pip install -r requirements.txt            # CPU
+# pip install -r requirements-gpu.txt      # NVIDIA GPU
+# pip install -r requirements-tpu.txt      # Google Cloud TPU
 ```
 
-For NVIDIA GPU / A100:
+Check a config before starting a job:
 
 ```bash
-pip install -r requirements-gpu.txt
-```
-
-For Google Cloud TPU:
-
-```bash
-pip install -r requirements-tpu.txt
-```
-
-The port expects:
-
-- `jax[cpu]`
-- `jax[cuda13]` for NVIDIA GPU
-- `jax[tpu]` for TPU
-- `flax`
-- `optax`
-- `orbax-checkpoint`
-- `tensorboard`
-- standard scientific Python packages such as `numpy`, `pandas`, `pillow`, `imageio`, and `matplotlib`
-
-### Data
-
-MorphoMNIST is the primary acceptance dataset for this JAX port.
-
-The default data location is the same GCS bucket used by the Torch repository:
-
-```text
-gs://medical-airnd/causal-gen/datasets/morphomnist
-```
-
-The training code reads MorphoMNIST directly from that bucket. If you want to point to a different dataset location, pass `--data_dir` explicitly.
-
-The structured-variable and counterfactual code paths are currently centered on MorphoMNIST. The broader UK Biobank and MIMIC-CXR functionality from the Torch repository is preserved as a porting target, but MorphoMNIST is the best-supported path right now.
-
-### Run
-
-The primary interface is the single experiment runner. Each file in `configs/`
-is a complete, standalone experiment definition; override a value with
-`section.key=value` when needed.
-
-```bash
-python scripts/run.py train-scm --config configs/morphomnist_scm.yaml
-python scripts/run.py train-predictor --config configs/morphomnist_predictor.yaml
-python scripts/run.py train-image-model --config configs/morphomnist_image_model.yaml
-python scripts/run.py finetune-counterfactual --config configs/morphomnist_counterfactual.yaml
-```
-
-For a single-VM TPU v6e-4 image-model run, install the TPU dependencies on
-the TPU VM and use the topology-specific config:
-
-```bash
-pip install -r requirements-tpu.txt
 python scripts/run.py train-image-model \
-  --config configs/morphomnist_image_model_tpu_v6e4.yaml
+  --config configs/morphomnist_image_model.yaml --dry-run
 ```
 
-The runner performs a hardware preflight before importing the training stage.
-The v6e-4 profile requires backend `tpu`, four local/global devices, one JAX
-process, BF16 inputs, and replicated data-parallel training with a global batch
-of 512 (128 samples per chip). It fails instead of silently falling back to CPU.
-Use an explicit override such as `artifacts.run_name=my_v6e4_run`; do not reuse a
-completed run name.
+All researcher-facing operations use one entrypoint, `scripts/run.py`. Configs
+are standalone YAML files; append `section.key=value` to override a setting.
 
-Use `--dry-run` to validate a config without accessing data or starting a job.
-`scripts/run.py` is the only supported entrypoint.
+## Research workflow
 
-For MorphoMNIST, the recommended training order is:
-
-1. train the parent SCM
-2. train the auxiliary predictor
-3. train the image mechanism
-4. run counterfactual composition / evaluation
-
-The scripts below match that order.
-
-#### 1. Train the parent SCM
-
-Run the structured-variable model first:
+Run the stages in this order for a new MorphoMNIST experiment:
 
 ```bash
-python scripts/run.py train-scm --config configs/morphomnist_scm.yaml
-```
+python scripts/run.py train-scm \
+  --config configs/morphomnist_scm.yaml
 
-This learns the causal variables for MorphoMNIST, namely digit, thickness, and intensity.
+python scripts/run.py train-predictor \
+  --config configs/morphomnist_predictor.yaml
 
-#### 2. Train the auxiliary predictor
+python scripts/run.py train-image-model \
+  --config configs/morphomnist_image_model.yaml
 
-This is a separate image-to-parent prediction job. It does not train or update the SCM.
-
-```bash
-python scripts/run.py train-predictor --config configs/morphomnist_predictor.yaml
-```
-
-#### 3. Train the image mechanism
-
-```bash
-python scripts/run.py train-image-model --config configs/morphomnist_image_model.yaml
-```
-
-Use YAML overrides for run-specific values, for example
-`artifacts.run_name=my_experiment runtime.accelerator=cpu`.
-
-#### 4. Run counterfactual composition
-
-After the SCM, predictor, and image-mechanism checkpoints exist, run:
-
-```bash
 python scripts/run.py finetune-counterfactual \
-  --config configs/morphomnist_counterfactual.yaml \
-  artifacts.run_name=morphomnist_cf
+  --config configs/morphomnist_counterfactual.yaml
+
+python scripts/run.py infer \
+  --config configs/morphomnist_inference.yaml
 ```
 
-Set `workflow.scm_checkpoint`, `workflow.predictor_checkpoint`, and
-`workflow.image_model_checkpoint` in the standalone config to the three
-upstream checkpoint roots. The stage writes its `cf/` artifact layout,
-checkpoint payload, logs, TensorBoard events, and GCS synchronization.
-
-Relative checkpoint paths are resolved locally first, then below
-`artifacts.remote_root`; use an explicit `gs://...` path to require GCS. Set
-`workflow.trust_incomplete_checkpoint: true` only for a known historical mirror
-whose Orbax payload is present but lacks `commit_success.txt`; the run records
-that recovery choice in its logs and checkpoint hparams.
-
-#### 5. Run inference
-
-```bash
-python scripts/run.py infer --config configs/morphomnist_inference.yaml
-```
-
-The reference config reads
+The counterfactual config names its three upstream artifacts explicitly:
+`workflow.scm_checkpoint`, `workflow.predictor_checkpoint`, and
+`workflow.image_model_checkpoint`. The inference reference config loads the
+verified GCS HVAE run at
 `gs://medical-airnd/causal-gen/checkpoints/morphomnist/hvae_jax-cpu_22-07-2026`.
 
-### Current Defaults
+MorphoMNIST defaults to
+`gs://medical-airnd/causal-gen/datasets/morphomnist`. Override `dataset.root`
+to use a local or alternate GCS dataset location. GPU and TPU image-model
+profiles are available in `configs/morphomnist_image_model_gpu.yaml` and
+`configs/morphomnist_image_model_tpu_v6e4.yaml`; runtime preflight fails if the
+requested topology is unavailable.
 
-- MorphoMNIST is loaded from `gs://medical-airnd/causal-gen/datasets/morphomnist`
-- checkpoints default to `checkpoints/` from the repository root
-- `eval_freq` controls validation and visualization, while `checkpoint_freq` independently controls periodic training-state saves
-- CPU is the intended execution target
-
-### Notes
-
-- This port intentionally keeps the Torch repository as the behavioral reference.
-- MorphoMNIST is the main acceptance gate for output parity and smooth CPU execution.
-- The JAX code is structured to preserve the same causal workflow shape as the original repository: parent SCM first, image model second, counterfactual composition last.
-
-### Extending the Port
-
-If you want to add a new dataset or causal mechanism, the rough flow is:
-
-1. Add the dataset loader in `src/data/`.
-2. Add or extend the causal model in `src/causal/`.
-3. Define a complete standalone config in `configs/`.
-4. Run the required stages through `scripts/run.py`.
-
-### Checkpointing
-
-The JAX port now uses **Orbax checkpoint directories** for persistence. Each run writes its training state under a checkpoint root inside the experiment run folder:
+## Project structure
 
 ```text
-<checkpoint_root>/<dataset>/<run_name>/checkpoints/
+scripts/
+  run.py                         # only training/inference entrypoint
+  morphomnist_visualizer.py      # optional interactive inspection tool
+configs/
+  morphomnist_{scm,predictor,image_model,counterfactual,inference}.yaml
+src/
+  data/                          # MorphoMNIST loading and parent encoding
+  causal/                        # SCM, predictor, schema-driven DSCM
+  models/                        # VAE/HVAE implementations
+  training/                      # five stage modules and shared loops
+  config.py                      # typed YAML validation and overrides
+  runtime.py                     # JAX backend/device setup
+  utils.py                       # Orbax, logging, visualization, GCS helpers
+tests/
+  unit/ contract/ integration/   # configuration, boundary, and runner tests
+  test_*_parity.py               # numerical regression tests
 ```
 
-Resume paths are configured as `workflow.resume` or
-`workflow.resume_checkpoint`. Orbax keeps the latest step and metadata under
-that root; `.pt` and `.pkl` files are not supported.
+`src/` contains reusable code only. Do not add another CLI under `src/`; add a
+typed config and route a new public operation through `scripts/run.py`.
 
-### Resume Training
+## Configs and artifacts
 
-Set `workflow.resume` (image model) or `workflow.resume_checkpoint`
-(counterfactual) to a local or GCS Orbax checkpoint root. The loader selects
-the latest valid step.
+Every config specifies dataset, causal schema, model, optimizer, runtime,
+artifact location, seed, and workflow inputs. `--dry-run` validates that schema
+without reading data or importing a stage implementation.
 
-By default, local training also mirrors the full experiment run tree to GCS under:
+Runs are stored under:
 
 ```text
-gs://medical-airnd/causal-gen/checkpoints/<dataset>/<run_name>/
+checkpoints/<dataset>/<run-name>/
 ```
 
-That means the same Orbax checkpoint root is available locally and in the bucket after each save, and the checkpoint data stays under the run's `checkpoints/` subfolder in both places.
+Training artifacts include Orbax checkpoints, `hparams.json`, TensorBoard
+events, logs, and stage-specific PDFs or image previews. If `artifacts.remote_root`
+is configured, the run tree is mirrored to GCS. Existing JAX/Orbax artifacts
+are supported; `.pt` and `.pkl` checkpoints are intentionally unsupported.
 
-Visualization artifacts follow the same training-step convention and are written as:
+For historical GCS copies that contain a completed payload but no Orbax
+completion marker, set the workflow’s `trust_incomplete_checkpoint: true`.
+This is explicit in the reference counterfactual and inference configs.
 
-```text
-<save_dir>/viz-<training_step>.png
+## Benchmark summary: JAX versus PyTorch
+
+Recorded MorphoMNIST benchmarks show substantially higher throughput for the
+native JAX implementation than the earlier PyTorch/Pyro implementation.
+Throughput is reported as end-to-end or epoch-level `samples/s`, rather than
+raw asynchronous dispatch timing.
+
+| Platform | Workload and batch size | PyTorch | Native JAX | Observed ratio | Comparison context |
+|---|---|---:|---:|---:|---|
+| CPU | Parent PGM, batch size 16 | 3,563 samples/s | 25,685 samples/s | ~7.2x | Same MorphoMNIST hyperparameters |
+| CPU | HVAE image training, batch size 32 | 17.1 samples/s | 179.4 samples/s | ~10.5x | JAX late-stage steady state versus PyTorch full loop |
+| GPU | HVAE image training | 750.7 samples/s (A100, batch size 128) | 4,769.4 samples/s (G4, batch size 256) | ~6.4x | Throughput indication only; hardware and batch size differ |
+
+The PGM row is the closest controlled framework comparison. The remaining
+rows are useful operational signals, not bitwise-identical experiments. For a
+new comparison, match dataset split, batch size, precision, model and optimizer
+settings, checkpoint/logging cadence, and a post-compilation timing window;
+report samples/s alongside loss or ELBO rather than treating throughput alone
+as evidence of numerical equivalence.
+
+JAX also accelerates the TPU path: the captured MorphoMNIST HVAE runs reached
+about 382 samples/s on TPU v6e-1 at batch size 128 and about 7,418 samples/s
+on TPU v6e-4 at batch size 512 after warmup. These are JAX scaling results,
+not PyTorch speedups, because no matching PyTorch TPU measurement is available.
+
+## Development
+
+Run the suite from the repository root:
+
+```bash
+PYTHONPATH=src pytest -q
 ```
 
-For example, the end-of-epoch validation image for global step 400 is saved as `viz-400.png`.
+When changing a stage, run its parity tests and add a unit or integration test.
+Keep numerical changes isolated; checkpoint payload fields and run layouts are
+part of the research artifact contract.
 
-### License
+To add a dataset, implement its provider under `src/data/`, define its schema
+and parent encoding, add causal/image mechanisms under `src/causal/` or
+`src/models/`, provide a standalone config, and add a small contract fixture.
 
-See the original repository for licensing details.
+## Reference
+
+Causal-GenX ports the methods introduced in:
+
+> Fabio De Sousa Ribeiro, Tian Xia, Miguel Monteiro, Nick Pawlowski, and Ben
+> Glocker. *High Fidelity Image Counterfactuals with Probabilistic Causal
+> Models.* ICML 2023.
+
+- [Paper](https://arxiv.org/abs/2306.15764)
+- [Original PyTorch/Pyro code](https://github.com/biomedia-mira/causal-gen)
+- [Proceedings of Machine Learning Research](https://proceedings.mlr.press/v202/de-sousa-ribeiro23a.html)

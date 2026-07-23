@@ -22,7 +22,7 @@ runtime:
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: pgm_jax-cpu_22-07-2026
+  run_name: pgm_jax-cpu_23-07-2026
   remote_root: gs://medical-airnd/causal-gen/checkpoints
 workflow:
   type: train-scm
