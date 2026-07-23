@@ -124,6 +124,8 @@ class CounterfactualTrainingConfig(BaseModel):
     epochs: PositiveInt = 5000
     speed_log_freq: PositiveInt = 50
     checkpoint_freq: PositiveInt = 1
+    execution_mode: Literal["auto", "single_device", "replicated"] = "auto"
+    drop_remainder: bool = False
     alpha: float = 0.1
     lmbda_init: float = 0.0
     lr_lagrange: float = 1e-2

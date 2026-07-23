@@ -341,6 +341,8 @@ def test_native_counterfactual_arguments_match_profile():
     assert args.wd == 0.1
     assert args.speed_log_freq == 50
     assert args.checkpoint_freq == 1
+    assert args.execution_mode == "auto"
+    assert args.drop_remainder is False
     assert args.alpha == 0.1
     assert args.damping == 100.0
     assert args.do_pa is None

@@ -38,7 +38,7 @@ from .counterfactual_support import (
 )
 from causal.flow_scm import MorphoMNISTPGM
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
-from training.image_loop import init_state, preprocess_batch
+from training.image_loop import _first_local_replica, _replicate, _shard_batch, _unreplicate, init_state, preprocess_batch
 from utils import (
     BackgroundArtifactWriter,
     EMA,
@@ -166,6 +166,32 @@ class Bundle:
         return cls(aux_data, params, batch_stats)
 
 
+def _use_tpu_replication(args) -> bool:
+    """Resolve counterfactual execution mode for the local TPU topology."""
+    requested_mode = getattr(args, "execution_mode", "auto")
+    multi_tpu_available = args.accelerator == "tpu" and jax.local_device_count() > 1
+    if requested_mode == "replicated" and not multi_tpu_available:
+        raise ValueError("execution_mode=replicated requires accelerator=tpu with multiple local devices")
+    return multi_tpu_available and requested_mode != "single_device"
+
+
+def _portable_cf_state(state: Dict[str, Any], *, replicated: bool) -> Dict[str, Any]:
+    """Return ordinary trees for single-device evaluation and checkpointing."""
+    if not replicated:
+        return state
+    portable = dict(state)
+    for key in ("vae_params", "ema_params", "opt_state", "lmbda", "lambda_opt_state"):
+        portable[key] = _unreplicate(state[key])
+    portable["ema"] = EMA(
+        params=_unreplicate(state["ema"].params),
+        decay=state["ema"].decay,
+        update_after_step=state["ema"].update_after_step,
+        step=state["ema"].step,
+        initted=state["ema"].initted,
+    )
+    return portable
+
+
 def _restore_args(args, checkpoint):
     saved = checkpoint.get("hparams", {})
     preserved = {
@@ -181,6 +207,8 @@ def _restore_args(args, checkpoint):
         "vae_path": args.vae_path,
         "trust_incomplete_checkpoint": args.trust_incomplete_checkpoint,
         "model_validation_batches": args.model_validation_batches,
+        "execution_mode": args.execution_mode,
+        "drop_remainder": args.drop_remainder,
     }
     for name in ("vae", "pgm", "predictor", "resume"):
         for suffix in ("path", "trusted_incomplete"):
@@ -600,6 +628,89 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
         return vae_params, opt_state, lmbda, lambda_opt_state, out
 
     return jax.jit(step, donate_argnums=(0, 1, 2, 3))
+
+
+def _make_pmap_train_step(args, vae_graphdef, optimizer, lambda_optimizer, devices):
+    """Compile one synchronized local-TPU counterfactual update."""
+    scalar_keys = ("loss", "aux_loss", "elbo", "nll", "kl")
+
+    def step(
+        vae_params,
+        opt_state,
+        lmbda,
+        lambda_opt_state,
+        batch,
+        do,
+        rng,
+        pgm_bundle,
+        predictor_bundle,
+        global_step,
+    ):
+        def loss_fn(current_vae_params, current_lmbda):
+            local_vae = Bundle(vae_graphdef, _vae_compute_params(args, current_vae_params))
+            out = _cf_forward(
+                args,
+                local_vae,
+                pgm_bundle,
+                predictor_bundle,
+                batch,
+                do,
+                rng,
+                beta=args.beta,
+                alpha=args.alpha,
+                lmbda=current_lmbda,
+                cf_particles=args.cf_particles,
+                training=True,
+            )
+            return out["loss"], out
+
+        (loss, out), (vae_grads, lmbda_grads) = jax.value_and_grad(
+            loss_fn, argnums=(0, 1), has_aux=True
+        )(vae_params, lmbda)
+        vae_grads = jax.lax.pmean(vae_grads, axis_name="devices")
+        lmbda_grads = jax.lax.pmean(lmbda_grads, axis_name="devices")
+        clipped_vae_grads, clipped_lmbda_grads, grad_norm = clip_counterfactual_grads(
+            vae_grads, lmbda_grads, args.grad_clip
+        )
+        local_finite = jnp.isfinite(loss) & jnp.isfinite(grad_norm) & (grad_norm < args.grad_skip)
+        finite = jax.lax.pmin(local_finite.astype(jnp.int32), axis_name="devices").astype(jnp.bool_)
+        lr_scale = _cf_lr_scale(global_step, args.lr_warmup_steps)
+
+        def _apply_updates(values):
+            params, current_opt_state, lmbda_value, current_lambda_opt_state = values
+            updates, current_opt_state = optimizer.update(clipped_vae_grads, current_opt_state, params)
+            updates = jax.tree_util.tree_map(lambda update: update * lr_scale, updates)
+            params = optax.apply_updates(params, updates)
+            lambda_updates, current_lambda_opt_state = lambda_optimizer.update(
+                jax.tree_util.tree_map(lambda value: -value, clipped_lmbda_grads),
+                current_lambda_opt_state,
+                lmbda_value,
+            )
+            lmbda_value = jnp.clip(optax.apply_updates(lmbda_value, lambda_updates), min=0)
+            return params, current_opt_state, lmbda_value, current_lambda_opt_state
+
+        vae_params, opt_state, lmbda, lambda_opt_state = jax.lax.cond(
+            finite, _apply_updates, lambda values: values,
+            operand=(vae_params, opt_state, lmbda, lambda_opt_state),
+        )
+        metrics = {
+            key: jax.lax.pmean(out[key], axis_name="devices")
+            for key in scalar_keys
+        }
+        metrics.update(
+            grad_norm=jax.lax.pmean(grad_norm, axis_name="devices"),
+            grad_clipped=(grad_norm > args.grad_clip).astype(jnp.float32),
+            lr_scale=lr_scale,
+            update_skipped=jnp.logical_not(finite).astype(jnp.float32),
+        )
+        return vae_params, opt_state, lmbda, lambda_opt_state, metrics
+
+    return jax.pmap(
+        step,
+        axis_name="devices",
+        in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, None),
+        devices=devices,
+    )
 
 
 def _make_eval_step(args, vae_bundle, pgm_bundle, predictor_bundle):
@@ -1129,7 +1240,7 @@ def main(args):
     # JIT closures receive dynamic VAE state and a named intervention; their
     # captured bundles are frozen upstream mechanisms.
     eval_step = _make_eval_step(args, vae_bundle, pgm_bundle, predictor_bundle)
-    train_step = _make_train_step(
+    single_train_step = _make_train_step(
         args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, lambda_optimizer
     )
     dag_vars = list(MorphoMNISTPGM.variables.keys())
@@ -1155,11 +1266,45 @@ def main(args):
         writer.close()
         return
 
+    use_tpu_pmap = _use_tpu_replication(args)
+    devices = jax.local_devices() if use_tpu_pmap else []
+    device_count = len(devices) if use_tpu_pmap else 1
+    if use_tpu_pmap and args.bs % device_count:
+        raise ValueError(
+            f"Global batch size {args.bs} must be divisible by TPU local device count {device_count}."
+        )
+    drop_remainder = bool(getattr(args, "drop_remainder", False) or use_tpu_pmap)
+    if use_tpu_pmap:
+        logger.info(
+            "execution_mode=replicated local_device_count=%d global_batch_size=%d per_device_batch_size=%d",
+            device_count, args.bs, args.bs // device_count,
+        )
+        train_step = _make_pmap_train_step(args, vae_bundle.graphdef, optimizer, lambda_optimizer, devices)
+        for key in ("vae_params", "opt_state", "lmbda", "lambda_opt_state"):
+            state[key] = _replicate(state[key], devices)
+        state["ema"] = EMA(
+            params=_replicate(state["ema"].params, devices),
+            decay=state["ema"].decay,
+            update_after_step=state["ema"].update_after_step,
+            step=state["ema"].step,
+            initted=state["ema"].initted,
+        )
+        state["ema_params"] = _replicate(state["ema_params"], devices)
+        replicated_pgm_bundle = _replicate(pgm_bundle, devices)
+        replicated_predictor_bundle = _replicate(predictor_bundle, devices)
+    else:
+        logger.info(
+            "execution_mode=single_device accelerator=%s local_device_count=%d global_batch_size=%d",
+            args.accelerator, jax.local_device_count(), args.bs,
+        )
+        train_step = single_train_step
+        replicated_pgm_bundle = replicated_predictor_bundle = None
+
     benchmark_start_step = state["step"]
     benchmark_done = False
     artifact_writer = BackgroundArtifactWriter()
     metric_artifact_writer = BackgroundArtifactWriter()
-    steps_per_epoch = max(1, len(datasets["train"]) // args.bs)
+    steps_per_epoch = max(1, len(datasets["train"]) // args.bs) if drop_remainder else max(1, (len(datasets["train"]) + args.bs - 1) // args.bs)
     total_train_steps = steps_per_epoch * max(1, args.epochs - state["epoch"])
     try:
       for epoch in range(state["epoch"], args.epochs):
@@ -1172,24 +1317,30 @@ def main(args):
         speed_window_samples = 0
 
         for batch_index, raw_batch in enumerate(
-            _epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng), start=1
+            _epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=drop_remainder, rng=rng), start=1
         ):
             fetch_t0 = time.perf_counter()
             batch = preprocess_batch(args, raw_batch, compact_pa=True)
             batch_ready_t0 = time.perf_counter()
+            bs = int(batch["x"].shape[0])
             # Randomly intervene on one permitted causal variable each step.
             do_k = _choose_intervention(args, dag_vars)
             do = _make_intervention(args, batch, do_k, train_samples, train=True)
-            vae_params, opt_state, lmbda, lambda_opt_state, out = train_step(
-                state["vae_params"],
-                state["opt_state"],
-                state["lmbda"],
-                state["lambda_opt_state"],
-                batch,
-                do,
-                jax.random.PRNGKey(args.seed + state["step"] + batch_index + epoch * 1000),
-                state["step"],
-            )
+            step_rng = jax.random.PRNGKey(args.seed + state["step"] + batch_index + epoch * 1000)
+            if use_tpu_pmap:
+                batch = _shard_batch(batch, devices)
+                do = _shard_batch(do, devices)
+                vae_params, opt_state, lmbda, lambda_opt_state, out = train_step(
+                    state["vae_params"], state["opt_state"], state["lmbda"], state["lambda_opt_state"],
+                    batch, do, jax.random.split(step_rng, device_count), replicated_pgm_bundle,
+                    replicated_predictor_bundle, state["step"],
+                )
+                out = _unreplicate(out)
+            else:
+                vae_params, opt_state, lmbda, lambda_opt_state, out = train_step(
+                    state["vae_params"], state["opt_state"], state["lmbda"], state["lambda_opt_state"],
+                    batch, do, step_rng, state["step"],
+                )
             state["vae_params"] = vae_params
             state["opt_state"] = opt_state
             state["lmbda"] = lmbda
@@ -1197,7 +1348,6 @@ def main(args):
             if float(out["update_skipped"]) == 0.0:
                 state["ema"].update(state["vae_params"])
                 state["ema_params"] = tree_copy(state["ema"].params)
-            bs = int(batch["x"].shape[0])
             seen += bs
             state["step"] += 1
             totals["loss"] = totals.get("loss", 0.0) + float(out["loss"]) * bs
@@ -1260,6 +1410,7 @@ def main(args):
         checkpoint_due = _checkpoint_due(epoch + 1, args.checkpoint_freq)
         validation: Dict[str, tuple[Dict[str, float], Dict[str, float]]] | None = None
         if checkpoint_due:
+            eval_state = _portable_cf_state(state, replicated=use_tpu_pmap)
             validation = {}
             copy_do_pa = copy.deepcopy(args.do_pa)
             for pa_k in dag_vars + [None]:
@@ -1268,7 +1419,7 @@ def main(args):
                     args,
                     "valid",
                     datasets,
-                    state,
+                    eval_state,
                     vae_bundle,
                     pgm_bundle,
                     predictor_bundle,
@@ -1299,7 +1450,10 @@ def main(args):
             observational_stats, _ = validation["observational"]
             if observational_stats["loss"] < state["best_loss"]:
                 state["best_loss"] = observational_stats["loss"]
-                _submit_best_cf_checkpoint(artifact_writer, args, state, epoch + 1)
+                _submit_best_cf_checkpoint(
+                    artifact_writer, args,
+                    _portable_cf_state(state, replicated=use_tpu_pmap), epoch + 1,
+                )
                 logger.info("Model checkpoint enqueued: %s queue=%s", args.checkpoint_dir, artifact_writer.stats)
         writer.flush()
         if checkpoint_due and getattr(args, "remote_save_dir", ""):

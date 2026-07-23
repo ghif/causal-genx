@@ -159,6 +159,7 @@ def image_model_settings_for_counterfactual(config: ExperimentConfig) -> dict[st
         viz_batch_size=config.optimizer.batch_size, eval_freq=workflow.checkpoint_freq, checkpoint_freq=workflow.checkpoint_freq, resume="",
         ema_rate=workflow.ema_rate, beta=1.0, beta_warmup_steps=0, grad_clip=350.0, grad_skip=500.0,
         accu_steps=1, checkpoint_smoke_test=False, checkpoint_smoke_steps=1, benchmark_steps=workflow.benchmark_steps,
-        benchmark_warmup_steps=20, execution_mode="single_device", drop_remainder=False,
+        benchmark_warmup_steps=20, execution_mode=workflow.execution_mode,
+        drop_remainder=workflow.drop_remainder,
         context_norm=config.dataset.context_norm, dataset_id=config.dataset.name,
     )

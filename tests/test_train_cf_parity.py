@@ -172,6 +172,21 @@ def test_counterfactual_vae_learning_rate_warmup_uses_global_step():
     np.testing.assert_allclose(train_cf._cf_lr_scale(0, 0), 1.0)
 
 
+def test_counterfactual_execution_mode_selects_single_or_replicated_tpu(monkeypatch):
+    from training import counterfactual as train_cf
+
+    monkeypatch.setattr(jax, "local_device_count", lambda: 1)
+    assert not train_cf._use_tpu_replication(SimpleNamespace(accelerator="gpu", execution_mode="auto"))
+    assert not train_cf._use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="auto"))
+    with np.testing.assert_raises_regex(ValueError, "requires accelerator=tpu with multiple local devices"):
+        train_cf._use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="replicated"))
+
+    monkeypatch.setattr(jax, "local_device_count", lambda: 4)
+    assert train_cf._use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="auto"))
+    assert train_cf._use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="replicated"))
+    assert not train_cf._use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="single_device"))
+
+
 def test_counterfactual_ema_matches_pytorch_warmup_schedule():
     ema = EMA.init_from({"weight": jnp.asarray(0.0)}, decay=0.999, update_after_step=2)
 

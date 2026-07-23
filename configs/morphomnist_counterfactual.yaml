@@ -32,6 +32,8 @@ workflow:
   epochs: 500
   speed_log_freq: 50
   checkpoint_freq: 1
+  execution_mode: auto
+  drop_remainder: false
   alpha: 0.1
   lmbda_init: 0.0
   lr_lagrange: 0.01
