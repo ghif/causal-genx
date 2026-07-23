@@ -29,7 +29,7 @@ runtime:
   expected_process_count: 1
 artifacts:
   root: checkpoints
-  run_name: hvae_jax-tpu-v6e4
+  run_name: hvae_jax-tpu-v6e4-v2_23-07-2026
   remote_root: gs://medical-airnd/causal-gen/checkpoints
 workflow:
   type: train-image-model
