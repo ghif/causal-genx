@@ -18,8 +18,8 @@ optimizer:
   weight_decay: 0.1
   batch_size: 512
 runtime:
-  accelerator: cpu
-  precision: fp32
+  accelerator: tpu
+  precision: bf16
 artifacts:
   root: checkpoints
   run_name: cf_jax-tpu-v6e4_23-07-2026
