@@ -1,4 +1,9 @@
-"""Stage 3: native conditional VAE/HVAE image-model training."""
+"""Stage 3: train a conditional VAE/HVAE image mechanism.
+
+Images are modelled conditional on the encoded causal parents. This stage does
+not update the SCM or predictor; it creates the image-model artifact consumed
+by counterfactual fine-tuning and standalone inference.
+"""
 
 from __future__ import annotations
 
@@ -53,6 +58,7 @@ def _setup_logging(args: ImageModelSettings) -> logging.Logger:
 
 
 def _build_model(args: ImageModelSettings):
+    """Construct the configured VAE variant before its graph is split for JIT."""
     model_class = HVAE if args.vae == "hierarchical" else SimpleVAE
     return model_class(
         input_channels=args.input_channels,
@@ -88,6 +94,7 @@ def _resume_hparams(path: str) -> dict[str, Any]:
 
 
 def _run(args: ImageModelSettings) -> None:
+    """Execute image-model resume → dataset/model setup → generic training loop."""
     seed_all(args.seed, args.deterministic)
     has_resume_checkpoint = False
     if args.resume:
@@ -110,6 +117,7 @@ def _run(args: ImageModelSettings) -> None:
             if requested_lr < args.lr:
                 args.lr = requested_lr
             args.resume = resume_path
+    # A run owns its logs, previews, and Orbax checkpoint tree in one location.
     args.save_dir = experiment_run_dir(args.ckpt_dir, args.dataset_id, args.exp_name, "run")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
     args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.dataset_id, args.exp_name, "run")
@@ -134,6 +142,8 @@ def _run(args: ImageModelSettings) -> None:
     logger.info("model built")
     graphdef, _ = nnx.split(model, nnx.Param)
     logger.info("initialized model graph")
+    # Initialize optimizer state from one representative batch; training data is
+    # still streamed by ``image_loop.trainer`` below.
     sample = datasets["train"][0]
     sample = preprocess_batch(args, {key: value[None] for key, value in sample.items()}, expand_pa=True)
     rng = jax.random.PRNGKey(args.seed)

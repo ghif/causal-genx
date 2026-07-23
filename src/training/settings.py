@@ -1,4 +1,8 @@
-"""Typed runtime settings derived from standalone experiment configs."""
+"""Typed runtime settings derived from standalone experiment configs.
+
+Pydantic models validate user-facing YAML. These dataclasses are the mutable
+runtime view used by training loops for generated paths and resume metadata.
+"""
 
 from __future__ import annotations
 
@@ -70,6 +74,7 @@ class ImageModelSettings:
     remote_save_dir: str = ""
 
     def update_from_checkpoint(self, values: dict[str, Any], *, exclude: set[str] = frozenset()) -> None:
+        """Apply only known model settings from a resumed artifact's metadata."""
         allowed = {field.name for field in fields(self)} - set(exclude)
         for key, value in values.items():
             if key in allowed:

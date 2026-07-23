@@ -1,8 +1,14 @@
 """Stage 1: native MorphoMNIST structural causal model training.
 
-This module owns the SCM training loop used by ``scripts/run.py train-scm``.
-It deliberately retains the established checkpoint payload and run-directory
-contract, so existing analysis tools and checkpoints remain usable.
+This module owns ``scripts/run.py train-scm``. Its process is:
+
+1. load named causal variables from MorphoMNIST;
+2. fit the flow SCM by maximizing their joint log probability;
+3. evaluate the EMA parameters, plot the learned thickness/intensity joint,
+   and checkpoint only when validation improves.
+
+The checkpoint payload deliberately records both live and EMA parameters:
+the latter is the stable inference artifact consumed by counterfactual training.
 """
 
 from __future__ import annotations
@@ -44,7 +50,7 @@ from .common import stage_run_dir
 
 @dataclass
 class ScmRunArguments:
-    """Legacy-compatible run settings, constructed from the typed YAML config."""
+    """Runtime-only settings derived from the typed SCM YAML configuration."""
 
     accelerator: str
     gpu_id: str | None
@@ -189,6 +195,7 @@ def _loss(graphdef: Any, params: Any, batch: Dict[str, jax.Array]):
 
 
 def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation):
+    """Compile one parameter update; host logging and EMA updates stay outside JIT."""
     @jax.jit
     def train_step(params: Any, opt_state: Any, batch: Dict[str, jax.Array]):
         (loss, metrics), grads = jax.value_and_grad(_loss, argnums=1, has_aux=True)(graphdef, params, batch)
@@ -291,6 +298,7 @@ def _restore_args(args: ScmRunArguments, checkpoint: Dict[str, Any]) -> None:
 
 
 def _run(args: ScmRunArguments) -> Dict[str, float]:
+    """Execute load/resume → train → validate/plot → checkpoint for one SCM run."""
     _validate_scope(args)
     checkpoint: Optional[Dict[str, Any]] = None
     if args.load_path:
@@ -300,12 +308,14 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
     args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, "morphomnist", args.exp_name, "pgm")
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
+    # Build data and model only after resume metadata has restored model settings.
     logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets = morphomnist(args)
     model = MorphoMNISTPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
     graphdef, _ = nnx.split(model, nnx.Param); params = nnx.state(model, nnx.Param).to_pure_dict()
     optimizer = optax.chain(optax.clip_by_global_norm(200.0), optax.adamw(args.lr, b1=0.9, b2=0.999, eps=1e-8, weight_decay=args.wd))
     opt_state = optimizer.init(params); ema = PGMEMA.init_from(params); start_epoch = step = 0; best_loss = float("inf")
     if checkpoint is not None:
+        # Resume the trainable state while retaining the artifact's EMA state.
         _assert_compatible_checkpoint(checkpoint, params)
         params, opt_state = checkpoint["model_params"], checkpoint["opt_state"]
         ema = PGMEMA(params=checkpoint.get("ema_params", checkpoint["params"]), step=int(checkpoint.get("ema_step", checkpoint.get("step", 0))), initted=bool(checkpoint.get("ema_initted", True)))
@@ -332,12 +342,14 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
         if epoch % args.eval_freq != 0:
             if args.benchmark_steps and step >= args.benchmark_steps: break
             continue
+        # Validation and plots use EMA weights so saved samples match inference.
         valid_stats = _eval_epoch(graphdef, ema.params, datasets["valid"], args.bs, rng); final_stats = valid_stats
         logger.info("loss | train: %.4f - valid: %.4f - steps: %d", train_stats["loss"], valid_stats["loss"], step)
         for key in train_stats: writer.add_scalar(f"train/{key}", train_stats[key], step); writer.add_scalar(f"valid/{key}", valid_stats[key], step)
         writer.add_scalar("elbo/train", train_stats["loss"], step); writer.add_scalar("elbo/valid", valid_stats["loss"], step)
         _plot_joint(args, graphdef, ema.params, datasets["train"], step); _sync_pdf_artifacts(args)
         if valid_stats["loss"] < best_loss:
+            # A lower negative log likelihood defines the durable best artifact.
             best_loss = valid_stats["loss"]; save_checkpoint(_checkpoint_payload(args, params, ema, opt_state, epoch + 1, step, best_loss), args.checkpoint_dir, step=step, custom_metadata={"epoch": epoch + 1, "best_loss": best_loss})
             if args.remote_save_dir: sync_tree(args.checkpoint_dir, os.path.join(args.remote_save_dir, "checkpoints"))
             logger.info("Model saved: %s", args.checkpoint_dir)

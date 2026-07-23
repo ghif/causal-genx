@@ -21,6 +21,7 @@ REPOSITORY_ROOT = SOURCE_ROOT.parent
 
 
 def stage_run_dir(config: ExperimentConfig) -> Path:
+    """Return the shared local run root; stages add their own subdirectory if needed."""
     return REPOSITORY_ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name
 
 
@@ -95,7 +96,11 @@ def validate_stage_artifacts(
     *,
     remote_root: str = "",
 ) -> tuple[str, str, str]:
-    """Resolve and validate the three counterfactual input artifacts."""
+    """Resolve and validate the three frozen inputs required by Stage 4.
+
+    Validation happens before loading any model arrays, preventing an SCM,
+    predictor, or image-model artifact from being composed in the wrong role.
+    """
     scm_checkpoint = resolve_checkpoint_reference(scm_checkpoint, remote_root)
     predictor_checkpoint = resolve_checkpoint_reference(predictor_checkpoint, remote_root)
     image_model_checkpoint = resolve_checkpoint_reference(image_model_checkpoint, remote_root)

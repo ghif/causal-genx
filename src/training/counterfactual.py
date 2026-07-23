@@ -1,3 +1,11 @@
+"""Stage 4: counterfactual image-model fine-tuning.
+
+This stage freezes three upstream artifacts: the SCM supplies intervened parent
+variables, the predictor supplies an auxiliary image-consistency likelihood,
+and the pretrained VAE supplies the initial image mechanism. Only VAE weights
+and the Lagrange multiplier are optimized here.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -265,6 +273,7 @@ def _make_intervention(
     *,
     train: bool,
 ) -> Dict[str, jax.Array]:
+    """Create one named intervention, shuffled for training and sampled for evaluation."""
     if train:
         parent = _batch_parent(args, batch, do_k)
         permutation = np.random.permutation(parent.shape[0])
@@ -279,6 +288,7 @@ def _make_intervention(
 
 
 def _load_vae_bundle(args):
+    """Restore the frozen pretrained image mechanism and its checkpoint metadata."""
     vae_hparams = _load_checkpoint_hparams(args.vae_path)
     inherit_image_training_config(args, vae_hparams)
     model_args = {
@@ -326,6 +336,7 @@ def _load_vae_bundle(args):
 
 
 def _load_pgm_bundle(args):
+    """Restore only the SCM EMA inference leaves onto the active device."""
     rngs = nnx.Rngs(args.seed)
     pgm_hparams = _load_checkpoint_hparams(args.pgm_path)
     pgm = MorphoMNISTPGM(widths=pgm_hparams.get("widths", [32, 32]), rngs=rngs)
@@ -351,6 +362,7 @@ def _load_pgm_bundle(args):
 
 
 def _load_predictor_bundle(args):
+    """Restore predictor EMA parameters plus BatchNorm statistics for evaluation mode."""
     rngs = nnx.Rngs(args.seed)
     predictor_hparams = _load_checkpoint_hparams(args.predictor_path)
     predictor = MorphoMNISTSupAuxPredictor(
@@ -513,6 +525,7 @@ def _cf_forward(
 
 
 def _make_losses(args, vae_bundle, pgm_bundle, predictor_bundle):
+    """Build the constrained objective from frozen SCM/predictor and trainable VAE state."""
     def loss_fn(vae_params, lmbda, batch, do, rng):
         local_vae = Bundle(vae_bundle.graphdef, _vae_compute_params(args, vae_params))
         out = _cf_forward(
@@ -535,6 +548,7 @@ def _make_losses(args, vae_bundle, pgm_bundle, predictor_bundle):
 
 
 def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, lambda_optimizer):
+    """Compile one joint VAE/Lagrange update while keeping SCM and predictor frozen."""
     loss_fn = _make_losses(args, vae_bundle, pgm_bundle, predictor_bundle)
 
     def step(
@@ -593,6 +607,7 @@ def _make_train_step(args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, 
 
 
 def _make_eval_step(args, vae_bundle, pgm_bundle, predictor_bundle):
+    """Compile the same counterfactual objective without applying updates."""
     def step(vae_params, lmbda, batch, do, rng):
         local_vae = Bundle(vae_bundle.graphdef, _vae_compute_params(args, vae_params))
         out = _cf_forward(
@@ -928,6 +943,7 @@ def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
 
 
 def _save_cf_checkpoint(args, state, epoch: int) -> str:
+    """Persist the fine-tuned VAE, optimizer state, multiplier, and provenance."""
     payload = {
         "epoch": epoch,
         "step": state["step"],
@@ -947,6 +963,7 @@ def _save_cf_checkpoint(args, state, epoch: int) -> str:
 
 
 def main(args):
+    """Run artifact validation, frozen-model preflight, and counterfactual fine-tuning."""
     _validate_runtime_device(args)
     _configure_compute_policy(args)
     seed_all(args.seed, args.deterministic)
@@ -958,6 +975,8 @@ def main(args):
     if not hasattr(args, "elbo_constraint") or args.elbo_constraint is None:
         args.elbo_constraint = 1.841216802597046
 
+    # Load and validate each upstream component independently. This fails early
+    # if a checkpoint has the wrong architecture, schema, or device topology.
     vae_ckpt, vae_bundle = _load_vae_bundle(args)
     datasets = morphomnist(args)
     _print_dataset_normalization(datasets)
@@ -976,7 +995,8 @@ def main(args):
     ):
         raise ValueError("VAE checkpoint parameter structure is incompatible with HVAE")
 
-    # Build a fresh model state from the loaded VAE weights.
+    # Start optimization from the pretrained VAE; SCM and predictor remain in
+    # immutable Bundles captured by the compiled train/eval functions.
     state = {
         "vae_params": vae_ckpt.get("ema_params", vae_ckpt.get("params")),
         "opt_state": None,
@@ -1063,6 +1083,8 @@ def main(args):
     )
     log_checkpoint_summary(logger, args)
 
+    # JIT closures receive dynamic VAE state and a named intervention; their
+    # captured bundles are frozen upstream mechanisms.
     eval_step = _make_eval_step(args, vae_bundle, pgm_bundle, predictor_bundle)
     train_step = _make_train_step(
         args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, lambda_optimizer
@@ -1110,6 +1132,7 @@ def main(args):
 
         for i, raw_batch in enumerate(progress):
             batch = preprocess_batch(args, raw_batch, compact_pa=True)
+            # Randomly intervene on one permitted causal variable each step.
             do_k = _choose_intervention(args, dag_vars)
             do = _make_intervention(args, batch, do_k, train_samples, train=True)
             vae_params, opt_state, lmbda, lambda_opt_state, out = train_step(
@@ -1216,6 +1239,7 @@ def main(args):
                 writer.add_scalar("aux_loss/valid", last_valid_stats["aux_loss"], state["step"])
 
                 if last_valid_stats["loss"] < state["best_loss"]:
+                    # Save only the best validated counterfactual image mechanism.
                     state["best_loss"] = last_valid_stats["loss"]
                     _save_cf_checkpoint(args, state, epoch + 1)
                     logger.info("Model saved: %s", args.checkpoint_dir)

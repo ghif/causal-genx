@@ -1,4 +1,8 @@
-"""Numerical and presentation helpers shared by counterfactual fine-tuning."""
+"""Small, pure helpers shared by the counterfactual train and evaluation paths.
+
+Keeping the constrained loss and global gradient clipping here makes the JIT
+step readable and ensures the same numerical rule is tested independently.
+"""
 
 from __future__ import annotations
 
@@ -43,9 +47,11 @@ def format_torch_style_eval_progress(stats: Dict[str, float], metric_keys: tuple
 
 
 def damped_lagrangian_loss(aux_loss, lmbda, constraint, damping):
+    """Apply the detached damping term used to enforce the ELBO constraint."""
     return aux_loss - (lmbda - damping * jax.lax.stop_gradient(constraint)) * constraint
 
 
 def clip_counterfactual_grads(vae_grads, lmbda_grads, max_norm):
+    """Scale both optimizers with one global norm so their updates stay coupled."""
     grad_norm = optax.global_norm((vae_grads, lmbda_grads)); scale = jnp.minimum(1.0, max_norm / (grad_norm + 1e-6))
     return jax.tree_util.tree_map(lambda x: x * scale, vae_grads), jax.tree_util.tree_map(lambda x: x * scale, lmbda_grads), grad_norm

@@ -1,4 +1,9 @@
-"""Stage 2: native image-to-causal-variable predictor training."""
+"""Stage 2: train the image-to-causal-variable predictor.
+
+The predictor is trained independently from the SCM. It maps an observed image
+to thickness, intensity, and digit distributions, then supplies the auxiliary
+counterfactual constraint used by Stage 4.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ from .common import epoch_batches, stage_run_dir
 
 @dataclass
 class PredictorRunArguments:
-    """Legacy-compatible predictor settings constructed from the typed config."""
+    """Runtime-only predictor settings constructed from the typed config."""
 
     accelerator: str
     gpu_id: str | None
@@ -208,6 +213,7 @@ def _loss_and_state(graphdef: Any, params: Any, batch_stats: Any, batch: Dict[st
 
 
 def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation):
+    """Compile one predictor update, including BatchNorm state evolution."""
     @jax.jit
     def train_step(params, batch_stats, opt_state, batch):
         def loss_fn(current_params):
@@ -294,12 +300,14 @@ def _setup_logging(args: PredictorRunArguments) -> logging.Logger:
 
 
 def _run(args: PredictorRunArguments) -> Dict[str, float]:
+    """Execute predictor resume → supervised training → EMA validation → save."""
     checkpoint: Optional[Dict[str, Any]] = load_checkpoint(args.load_path) if args.load_path else None
     if checkpoint is not None: _restore_args(args, checkpoint)
     _validate_scope(args); _validate_runtime_device(args); dtype = _compute_dtype(args); _configure_dataset_args(args); seed_all(args.seed, args.deterministic)
     args.save_dir = experiment_run_dir(args.ckpt_dir, "morphomnist", args.exp_name, "pgm")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir); args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, "morphomnist", args.exp_name, "pgm")
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
+    # The labelled subset is deterministic, making partial-supervision runs reproducible.
     logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets, train_dataset = _build_datasets(args); valid_dataset = datasets["valid"]
     model = MorphoMNISTSupAuxPredictor(input_channels=args.input_channels, input_res=args.input_res, width=8, std_fixed=args.std_fixed, compute_dtype=dtype, rngs=nnx.Rngs(args.seed))
     graphdef, params_state, batch_stats_state = nnx.split(model, nnx.Param, nnx.BatchStat); model_params, model_batch_stats = params_state.to_pure_dict(), batch_stats_state.to_pure_dict()
@@ -326,6 +334,7 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
             seen += size; step += 1
             progress.set_description(_progress_description("train", {key: value / max(1, seen) for key, value in totals.items()}, float(grad_norm)))
+        # Evaluate with EMA parameters and EMA BatchNorm statistics, not the live model.
         train_stats = {key: value / max(1, seen) for key, value in totals.items()}; valid_stats = _eval_epoch(graphdef, ema.params, ema.batch_stats, valid_dataset, args.bs, rng); final_stats = valid_stats
         logger.info("loss | train: %.4f - valid: %.4f - steps: %d", train_stats["loss"], valid_stats["loss"], step)
         for key in train_stats: writer.add_scalar(f"train/{key}", train_stats[key], step); writer.add_scalar(f"valid/{key}", valid_stats[key], step)

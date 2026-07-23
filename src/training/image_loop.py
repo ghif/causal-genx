@@ -1,3 +1,10 @@
+"""Shared optimization loop for the conditional VAE/HVAE image mechanism.
+
+The loop owns batching, compiled updates, EMA maintenance, evaluation,
+visualization, and Orbax persistence. ``image_model.py`` intentionally owns
+only stage setup so the numerical training process stays in one place.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -16,6 +23,7 @@ from utils import BackgroundArtifactWriter, EMA, append_text_file, batch_iterato
 
 
 def preprocess_batch(args, batch, expand_pa: bool = False, compact_pa: bool = False):
+    """Normalize images and convert parent vectors to the model's NHWC contract."""
     x = np.asarray(batch["x"], dtype=np.float32)
     if x.max() > 1.5:
         x = (x - 127.5) / 127.5
@@ -120,6 +128,7 @@ def make_optimizer(args):
 
 
 def init_state(model, args, sample_batch, rng):
+    """Create live parameters, optimizer state, and separate EMA inference weights."""
     params = nnx.state(model, nnx.Param).to_pure_dict()
     tx = make_optimizer(args)
     return TrainState(params=params, opt_state=tx.init(params), ema=EMA.init_from(params, args.ema_rate)), tx
@@ -324,6 +333,12 @@ def _write_best_artifacts(
 
 
 def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
+    """Run epochs and emit only artifacts tied to a completed validation interval.
+
+    ``state.params`` is optimized every step. ``state.ema.params`` tracks it
+    after warm-up and is the only parameter tree used for validation, previews,
+    and saved best checkpoints.
+    """
     ensure_dir(args.save_dir)
     requested_mode = getattr(args, "execution_mode", "auto")
     multi_tpu_available = args.accelerator == "tpu" and jax.local_device_count() > 1

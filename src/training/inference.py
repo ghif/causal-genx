@@ -1,4 +1,9 @@
-"""Native inference for saved image-model Orbax artifacts."""
+"""Stage 5: native inference for saved image-model Orbax artifacts.
+
+Inference is intentionally read-only with respect to the source checkpoint:
+it restores the EMA image-model parameters, reconstructs one provided (or zero)
+image under named parents, and writes a preview plus JSON summary to a new run.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +39,7 @@ def output_dir(config: ExperimentConfig) -> str:
 
 
 def _checkpoint_root(reference: str) -> str:
+    """Accept an experiment root, a checkpoint root, or an explicit Orbax step."""
     reference = reference.rstrip("/")
     if reference.rsplit("/", 1)[-1].isdigit() or reference.endswith("/checkpoints"):
         return reference
@@ -77,6 +83,7 @@ def _input_image(path: str, input_res: int, channels: int) -> jax.Array:
 
 
 def _parents(values: dict[str, Any], context_dim: int) -> jax.Array:
+    """Encode named MorphoMNIST values in the schema's stable parent order."""
     encoded = []
     for variable in MORPHOMNIST_SCHEMA.variables:
         value = values.get(variable.name, 0)
@@ -91,6 +98,7 @@ def _parents(values: dict[str, Any], context_dim: int) -> jax.Array:
 
 
 def run(config: ExperimentConfig) -> str:
+    """Restore EMA weights, run one forward/reconstruction pass, and save outputs."""
     workflow = config.workflow
     assert isinstance(workflow, InferenceConfig)
     seed_all(config.seed, deterministic=True)
@@ -98,6 +106,8 @@ def run(config: ExperimentConfig) -> str:
     model = _model_from_metadata(metadata, config.seed)
     graphdef, params_state = nnx.split(model, nnx.Param)
     template = {"ema_params": params_state.to_pure_dict()}
+    # A narrow template restores only EMA weights and maps arrays to the active
+    # runtime, allowing a CPU process to inspect GPU- or TPU-authored artifacts.
     checkpoint, resolved = load_checkpoint_with_path(
         checkpoint_root, template=template,
         fallback_sharding=jax.sharding.SingleDeviceSharding(jax.devices()[0]),
@@ -109,6 +119,7 @@ def run(config: ExperimentConfig) -> str:
     model = nnx.merge(graphdef, nnx.State(weights)); model.eval()
     x = _input_image(workflow.image_path, metadata["input_res"], metadata["input_channels"])
     parents = _parents(workflow.parents, metadata["context_dim"])
+    # ELBO diagnostics use the supplied image; the decoder mean is the preview.
     output = model(x, parents, beta=workflow.beta, rng=jax.random.PRNGKey(config.seed), training=False)
     reconstruction, _ = model.likelihood.sample(
         model.decoder(parents=parents, rng=jax.random.PRNGKey(config.seed), training=False)[0], return_loc=True
