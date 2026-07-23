@@ -12,7 +12,7 @@ import numpy as np
 import optax
 from flax import nnx
 
-from utils import BackgroundArtifactWriter, EMA, append_text_file, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, sync_tree, write_images
+from utils import BackgroundArtifactWriter, EMA, append_text_file, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, sync_file, sync_tree, write_images
 
 
 def preprocess_batch(args, batch, expand_pa: bool = False, compact_pa: bool = False):
@@ -284,10 +284,43 @@ def save_state(
     save_checkpoint(ckpt, path, step=state.step, custom_metadata=metadata)
     remote_run_dir = getattr(args, "remote_save_dir", "")
     if remote_run_dir:
-        from utils import sync_tree
-
-        sync_tree(args.checkpoint_dir, os.path.join(remote_run_dir, "checkpoints"))
+        remote_checkpoint_dir = os.path.join(remote_run_dir, "checkpoints")
+        sync_tree(
+            os.path.join(args.checkpoint_dir, str(state.step)),
+            os.path.join(remote_checkpoint_dir, str(state.step)),
+        )
+        hparams_path = os.path.join(args.checkpoint_dir, "hparams.json")
+        if os.path.exists(hparams_path):
+            sync_file(hparams_path, os.path.join(remote_checkpoint_dir, "hparams.json"))
     return path
+
+
+def _write_best_artifacts(
+    args,
+    graphdef,
+    state: TrainState,
+    epoch: int,
+    viz_batch,
+    trainlog: str,
+) -> None:
+    """Persist one coherent best-model artifact bundle in worker order."""
+    save_state(args, state, None, epoch, wait=True)
+    write_images(
+        args,
+        graphdef,
+        state.ema.params,
+        viz_batch,
+        jax.random.PRNGKey(args.seed + epoch),
+        step=state.step,
+    )
+    remote_trainlog = (
+        os.path.join(args.remote_save_dir, "trainlog.txt")
+        if getattr(args, "remote_save_dir", "")
+        else None
+    )
+    append_text_file(
+        os.path.join(args.save_dir, "trainlog.txt"), trainlog, remote_path=remote_trainlog
+    )
 
 
 def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
@@ -533,14 +566,11 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
             train_stats_sum = {k: float(_block_until_ready(v)) for k, v in train_stats_sum.items()}
             train_time = time.perf_counter() - epoch_step_t0
 
-            # Evaluation follows the legacy zero-based gate (after epochs
-            # 1, 1+eval_freq, ...). Checkpoint frequency counts completed
-            # epochs (after checkpoint_freq, 2*checkpoint_freq, ...).
-            # Evaluation/visualization and persistence are independent: a
-            # checkpoint due epoch must not trigger an extra validation pass.
-            eval_due = epoch % max(1, args.eval_freq) == 0
+            # A completed checkpoint interval is the only durable-artifact
+            # trigger.  Validation, checkpointing, visualization and the
+            # persistent train log therefore describe the same best model.
             checkpoint_due = (epoch + 1) % max(1, args.checkpoint_freq) == 0
-            validation_due = eval_due
+            validation_due = checkpoint_due
             valid_nelbo = valid_nll = valid_kl = float("nan")
             valid_viz_batch = None
             if validation_due:
@@ -551,10 +581,9 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 valid_viz_batch = next(
                     _iter_eval_batches(datasets["valid"], args.viz_batch_size)
                 )
-            if eval_due and valid_nelbo < state.best_loss:
+            best_checkpoint_due = validation_due and valid_nelbo < state.best_loss
+            if best_checkpoint_due:
                 state.best_loss = valid_nelbo
-            if checkpoint_due:
-                save_state(args, state, tx, epoch + 1, artifact_writer=artifact_writer)
             if hasattr(writer, "add_scalar"):
                 writer.add_scalar("nelbo/train", train_stats_sum["elbo"] / max(1, steps_per_epoch), epoch + 1)
                 writer.add_scalar("nll/train", train_stats_sum["nll"] / max(1, steps_per_epoch), epoch + 1)
@@ -580,17 +609,9 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                 state.step,
                 epoch_iter_per_sec,
                 epoch_sample_per_sec,
-                extra={"eval_log": eval_due},
+                extra={"eval_log": validation_due},
             )
-            if eval_due:
-                viz_path = write_images(
-                    args,
-                    graphdef,
-                    _portable_state(state).ema.params,
-                    valid_viz_batch,
-                    jax.random.PRNGKey(args.seed + epoch),
-                    step=state.step,
-                )
+            if validation_due:
                 logger.info(
                     "=> valid | nelbo: %.4f - nll: %.4f - kl: %.4f - steps: %d",
                     valid_nelbo,
@@ -599,18 +620,31 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     state.step,
                     extra={"eval_log": True},
                 )
-                trainlog_lines = [
-                    f"viz_image={viz_path}",
-                    f"epoch={epoch + 1} train nelbo={train_stats_sum['elbo'] / max(1, steps_per_epoch):.4f} nll={train_stats_sum['nll'] / max(1, steps_per_epoch):.4f} kl={train_stats_sum['kl'] / max(1, steps_per_epoch):.4f} steps={state.step} it_s={epoch_iter_per_sec:.3f} sample_s={epoch_sample_per_sec:.3f}",
-                    f"epoch={epoch + 1} valid nelbo={valid_nelbo:.4f} nll={valid_nll:.4f} kl={valid_kl:.4f} steps={state.step}",
-                    f"epoch={epoch + 1} train_time={train_time:.1f}s total_time={epoch_time:.1f}s epoch_iter_s={epoch_iter_per_sec:.3f} epoch_sample_s={epoch_sample_per_sec:.3f}",
-                ]
-                remote_trainlog = os.path.join(args.remote_save_dir, "trainlog.txt") if getattr(args, "remote_save_dir", "") else None
-                append_text_file(
-                    os.path.join(args.save_dir, "trainlog.txt"),
-                    "\n".join(trainlog_lines) + "\n",
-                    remote_path=remote_trainlog,
-                )
+                if best_checkpoint_due:
+                    trainlog_lines = [
+                        f"best_checkpoint_step={state.step}",
+                        f"viz_image={os.path.join(args.save_dir, f'viz-{state.step}.png')}",
+                        f"epoch={epoch + 1} train nelbo={train_stats_sum['elbo'] / max(1, steps_per_epoch):.4f} nll={train_stats_sum['nll'] / max(1, steps_per_epoch):.4f} kl={train_stats_sum['kl'] / max(1, steps_per_epoch):.4f} steps={state.step} it_s={epoch_iter_per_sec:.3f} sample_s={epoch_sample_per_sec:.3f}",
+                        f"epoch={epoch + 1} valid nelbo={valid_nelbo:.4f} nll={valid_nll:.4f} kl={valid_kl:.4f} steps={state.step}",
+                        f"epoch={epoch + 1} train_time={train_time:.1f}s total_time={epoch_time:.1f}s epoch_iter_s={epoch_iter_per_sec:.3f} epoch_sample_s={epoch_sample_per_sec:.3f}",
+                    ]
+                    artifact_state = _portable_state(state)
+                    artifact_writer.submit(
+                        _write_best_artifacts,
+                        args,
+                        graphdef,
+                        artifact_state,
+                        epoch + 1,
+                        valid_viz_batch,
+                        "\n".join(trainlog_lines) + "\n",
+                    )
+                    logger.info(
+                        "best_artifact_enqueued epoch=%d step=%d queue=%s",
+                        epoch + 1,
+                        state.step,
+                        artifact_writer.stats,
+                        extra={"eval_log": True},
+                    )
                 logger.info(
                     "epoch=%d train_time=%.1fs total_time=%.1fs epoch_iter/s=%.3f epoch_sample/s=%.3f",
                     epoch + 1,

@@ -29,7 +29,8 @@ workflow:
   epochs: 5000
   speed_log_freq: 50
   viz_batch_size: 32
-  eval_freq: 5
+  # This is the single artifact cadence: validate, then asynchronously save
+  # checkpoint, visualization, and train log only for a new best ELBO.
   checkpoint_freq: 1
   benchmark_steps: 0
   benchmark_warmup_steps: 20

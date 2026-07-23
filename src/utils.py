@@ -7,6 +7,7 @@ import os
 import random
 import shutil
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
@@ -211,7 +212,10 @@ def _checkpoint_manager(root_dir: str, *, create: bool) -> ocp.CheckpointManager
         max_to_keep=3,
         create=create,
         save_interval_steps=1,
-        enable_async_checkpointing=False,
+        # The artifact worker owns completion, so Orbax may overlap its array
+        # serialization with host-side artifact preparation without affecting
+        # the training thread.
+        enable_async_checkpointing=True,
     )
     return ocp.CheckpointManager(root_dir, options=options)
 
@@ -434,14 +438,60 @@ def _save_checkpoint_and_sync(
 ) -> None:
     save_checkpoint(data, path, step=step, custom_metadata=custom_metadata)
     if local_tree_dir and remote_tree_dir:
-        sync_tree(local_tree_dir, remote_tree_dir)
+        # A full-tree mirror reuploads every retained Orbax step on each save.
+        # The checkpoint just written and its run-level hparams are sufficient.
+        save_step = int(step if step is not None else data.get("step", 0))
+        sync_tree(
+            os.path.join(local_tree_dir, str(save_step)),
+            os.path.join(remote_tree_dir, str(save_step)),
+        )
+        hparams_path = os.path.join(local_tree_dir, "hparams.json")
+        if os.path.exists(hparams_path):
+            sync_file(hparams_path, os.path.join(remote_tree_dir, "hparams.json"))
 
 
 class BackgroundArtifactWriter:
-    """Serialize artifact saves on the caller thread."""
+    """Bounded, ordered artifact worker that never blocks the training loop.
+
+    One job may run while one newer job is retained.  Submitting another job
+    replaces that pending job, which keeps slow storage from building an
+    unbounded backlog of stale checkpoints and visualizations.
+    """
 
     def __init__(self):
         self._closed = False
+        self._condition = threading.Condition()
+        self._running = False
+        self._pending = None
+        self._error: BaseException | None = None
+        self._submitted = 0
+        self._coalesced = 0
+        self._worker = threading.Thread(
+            target=self._run, name="causal-gen-artifacts", daemon=True
+        )
+        self._worker.start()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while self._pending is None and not self._closed:
+                    self._condition.wait()
+                if self._pending is None and self._closed:
+                    self._condition.notify_all()
+                    return
+                fn, args, kwargs = self._pending
+                self._pending = None
+                self._running = True
+            try:
+                fn(*args, **kwargs)
+            except BaseException as exc:  # surfaced by flush/close on the host
+                with self._condition:
+                    if self._error is None:
+                        self._error = exc
+            finally:
+                with self._condition:
+                    self._running = False
+                    self._condition.notify_all()
 
     def _submit_job(
         self,
@@ -449,9 +499,27 @@ class BackgroundArtifactWriter:
         *args,
         **kwargs,
     ):
-        if self._closed:
-            raise RuntimeError("BackgroundArtifactWriter is closed.")
-        return fn(*args, **kwargs)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("BackgroundArtifactWriter is closed.")
+            if self._pending is not None:
+                self._coalesced += 1
+            self._pending = (fn, args, kwargs)
+            self._submitted += 1
+            self._condition.notify()
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        with self._condition:
+            return {
+                "submitted": self._submitted,
+                "coalesced": self._coalesced,
+                "running": int(self._running),
+                "pending": int(self._pending is not None),
+            }
+
+    def submit(self, fn, *args, **kwargs) -> None:
+        self._submit_job(fn, *args, **kwargs)
 
     def submit_checkpoint(
         self,
@@ -488,12 +556,27 @@ class BackgroundArtifactWriter:
         return viz_path
 
     def flush(self):
-        return None
+        with self._condition:
+            while self._pending is not None or self._running:
+                self._condition.wait()
+            if self._error is not None:
+                raise RuntimeError("Background artifact writer failed.") from self._error
 
     def close(self):
         if self._closed:
             return
-        self._closed = True
+        error = None
+        try:
+            self.flush()
+        except BaseException as exc:
+            error = exc
+        finally:
+            with self._condition:
+                self._closed = True
+                self._condition.notify_all()
+            self._worker.join()
+        if error is not None:
+            raise error
 
 
 AsyncCheckpointWriter = BackgroundArtifactWriter
