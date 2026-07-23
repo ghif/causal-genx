@@ -231,6 +231,21 @@ def test_sup_aux_device_preflight_requires_one_gpu_and_accepts_tpu(monkeypatch):
     assert _validate_sup_aux_runtime_device(SimpleNamespace(accelerator="tpu")) is tpu
 
 
+def test_sup_aux_execution_mode_selects_single_or_replicated_tpu(monkeypatch):
+    from training.predictor import _use_tpu_replication
+
+    monkeypatch.setattr(jax, "local_device_count", lambda: 1)
+    assert not _use_tpu_replication(SimpleNamespace(accelerator="gpu", execution_mode="auto"))
+    assert not _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="auto"))
+    with np.testing.assert_raises_regex(ValueError, "requires accelerator=tpu with multiple local devices"):
+        _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="replicated"))
+
+    monkeypatch.setattr(jax, "local_device_count", lambda: 4)
+    assert _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="auto"))
+    assert _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="replicated"))
+    assert not _use_tpu_replication(SimpleNamespace(accelerator="tpu", execution_mode="single_device"))
+
+
 def test_sup_aux_ema_and_checkpoint_round_trip(tmp_path):
     ema = _WarmupEMA.init_from({"value": jnp.array(0.0)}, {"mean": jnp.array(0.0)})
     for index in range(101):

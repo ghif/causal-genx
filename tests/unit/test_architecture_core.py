@@ -1,5 +1,8 @@
+import logging
+
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
 from artifacts import ArtifactMetadata, assert_compatible
 from data.conditioning import ParentEncoder
@@ -79,6 +82,135 @@ def test_image_model_config_forwards_typed_training_settings():
     assert args.beta_warmup_steps == 12
 
 
+def test_predictor_checkpoint_frequency_is_typed_and_forwarded():
+    config = load_experiment(
+        "configs/morphomnist_predictor.yaml", ["workflow.checkpoint_freq=3"]
+    )
+
+    assert config.workflow.checkpoint_freq == 3
+    assert predictor._run_arguments(config).checkpoint_freq == 3
+
+
+def test_predictor_runtime_execution_settings_are_typed_and_forwarded():
+    config = load_experiment(
+        "configs/morphomnist_predictor.yaml",
+        ["workflow.execution_mode=replicated", "workflow.drop_remainder=false"],
+    )
+
+    args = predictor._run_arguments(config)
+    assert args.execution_mode == "replicated"
+    assert args.drop_remainder is False
+
+
+def test_predictor_checkpoint_frequency_defaults_to_every_epoch():
+    config = load_experiment("configs/morphomnist_predictor.yaml")
+
+    assert config.workflow.checkpoint_freq == 1
+    assert predictor._checkpoint_due(1, config.workflow.checkpoint_freq)
+    assert predictor._checkpoint_due(3, 3)
+    assert not predictor._checkpoint_due(2, 3)
+
+
+def test_predictor_epoch_summary_writes_tensorboard_metrics_and_trainlog(caplog):
+    scalars = []
+
+    class RecordingWriter:
+        def add_scalar(self, tag, value, step):
+            scalars.append((tag, value, step))
+
+    train_stats = {
+        "loss": 1.0,
+        "logp(digit_aux)": -0.1,
+        "logp(thickness_aux)": -0.2,
+        "logp(intensity_aux)": -0.3,
+    }
+    valid_stats = {key: value + 0.5 for key, value in train_stats.items()}
+    prediction_stats = {"thickness_mae": 0.4, "intensity_mae": 0.5, "digit_acc": 0.6}
+
+    predictor._write_epoch_summary(
+        RecordingWriter(), epoch=2, step=12, train_stats=train_stats,
+        valid_stats=valid_stats, prediction_stats=prediction_stats,
+        train_time=3.0, total_time=5.0, iter_per_sec=4.0, sample_per_sec=128.0,
+    )
+    logger = logging.getLogger("predictor-epoch-summary-test")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        predictor._log_epoch_summary(
+            logger, epoch=2, step=12, train_stats=train_stats,
+            valid_stats=valid_stats, prediction_stats=prediction_stats,
+            train_time=3.0, total_time=5.0, iter_per_sec=4.0, sample_per_sec=128.0,
+        )
+
+    scalar_tags = {tag for tag, _, _ in scalars}
+    assert {f"train/{key}" for key in train_stats} <= scalar_tags
+    assert {f"valid/{key}" for key in valid_stats | prediction_stats} <= scalar_tags
+    assert {
+        "elbo/train", "elbo/valid", "epoch/number", "epoch/global_step",
+        "epoch/train_time_sec", "epoch/total_time_sec", "epoch/iter_per_sec",
+        "epoch/sample_per_sec",
+    } <= scalar_tags
+    assert all(step == 12 for _, _, step in scalars)
+    assert "=> train |" in caplog.text
+    assert "=> valid |" in caplog.text
+    assert "train_time=3.0s total_time=5.0s" in caplog.text
+
+
+def test_predictor_tensorboard_events_are_synced_to_remote_run_dir(tmp_path, monkeypatch):
+    save_dir = tmp_path / "run"
+    save_dir.mkdir()
+    (save_dir / "events.out.tfevents.1").write_bytes(b"event-one")
+    (save_dir / "events.out.tfevents.2").write_bytes(b"event-two")
+    (save_dir / "trainlog.txt").write_text("not an event", encoding="utf-8")
+    copied = []
+
+    def fake_sync_file(local_path, remote_path):
+        copied.append((local_path, remote_path))
+
+    monkeypatch.setattr("training.predictor.sync_file", fake_sync_file)
+    predictor._sync_tensorboard_artifacts(
+        SimpleNamespace(save_dir=str(save_dir), remote_save_dir="gs://bucket/morphomnist/predictor")
+    )
+
+    assert copied == [
+        (str(save_dir / "events.out.tfevents.1"), "gs://bucket/morphomnist/predictor/events.out.tfevents.1"),
+        (str(save_dir / "events.out.tfevents.2"), "gs://bucket/morphomnist/predictor/events.out.tfevents.2"),
+    ]
+
+
+def test_predictor_best_checkpoint_is_submitted_to_artifact_writer(tmp_path):
+    submitted = []
+
+    class RecordingWriter:
+        def submit_checkpoint(self, *args, **kwargs):
+            submitted.append((args, kwargs))
+
+    args = SimpleNamespace(
+        checkpoint_dir=str(tmp_path / "checkpoints"),
+        remote_save_dir="gs://bucket/morphomnist/predictor",
+        setup="sup_aux",
+    )
+    ema = predictor.WarmupEMA(params={"ema": np.array([1.0])}, batch_stats={"bn": np.array([2.0])})
+
+    predictor._submit_best_checkpoint(
+        RecordingWriter(),
+        args,
+        {"model": np.array([3.0])},
+        {"bn": np.array([4.0])},
+        ema,
+        {"optimizer": np.array([5.0])},
+        epoch=3,
+        step=12,
+        best_loss=0.25,
+    )
+
+    assert len(submitted) == 1
+    call_args, call_kwargs = submitted[0]
+    assert call_args[1] == args.checkpoint_dir
+    assert call_kwargs["step"] == 12
+    assert call_kwargs["local_tree_dir"] == args.checkpoint_dir
+    assert call_kwargs["remote_tree_dir"] == "gs://bucket/morphomnist/predictor/checkpoints"
+    assert call_args[0]["best_loss"] == 0.25
+
+
 def test_default_image_model_yaml_matches_hvae_profile():
     args = image_model._run_arguments(
         load_experiment("configs/morphomnist_image_model.yaml")
@@ -140,6 +272,7 @@ def test_native_predictor_arguments_match_artifact_profile():
     assert args.remote_ckpt_dir == "gs://medical-airnd/causal-gen/checkpoints"
     assert args.bs == 32
     assert args.epochs == 1000
+    assert args.speed_log_freq == 50
     assert args.setup == "sup_aux"
 
 

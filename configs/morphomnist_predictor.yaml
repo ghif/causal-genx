@@ -22,9 +22,14 @@ runtime:
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: predictor_jax-cpu_22-07-2026
+  run_name: predictor_jax-cpu-v2_23-07-2026
   remote_root: gs://medical-airnd/causal-gen/checkpoints
 workflow:
   type: train-predictor
   predictor_model: morphomnist_image_parent_predictor
   epochs: 1000
+  speed_log_freq: 50
+  execution_mode: auto
+  drop_remainder: true
+  # Checkpoints remain best-validation-loss only, evaluated every N completed epochs.
+  checkpoint_freq: 1

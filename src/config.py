@@ -81,6 +81,10 @@ class PredictorTrainingConfig(BaseModel):
     type: Literal["train-predictor"]
     predictor_model: str = "morphomnist_image_parent_predictor"
     epochs: PositiveInt = 1000
+    speed_log_freq: PositiveInt = 50
+    checkpoint_freq: PositiveInt = 1
+    execution_mode: Literal["auto", "single_device", "replicated"] = "auto"
+    drop_remainder: bool = True
 
 
 class ImageModelTrainingConfig(BaseModel):
