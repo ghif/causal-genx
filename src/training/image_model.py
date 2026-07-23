@@ -2,21 +2,18 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
 import jax
 from flax import nnx
 
-from config import ExperimentConfig, ImageModelTrainingConfig
-from data.morphomnist import MORPHOMNIST_SCHEMA, morphomnist
-from hps import HPARAMS_REGISTRY, Hparams, add_arguments
+from config import ExperimentConfig
+from data.morphomnist import morphomnist
 from models.image_vae import HVAE, SimpleVAE
 from utils import (
     SummaryWriter,
@@ -30,82 +27,20 @@ from utils import (
     write_images,
 )
 
-from .common import legacy_run_dir
+from .common import stage_run_dir
 from .image_loop import init_state, preprocess_batch, trainer
+from .settings import ImageModelSettings, image_model_settings
 
 
 def output_dir(config: ExperimentConfig) -> Path:
-    return legacy_run_dir(config)
+    return stage_run_dir(config)
 
 
-def _run_arguments(config: ExperimentConfig) -> Hparams:
-    """Build the legacy image-model hparams from one typed stage config."""
-    workflow = config.workflow
-    assert isinstance(workflow, ImageModelTrainingConfig)
-    args = Hparams()
-    # Legacy ``setup_hparams`` first applies the dataset preset and then every
-    # argparse default. Mirror that merge exactly without parsing run.py's CLI.
-    args.update(HPARAMS_REGISTRY["morphomnist"].__dict__)
-    parser = add_arguments(argparse.ArgumentParser(add_help=False))
-    args.update(vars(parser.parse_args([])))
-    args.update({
-        "dataset": config.dataset.name,
-        "data_dir": config.dataset.root,
-        "input_res": config.dataset.input_res,
-        "pad": config.dataset.pad,
-        "hflip": config.dataset.hflip,
-        "parents_x": list(MORPHOMNIST_SCHEMA.variable_names),
-        "context_dim": MORPHOMNIST_SCHEMA.encoded_dim,
-        "cond_prior": config.model.cond_prior,
-        "enc_arch": config.model.enc_arch,
-        "dec_arch": config.model.dec_arch,
-        "widths": config.model.widths,
-        "bottleneck": config.model.bottleneck,
-        "z_dim": config.model.z_dim,
-        "z_max_res": config.model.z_max_res,
-        "bias_max_res": config.model.bias_max_res,
-        "x_like": config.model.x_like,
-        "std_init": config.model.std_init,
-        "q_correction": config.model.q_correction,
-        "kl_free_bits": config.model.kl_free_bits,
-        "accelerator": config.runtime.accelerator,
-        "precision": config.runtime.precision,
-        "ckpt_dir": config.artifacts.root,
-        "remote_ckpt_dir": config.artifacts.remote_root,
-        "exp_name": config.artifacts.run_name,
-        "seed": config.seed,
-        "epochs": workflow.epochs,
-        "bs": config.optimizer.batch_size,
-        "lr": config.optimizer.lr,
-        "wd": config.optimizer.weight_decay,
-        "lr_warmup_steps": config.optimizer.lr_warmup_steps,
-        "betas": list(config.optimizer.betas),
-        "vae": "hierarchical" if config.model.name == "hierarchical_vae" else "simple",
-        "speed_log_freq": workflow.speed_log_freq,
-        "viz_batch_size": workflow.viz_batch_size,
-        "eval_freq": workflow.eval_freq,
-        "checkpoint_freq": workflow.checkpoint_freq,
-        "resume": workflow.resume,
-        "ema_rate": workflow.ema_rate,
-        "beta": workflow.beta,
-        "beta_warmup_steps": workflow.beta_warmup_steps,
-        "grad_clip": workflow.grad_clip,
-        "grad_skip": workflow.grad_skip,
-        "accu_steps": workflow.accu_steps,
-        "checkpoint_smoke_test": workflow.checkpoint_smoke_test,
-        "checkpoint_smoke_steps": workflow.checkpoint_smoke_steps,
-        "benchmark_steps": workflow.benchmark_steps,
-        "benchmark_warmup_steps": workflow.benchmark_warmup_steps,
-        "execution_mode": workflow.execution_mode,
-        "drop_remainder": workflow.drop_remainder,
-        # Batch sizing is explicit in clean configs; retain auto-scaling only
-        # for the deprecated shell launcher.
-        "tpu_auto_scale": False,
-    })
-    return args
+def _run_arguments(config: ExperimentConfig) -> ImageModelSettings:
+    return image_model_settings(config)
 
 
-def _setup_logging(args: Hparams) -> logging.Logger:
+def _setup_logging(args: ImageModelSettings) -> logging.Logger:
     """Keep terminal logging separate from eval-gated trainlog persistence."""
     ensure_dir(args.save_dir)
     logging.basicConfig(
@@ -117,7 +52,7 @@ def _setup_logging(args: Hparams) -> logging.Logger:
     return logging.getLogger("causal-genx")
 
 
-def _build_model(args: Hparams):
+def _build_model(args: ImageModelSettings):
     model_class = HVAE if args.vae == "hierarchical" else SimpleVAE
     return model_class(
         input_channels=args.input_channels,
@@ -135,7 +70,7 @@ def _build_model(args: Hparams):
         x_like=args.x_like,
         kl_free_bits=args.kl_free_bits,
         std_init=args.std_init,
-        hps=args.hps,
+        dataset_id=args.dataset_id,
         rngs=nnx.Rngs(args.seed),
     )
 
@@ -152,13 +87,8 @@ def _resume_hparams(path: str) -> dict[str, Any]:
         return json.load(handle)
 
 
-def _run(args: Hparams) -> None:
-    """The former ``main.main`` body, kept deliberately outcome-compatible."""
+def _run(args: ImageModelSettings) -> None:
     seed_all(args.seed, args.deterministic)
-    if getattr(args, "tpu_auto_scale", False) and args.accelerator == "tpu" and jax.local_device_count() > 1:
-        if args.bs == 128:
-            args.bs = 512
-        args.drop_remainder = True
     has_resume_checkpoint = False
     if args.resume:
         if not path_exists(args.resume):
@@ -174,15 +104,15 @@ def _run(args: Hparams) -> None:
                 if key not in {"resume", "accelerator", "device"}
             }
             data_dir, requested_lr, resume_path = args.data_dir, args.lr, args.resume
-            args.update(saved)
+            args.update_from_checkpoint(saved, exclude={"resume", "accelerator", "data_dir"})
             if data_dir:
                 args.data_dir = data_dir
             if requested_lr < args.lr:
                 args.lr = requested_lr
             args.resume = resume_path
-    args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "run")
+    args.save_dir = experiment_run_dir(args.ckpt_dir, args.dataset_id, args.exp_name, "run")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
-    args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.hps, args.exp_name, "run")
+    args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.dataset_id, args.exp_name, "run")
     ensure_dir(args.save_dir)
     ensure_dir(args.checkpoint_dir)
     logger = _setup_logging(args)
@@ -246,7 +176,7 @@ def run(config: ExperimentConfig) -> str:
 def dry_run_image(config: ExperimentConfig) -> str:
     """Build the configured model and exercise visualization without training."""
     args = _run_arguments(config)
-    args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "run")
+    args.save_dir = experiment_run_dir(args.ckpt_dir, args.dataset_id, args.exp_name, "run")
     args.remote_save_dir = ""
     ensure_dir(args.save_dir)
     model = _build_model(args)
@@ -268,8 +198,3 @@ def dry_run_image(config: ExperimentConfig) -> str:
         step=0,
     )
     return f"dry-run-image wrote {path} ({args.viz_batch_size} requested samples)"
-
-
-def run_legacy_args(args: Any) -> None:
-    """Compatibility hook for the deprecated ``src/main.py`` entrypoint."""
-    _run(args)

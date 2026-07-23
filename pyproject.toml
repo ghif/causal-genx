@@ -14,7 +14,7 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["artifacts", "conditioning", "config", "contracts", "datasets", "hps", "infer", "main", "models", "runtime", "trainer", "utils", "workflows"]
+py-modules = ["artifacts", "config", "contracts", "runtime", "utils"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

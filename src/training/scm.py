@@ -39,7 +39,7 @@ from utils import (
     tree_copy,
 )
 
-from .common import legacy_run_dir
+from .common import stage_run_dir
 
 
 @dataclass
@@ -84,7 +84,7 @@ class ScmRunArguments:
 
 
 def output_dir(config: ExperimentConfig) -> Path:
-    return legacy_run_dir(config)
+    return stage_run_dir(config)
 
 
 def validate_artifacts(run_dir: str | Path) -> None:
@@ -192,7 +192,7 @@ def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation):
     @jax.jit
     def train_step(params: Any, opt_state: Any, batch: Dict[str, jax.Array]):
         (loss, metrics), grads = jax.value_and_grad(_loss, argnums=1, has_aux=True)(graphdef, params, batch)
-        grad_norm = optax.tree.norm(grads)
+        grad_norm = optax.global_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, metrics, grad_norm
     return train_step
@@ -354,19 +354,3 @@ def run(config: ExperimentConfig) -> str:
     _run(_run_arguments(config))
     validate_artifacts(run_dir)
     return str(run_dir)
-
-
-def run_legacy_args(legacy_args: Any) -> Dict[str, float]:
-    """Compatibility adapter for ``pgm/train_pgm.py --setup sup_pgm``.
-
-    The old parser stays available, but it now executes this module's native
-    SCM loop. Predictor arguments continue to be handled by the legacy
-    predictor wrapper until that stage is migrated separately.
-    """
-    fields = ScmRunArguments.__dataclass_fields__
-    args = ScmRunArguments(**{
-        name: getattr(legacy_args, name, field.default)
-        for name, field in fields.items()
-        if field.init
-    })
-    return _run(args)

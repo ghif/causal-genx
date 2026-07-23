@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import os
 import posixpath
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
@@ -22,15 +20,7 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = SOURCE_ROOT.parent
 
 
-def run_legacy_module(script: str, arguments: list[str], *, cwd: Path | None = None) -> None:
-    cwd = cwd or SOURCE_ROOT
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = os.pathsep.join(filter(None, (str(SOURCE_ROOT), environment.get("PYTHONPATH", ""))))
-    if subprocess.run([sys.executable, "-u", script, *arguments], cwd=cwd, env=environment, check=False).returncode:
-        raise RuntimeError(f"Stage implementation {script} failed.")
-
-
-def legacy_run_dir(config: ExperimentConfig) -> Path:
+def stage_run_dir(config: ExperimentConfig) -> Path:
     return REPOSITORY_ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name
 
 

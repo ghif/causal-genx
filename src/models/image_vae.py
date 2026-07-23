@@ -351,7 +351,7 @@ class Decoder(nnx.Module):
         q_correction: bool = True,
         bias_max_res: int = 192,
         vr: Optional[str] = None,
-        hps: str = "morphomnist",
+        dataset_id: str = "morphomnist",
         rngs: Optional[nnx.Rngs] = None,
     ):
         self.widths = widths
@@ -364,7 +364,7 @@ class Decoder(nnx.Module):
         self.q_correction = q_correction
         self.bias_max_res = bias_max_res
         self.vr = vr
-        self.hps = hps
+        self.dataset_id = dataset_id
         stages = []
         for i, stage in enumerate(self.dec_arch.split(",")):
             res = int(stage.split("b")[0])
@@ -388,7 +388,7 @@ class Decoder(nnx.Module):
         ]
         self.blocks = _nnx_list(decoder_blocks)
         self.resolutions = tuple(sorted({r for r, _ in stages}))
-        self.is_drop_cond = "morphomnist" in self.hps
+        self.is_drop_cond = "morphomnist" in self.dataset_id
         self.biases = _nnx_dict()
         for i, res in enumerate(self.resolutions):
             if res <= self.bias_max_res:
@@ -587,7 +587,7 @@ class HVAE(nnx.Module):
         x_like: str = "none_dgauss",
         kl_free_bits: float = 0.0,
         std_init: float = 0.1,
-        hps: str = "morphomnist",
+        dataset_id: str = "morphomnist",
         vr: Optional[str] = None,
         rngs: Optional[nnx.Rngs] = None,
     ):
@@ -606,7 +606,7 @@ class HVAE(nnx.Module):
         self.x_like = x_like
         self.kl_free_bits = kl_free_bits
         self.std_init = std_init
-        self.hps = hps
+        self.dataset_id = dataset_id
         self.vr = vr
         self.encoder = Encoder(self.input_channels, self.input_res, self.enc_arch, self.widths, self.bottleneck, self.vr, rngs=rngs)
         self.decoder = Decoder(
@@ -620,7 +620,7 @@ class HVAE(nnx.Module):
             self.q_correction,
             self.bias_max_res,
             self.vr,
-            self.hps,
+            self.dataset_id,
             rngs=rngs,
         )
         self.likelihood = DGaussNet(self.input_channels, self.widths[0], self.std_init, rngs=rngs)

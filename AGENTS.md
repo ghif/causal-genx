@@ -2,12 +2,11 @@
 
 ## Project Structure & Module Organization
 
-`src/` contains reusable implementation code. The four research stages live in
-`src/training/`: SCM, predictor, image-model, and counterfactual fine-tuning.
+`src/` contains reusable implementation code. The five workflow stages live in
+`src/training/`: SCM, predictor, image-model, counterfactual fine-tuning, and inference.
 Dataset loading and conditioning are in `src/data/`; causal mechanisms are in
-`src/causal/`; VAE/HVAE code is in `src/models/`. Treat `src/pgm/` and
-`src/main.py` as compatibility layers: keep them working, but put new logic in
-the named stage modules.
+`src/causal/`; VAE/HVAE code is in `src/models/`. Put all workflow logic in
+the named stage modules; compatibility entrypoints and shell launchers are not supported.
 
 Use `scripts/run.py` as the public entry point. Each complete experiment has
 one standalone YAML file in `configs/`, for example

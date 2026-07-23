@@ -14,22 +14,22 @@ model:
   name: hierarchical_vae
   context_dim: 12
 optimizer:
-  lr: 0.0001
-  weight_decay: 0.1
-  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.01
+  batch_size: 1
 runtime:
   accelerator: cpu
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: pgm_jax-cpu_22-07-2026
-  remote_root: gs://medical-airnd/causal-gen/checkpoints
+  run_name: hvae_jax-cpu_22-07-2026_inference
 workflow:
-  type: train-scm
-  scm_model: morphomnist_scm
-  strict_artifact_contract: true
-  epochs: 1000
-  eval_freq: 1
-  plot_samples: 10000
-  widths: [32, 32]
-  benchmark_steps: 0
+  type: infer
+  checkpoint: gs://medical-airnd/causal-gen/checkpoints/morphomnist/hvae_jax-cpu_22-07-2026
+  parents:
+    thickness: 0.0
+    intensity: 0.0
+    digit: 0
+  beta: 1.0
+  # The historical GCS mirror has readable Orbax payloads without completion markers.
+  trust_incomplete_checkpoint: true

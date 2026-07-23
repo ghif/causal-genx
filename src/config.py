@@ -68,7 +68,7 @@ class ScmTrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     type: Literal["train-scm"]
     scm_model: str = "morphomnist_scm"
-    strict_legacy_parity: bool = True
+    strict_artifact_contract: bool = True
     epochs: PositiveInt = 1000
     eval_freq: PositiveInt = 1
     plot_samples: PositiveInt = 10000
@@ -138,6 +138,10 @@ class InferenceConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     type: Literal["infer"]
     checkpoint: str
+    image_path: str = ""
+    parents: dict[str, Any] = Field(default_factory=lambda: {"thickness": 0.0, "intensity": 0.0, "digit": 0})
+    beta: float = 1.0
+    trust_incomplete_checkpoint: bool = False
 
 
 WorkflowConfig = Annotated[

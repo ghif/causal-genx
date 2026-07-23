@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from pgm.cf_parity import (
+from training.counterfactual_support import (
     batch_progress_kwargs,
     clip_counterfactual_grads,
     damped_lagrangian_loss,
@@ -18,7 +18,7 @@ from pgm.cf_parity import (
     format_checkpoint_summary,
     format_checkpoint_validation_summary,
     format_run_summary,
-    inherit_vae_training_config,
+    inherit_image_training_config,
     intervention_progress_kwargs,
     format_torch_style_eval_progress,
     set_module_training_mode,
@@ -128,7 +128,7 @@ def test_counterfactual_step_rejects_explosive_gradients(monkeypatch):
     pandas_stub.DataFrame = object
     monkeypatch.setitem(sys.modules, "pandas", pandas_stub)
 
-    from pgm import train_cf
+    from training import counterfactual as train_cf
 
     def loss_fn(vae_params, lmbda, *_):
         loss = 10.0 * (vae_params["weight"] + lmbda)
@@ -163,7 +163,7 @@ def test_counterfactual_step_rejects_explosive_gradients(monkeypatch):
 
 
 def test_counterfactual_vae_learning_rate_warmup_uses_global_step():
-    from pgm import train_cf
+    from training import counterfactual as train_cf
 
     np.testing.assert_allclose(train_cf._cf_lr_scale(0, 100), 0.0)
     np.testing.assert_allclose(train_cf._cf_lr_scale(50, 100), 0.5)
@@ -195,7 +195,7 @@ def test_counterfactual_training_inherits_vae_optimizer_configuration():
         "betas": [0.9, 0.9],
     }
 
-    inherit_vae_training_config(args, checkpoint_hparams)
+    inherit_image_training_config(args, checkpoint_hparams)
 
     assert args.lr == 1e-4
     assert args.beta == 2.0
@@ -256,7 +256,7 @@ def test_eval_split_rejects_nan_batches(monkeypatch):
     pandas_stub.DataFrame = object
     monkeypatch.setitem(sys.modules, "pandas", pandas_stub)
 
-    from pgm import train_cf
+    from training import counterfactual as train_cf
 
     args = SimpleNamespace(
         bs=1,
@@ -343,7 +343,7 @@ def test_predictor_preflight_normalizes_images_before_likelihood(monkeypatch):
     pandas_stub.DataFrame = object
     monkeypatch.setitem(sys.modules, "pandas", pandas_stub)
 
-    from pgm import train_cf
+    from training import counterfactual as train_cf
 
     args = SimpleNamespace(
         bs=1,
@@ -395,7 +395,7 @@ def test_dataset_normalization_report_matches_pytorch_format(monkeypatch, capsys
     pandas_stub.DataFrame = object
     monkeypatch.setitem(sys.modules, "pandas", pandas_stub)
 
-    from pgm import train_cf
+    from training import counterfactual as train_cf
 
     class _Dataset:
         norm = "[-1,1]"

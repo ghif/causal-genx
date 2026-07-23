@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import copy
 import json
 import logging
@@ -18,9 +17,8 @@ from tqdm import tqdm
 
 from config import CounterfactualTrainingConfig, ExperimentConfig
 from data.morphomnist import morphomnist
-from hps import HPARAMS_REGISTRY, Hparams, add_arguments
-from models import HVAE
-from pgm.cf_parity import (
+from models.image_vae import HVAE
+from .counterfactual_support import (
     batch_progress_kwargs,
     clip_counterfactual_grads,
     damped_lagrangian_loss,
@@ -28,7 +26,7 @@ from pgm.cf_parity import (
     format_checkpoint_summary,
     format_checkpoint_validation_summary,
     format_run_summary,
-    inherit_vae_training_config,
+    inherit_image_training_config,
     intervention_progress_kwargs,
     format_torch_style_eval_progress,
     set_module_training_mode,
@@ -52,101 +50,16 @@ from utils import (
     tree_copy,
 )
 
-from .common import legacy_run_dir, validate_stage_artifacts
+from .common import stage_run_dir, validate_stage_artifacts
+from .settings import CounterfactualSettings, counterfactual_settings
 
 
 def output_dir(config: ExperimentConfig):
-    """Return the legacy-compatible counterfactual artifact directory."""
-    return legacy_run_dir(config) / "cf"
+    return stage_run_dir(config) / "cf"
 
 
-def legacy_argument_parser() -> argparse.ArgumentParser:
-    """Build the historical train_cf parser for the compatibility wrapper."""
-    parser = add_arguments(argparse.ArgumentParser())
-    parser.set_defaults(lr=1e-4, eval_freq=1)
-    parser.add_argument("--load_path", type=str, default="")
-    parser.add_argument("--gpu_id", type=str, default="0")
-    parser.add_argument("--pgm_path", type=str, default="checkpoints/morphomnist/pgm/checkpoints")
-    parser.add_argument("--predictor_path", type=str, default="checkpoints/morphomnist/run/checkpoints")
-    parser.add_argument("--vae_path", type=str, default="checkpoints/morphomnist/run/checkpoints")
-    parser.add_argument("--testing", action="store_true", default=False)
-    parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--lmbda_init", type=float, default=0.0)
-    parser.add_argument("--lr_lagrange", type=float, default=1e-2)
-    parser.add_argument("--damping", type=float, default=100.0)
-    parser.add_argument("--do_pa", type=str, default=None)
-    parser.add_argument("--plot_freq", type=int, default=500)
-    parser.add_argument("--imgs_plot", type=int, default=10)
-    parser.add_argument("--cf_particles", type=int, default=1)
-    parser.add_argument("--elbo_constraint", type=float, default=1.841216802597046)
-    parser.add_argument(
-        "--model_validation_batches",
-        type=int,
-        default=1,
-        help="Test batches used to validate each loaded model; 0 validates the full test split.",
-    )
-    parser.add_argument(
-        "--trust_incomplete_checkpoint",
-        action="store_true",
-        default=False,
-        help="Restore the newest numeric step even if commit_success.txt is missing.",
-    )
-    return parser
-
-
-def _default_arguments() -> Hparams:
-    """Apply the exact preset-plus-parser merge used by legacy train_cf.py."""
-    args = Hparams()
-    args.update(HPARAMS_REGISTRY["morphomnist"].__dict__)
-    args.update(vars(legacy_argument_parser().parse_args([])))
-    return args
-
-
-def _run_arguments(config: ExperimentConfig) -> Hparams:
-    workflow = config.workflow
-    assert isinstance(workflow, CounterfactualTrainingConfig)
-    args = _default_arguments()
-    args.update(
-        {
-            "accelerator": config.runtime.accelerator,
-            "gpu_id": config.runtime.gpu_id or "0",
-            "precision": config.runtime.precision,
-            "dataset": config.dataset.name,
-            "data_dir": config.dataset.root,
-            "ckpt_dir": config.artifacts.root,
-            "remote_ckpt_dir": config.artifacts.remote_root,
-            "exp_name": config.artifacts.run_name,
-            "seed": config.seed,
-            "epochs": workflow.epochs,
-            "bs": config.optimizer.batch_size,
-            "lr": config.optimizer.lr,
-            "wd": config.optimizer.weight_decay,
-            "betas": list(config.optimizer.betas),
-            "lr_warmup_steps": config.optimizer.lr_warmup_steps,
-            "input_res": config.dataset.input_res,
-            "pad": config.dataset.pad,
-            "hflip": config.dataset.hflip,
-            "eval_freq": workflow.eval_freq,
-            "plot_freq": workflow.plot_freq,
-            "alpha": workflow.alpha,
-            "lmbda_init": workflow.lmbda_init,
-            "lr_lagrange": workflow.lr_lagrange,
-            "damping": workflow.damping,
-            "do_pa": workflow.do_pa,
-            "cf_particles": workflow.cf_particles,
-            "elbo_constraint": workflow.elbo_constraint,
-            "ema_rate": workflow.ema_rate,
-            "model_validation_batches": workflow.model_validation_batches,
-            "trust_incomplete_checkpoint": workflow.trust_incomplete_checkpoint,
-            "load_path": workflow.resume_checkpoint,
-            "testing": workflow.testing,
-            "benchmark_steps": workflow.benchmark_steps,
-            "pgm_path": workflow.scm_checkpoint,
-            "predictor_path": workflow.predictor_checkpoint,
-            "vae_path": workflow.image_model_checkpoint,
-        }
-    )
-    return args
+def _run_arguments(config: ExperimentConfig) -> CounterfactualSettings:
+    return counterfactual_settings(config)
 
 
 def setup_logging(args):
@@ -367,7 +280,7 @@ def _make_intervention(
 
 def _load_vae_bundle(args):
     vae_hparams = _load_checkpoint_hparams(args.vae_path)
-    inherit_vae_training_config(args, vae_hparams)
+    inherit_image_training_config(args, vae_hparams)
     model_args = {
         key: vae_hparams.get(key, getattr(args, key))
         for key in (
@@ -386,7 +299,6 @@ def _load_vae_bundle(args):
             "x_like",
             "kl_free_bits",
             "std_init",
-            "hps",
         )
     }
     for key, value in model_args.items():
@@ -431,7 +343,7 @@ def _load_pgm_bundle(args):
     if pgm_ckpt.get("format_version") != 2 or "ema_params" not in pgm_ckpt:
         raise ValueError(
             "The PGM checkpoint uses the old simplified Gaussian/CNN format. "
-            "Retrain it with pgm/train_pgm.py before running counterfactual finetuning."
+            "Retrain it with the clean train-scm stage before running counterfactual finetuning."
         )
     _assert_tree_compatible("PGM", pgm_ckpt, params, "ema_params")
     graphdef, _ = nnx.split(pgm, nnx.Param)
@@ -467,7 +379,7 @@ def _load_predictor_bundle(args):
     if predictor_ckpt.get("format_version") != 3 or "ema_params" not in predictor_ckpt:
         raise ValueError(
             "The predictor checkpoint uses the old simplified CNN format. "
-            "Retrain it with pgm/train_pgm.py before running counterfactual finetuning."
+            "Retrain it with the clean train-predictor stage before running counterfactual finetuning."
         )
     params = predictor_ckpt["ema_params"]
     batch_stats = predictor_ckpt["ema_batch_stats"]
@@ -1116,9 +1028,9 @@ def main(args):
         else:
             print(f"Checkpoint not found: {args.load_path}")
 
-    args.save_dir = experiment_run_dir(args.ckpt_dir, args.hps, args.exp_name, "cf")
+    args.save_dir = experiment_run_dir(args.ckpt_dir, args.dataset_id, args.exp_name, "cf")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
-    args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.hps, args.exp_name, "cf")
+    args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.dataset_id, args.exp_name, "cf")
     ensure_dir(args.save_dir)
     ensure_dir(args.checkpoint_dir)
     logger = setup_logging(args)
@@ -1335,8 +1247,3 @@ def run(config: ExperimentConfig) -> str:
     args.vae_path = image_model_checkpoint
     main(args)
     return str(output_dir(config))
-
-
-def run_legacy_args(args: Hparams) -> None:
-    """Compatibility hook for the deprecated ``pgm/train_cf.py`` entrypoint."""
-    main(args)

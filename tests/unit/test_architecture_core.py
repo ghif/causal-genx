@@ -2,10 +2,10 @@ import numpy as np
 import pytest
 
 from artifacts import ArtifactMetadata, assert_compatible
-from conditioning import ParentEncoder
+from data.conditioning import ParentEncoder
 from config import load_experiment
 from contracts import CausalGraphSpec, VariableKind, VariableSpec
-from datasets import _DATASET_FACTORIES
+from data.morphomnist import _DATASET_FACTORIES
 from config import ExperimentConfig
 from training import counterfactual, image_model, predictor, scm
 
@@ -52,7 +52,7 @@ def test_v6e4_image_config_has_explicit_single_host_topology():
     assert args.cond_prior is True
 
 
-def test_image_model_config_forwards_legacy_training_hparams():
+def test_image_model_config_forwards_typed_training_settings():
     config = load_experiment(
         "configs/morphomnist_image_model.yaml",
         [
@@ -79,15 +79,14 @@ def test_image_model_config_forwards_legacy_training_hparams():
     assert args.beta_warmup_steps == 12
 
 
-def test_default_image_model_yaml_matches_run_local_hvae_profile():
+def test_default_image_model_yaml_matches_hvae_profile():
     args = image_model._run_arguments(
         load_experiment("configs/morphomnist_image_model.yaml")
     )
 
-    # src/run_local.sh passes these values explicitly to src/main.py.
     assert args.accelerator == "cpu"
     assert args.precision == "fp32"
-    assert args.hps == "morphomnist"
+    assert args.dataset_id == "morphomnist"
     assert args.vae == "hierarchical"
     assert args.parents_x == ["thickness", "intensity", "digit"]
     assert args.context_dim == 12
@@ -98,8 +97,8 @@ def test_default_image_model_yaml_matches_run_local_hvae_profile():
     assert args.wd == 0.01
     assert args.beta == 1.0
     assert args.speed_log_freq == 50
-    assert args.eval_freq == 50
-    assert args.checkpoint_freq == 50
+    assert args.eval_freq == 5
+    assert args.checkpoint_freq == 10
     assert args.viz_batch_size == 32
 
 
@@ -122,22 +121,6 @@ def test_schema_rejects_unknown_or_non_intervenable_values():
         schema.validate_intervention({"missing": 1})
 
 
-def test_legacy_pgm_delegate_exposes_src_on_pythonpath(monkeypatch):
-    captured = {}
-
-    class Result:
-        returncode = 0
-
-    def fake_run(command, **kwargs):
-        captured["command"] = command
-        captured["env"] = kwargs["env"]
-        captured["cwd"] = kwargs["cwd"]
-        return Result()
-
-    # Legacy module execution is centralized in training.common; stage tests
-    # below cover the named public SCM command instead.
-
-
 def test_native_scm_arguments_match_reference_profile():
     config = load_experiment("configs/morphomnist_scm.yaml")
     args = scm._run_arguments(config)
@@ -150,7 +133,7 @@ def test_native_scm_arguments_match_reference_profile():
     assert args.setup == "sup_pgm"  # retained checkpoint identity, not dispatch.
 
 
-def test_native_predictor_arguments_match_legacy_artifact_profile():
+def test_native_predictor_arguments_match_artifact_profile():
     config = load_experiment("configs/morphomnist_predictor.yaml")
     args = predictor._run_arguments(config)
     assert args.accelerator == "cpu"
@@ -160,7 +143,7 @@ def test_native_predictor_arguments_match_legacy_artifact_profile():
     assert args.setup == "sup_aux"
 
 
-def test_native_counterfactual_arguments_match_legacy_run_sh_profile():
+def test_native_counterfactual_arguments_match_profile():
     config = load_experiment("configs/morphomnist_counterfactual.yaml")
     args = counterfactual._run_arguments(config)
     assert args.accelerator == "cpu"
@@ -182,12 +165,6 @@ def test_native_counterfactual_arguments_match_legacy_run_sh_profile():
     assert str(counterfactual.output_dir(config)).endswith(
         f"checkpoints/morphomnist/{config.artifacts.run_name}/cf"
     )
-
-
-def test_train_cf_compatibility_module_forwards_to_stage_implementation():
-    from pgm import train_cf
-
-    assert train_cf is counterfactual
 
 
 def test_counterfactual_stage_runs_native_implementation(monkeypatch):
@@ -219,7 +196,7 @@ def test_counterfactual_stage_runs_native_implementation(monkeypatch):
     assert output.endswith(f"{config.artifacts.run_name}/cf")
 
 
-def test_predictor_artifact_contract_accepts_legacy_shape(tmp_path):
+def test_predictor_artifact_contract_accepts_expected_shape(tmp_path):
     (tmp_path / "checkpoints" / "1").mkdir(parents=True)
     for name in ("hparams.json",):
         (tmp_path / "checkpoints" / name).touch()
@@ -229,7 +206,7 @@ def test_predictor_artifact_contract_accepts_legacy_shape(tmp_path):
     predictor.validate_artifacts(tmp_path)
 
 
-def test_strict_scm_artifact_contract_accepts_legacy_shape(tmp_path):
+def test_scm_artifact_contract_accepts_expected_shape(tmp_path):
     (tmp_path / "checkpoints" / "1").mkdir(parents=True)
     for name in ("hparams.json",):
         (tmp_path / "checkpoints" / name).touch()

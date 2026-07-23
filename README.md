@@ -48,13 +48,14 @@ Current development focus is **MorphoMNIST on Mac CPU**, which is the primary ac
  ┣ 📜requirements-tpu.txt             # Google Cloud TPU dependencies
  ┣ 📜jax-porting.md                  # migration and parity plan
  ┣ 📂scripts
- ┃ ┣ 📜run.py                        # sole public runner for the four stages
+ ┃ ┣ 📜run.py                        # sole public runner for training and inference
  ┃ ┗ 📜morphomnist_visualizer.py
  ┣ 📂configs                         # one complete YAML per training stage
  ┃ ┣ 📜morphomnist_scm.yaml
  ┃ ┣ 📜morphomnist_predictor.yaml
  ┃ ┣ 📜morphomnist_image_model.yaml
- ┃ ┗ 📜morphomnist_counterfactual.yaml
+ ┃ ┣ 📜morphomnist_counterfactual.yaml
+ ┃ ┗ 📜morphomnist_inference.yaml
  ┗ 📂src                             # reusable lower-level implementation
    ┣ 📂data                          # MorphoMNIST provider and parent conditioning
    ┣ 📂causal                        # SCM, predictor, and deep-SCM mechanisms
@@ -62,7 +63,7 @@ Current development focus is **MorphoMNIST on Mac CPU**, which is the primary ac
    ┣ 📂training                      # SCM → predictor → image → CF stage modules
    ┣ 📜artifacts.py                  # metadata and compatibility validation
    ┣ 📜config.py                     # typed stage configuration
-   ┗ 📂pgm                           # deprecated compatibility modules
+   ┗ 📂training                      # five named workflow modules
 ```
 
 ### Overview
@@ -158,8 +159,7 @@ Use an explicit override such as `artifacts.run_name=my_v6e4_run`; do not reuse 
 completed run name.
 
 Use `--dry-run` to validate a config without accessing data or starting a job.
-The older `src/` entrypoints and shell launchers remain available for existing
-automation but are deprecated compatibility paths.
+`scripts/run.py` is the only supported entrypoint.
 
 For MorphoMNIST, the recommended training order is:
 
@@ -194,62 +194,8 @@ python scripts/run.py train-predictor --config configs/morphomnist_predictor.yam
 python scripts/run.py train-image-model --config configs/morphomnist_image_model.yaml
 ```
 
-To launch local CPU training of the JAX image mechanism, run the launcher from inside `src/`:
-
-```bash
-cd causal-genx/src
-bash run_local.sh my_experiment
-```
-
-The launcher accepts extra arguments and forwards them to `main.py`, so you can override the defaults when needed:
-
-```bash
-bash run_local.sh my_experiment --bs 32 --epochs 500 --eval_freq 4 --checkpoint_freq 50 --viz_batch_size 32
-```
-
-To run in the background:
-
-```bash
-cd causal-genx/src
-nohup bash run_local.sh my_experiment nohup > my_experiment.log 2>&1 &
-
-tail -f my_experiment.log
-```
-
-For NVIDIA GPU / A100, use the GPU launcher:
-
-```bash
-cd causal-genx/src
-bash run_gpu.sh my_experiment
-```
-
-To override GPU defaults:
-
-```bash
-cd causal-genx/src
-bash run_gpu.sh my_experiment --bs 128 --precision bf16 --eval_freq 4 --checkpoint_freq 4 --viz_batch_size 32
-```
-
-For Google Cloud TPU, use the TPU launcher:
-
-```bash
-cd causal-genx/src
-bash run_tpu.sh my_experiment
-```
-
-To override TPU defaults:
-
-```bash
-cd causal-genx/src
-bash run_tpu.sh my_experiment --bs 32 --precision bf16 --eval_freq 4 --checkpoint_freq 4 --viz_batch_size 32
-```
-
-You can also call the entrypoint directly:
-
-```bash
-cd causal-genx/src
-python main.py --exp_name my_experiment --data_dir gs://medical-airnd/causal-gen/datasets/morphomnist
-```
+Use YAML overrides for run-specific values, for example
+`artifacts.run_name=my_experiment runtime.accelerator=cpu`.
 
 #### 4. Run counterfactual composition
 
@@ -263,9 +209,8 @@ python scripts/run.py finetune-counterfactual \
 
 Set `workflow.scm_checkpoint`, `workflow.predictor_checkpoint`, and
 `workflow.image_model_checkpoint` in the standalone config to the three
-upstream checkpoint roots. The stage preserves the historical `cf/` artifact
-layout, checkpoint payload, logs, TensorBoard events, and GCS synchronization.
-`src/pgm/train_cf.py` remains a deprecated compatibility wrapper.
+upstream checkpoint roots. The stage writes its `cf/` artifact layout,
+checkpoint payload, logs, TensorBoard events, and GCS synchronization.
 
 Relative checkpoint paths are resolved locally first, then below
 `artifacts.remote_root`; use an explicit `gs://...` path to require GCS. Set
@@ -273,24 +218,19 @@ Relative checkpoint paths are resolved locally first, then below
 whose Orbax payload is present but lacks `commit_success.txt`; the run records
 that recovery choice in its logs and checkpoint hparams.
 
-For counterfactual or structured-mechanism training, the matching JAX entrypoints live under `src/pgm/`.
-
-`run_gpu.sh` is the GPU launcher for the `main.py` image-model training job. It is triggered when you explicitly run it from the shell, for example:
+#### 5. Run inference
 
 ```bash
-cd causal-genx/src
-bash run_gpu.sh my_experiment
+python scripts/run.py infer --config configs/morphomnist_inference.yaml
 ```
 
-It is not called automatically by `main.py`, `train_pgm.py`, or `train_cf.py`.
+The reference config reads
+`gs://medical-airnd/causal-gen/checkpoints/morphomnist/hvae_jax-cpu_22-07-2026`.
 
 ### Current Defaults
 
-- `run_local.sh` activates the `med-jax` conda environment
-- `run_gpu.sh` launches `main.py` with `--accelerator=gpu` and `--precision=bf16`
-- `run_tpu.sh` launches `main.py` with `--accelerator=tpu` and `--precision=bf16`
 - MorphoMNIST is loaded from `gs://medical-airnd/causal-gen/datasets/morphomnist`
-- checkpoints default to a local `../checkpoints` directory from inside `src/`
+- checkpoints default to `checkpoints/` from the repository root
 - `eval_freq` controls validation and visualization, while `checkpoint_freq` independently controls periodic training-state saves
 - CPU is the intended execution target
 
@@ -304,61 +244,33 @@ It is not called automatically by `main.py`, `train_pgm.py`, or `train_cf.py`.
 
 If you want to add a new dataset or causal mechanism, the rough flow is:
 
-1. Add the dataset loader in `src/datasets.py`.
-2. Add or extend the causal model in `src/pgm/flow_pgm.py`.
-3. Adjust hyperparameters and defaults in `src/hps.py`.
-4. Train the parent SCM with `src/pgm/train_pgm.py`.
-5. Train the image mechanism with `src/main.py`.
-6. Use `scripts/run.py finetune-counterfactual --config ...` to fine-tune and
-   evaluate the counterfactual composition.
+1. Add the dataset loader in `src/data/`.
+2. Add or extend the causal model in `src/causal/`.
+3. Define a complete standalone config in `configs/`.
+4. Run the required stages through `scripts/run.py`.
 
 ### Checkpointing
 
 The JAX port now uses **Orbax checkpoint directories** for persistence. Each run writes its training state under a checkpoint root inside the experiment run folder:
 
 ```text
-<ckpt_dir>/<hps>/<exp_name>/checkpoints/
+<checkpoint_root>/<dataset>/<run_name>/checkpoints/
 ```
 
-Resume by pointing `--resume` at that checkpoint directory. Orbax keeps the latest step subdirectory and the associated metadata under that root, so the resume path is a folder rather than a single `.pt` file.
-
-If you are migrating an older script, treat `.pt` checkpoints as legacy-only. The new default is always the Orbax directory layout.
+Resume paths are configured as `workflow.resume` or
+`workflow.resume_checkpoint`. Orbax keeps the latest step and metadata under
+that root; `.pt` and `.pkl` files are not supported.
 
 ### Resume Training
 
-To resume from the latest checkpoint, point `--resume` at the checkpoint root directory for the run. Orbax will pick the latest saved step inside that directory automatically.
-
-Local example:
-
-```bash
-cd causal-genx/src
-bash run_local.sh my_experiment --resume ../checkpoints/morphomnist/my_experiment/checkpoints
-```
-
-GPU example:
-
-```bash
-cd causal-genx/src
-bash run_gpu.sh my_experiment --resume ../checkpoints/morphomnist/my_experiment/checkpoints
-```
-
-TPU example:
-
-```bash
-cd causal-genx/src
-bash run_tpu.sh my_experiment --resume ../checkpoints/morphomnist/my_experiment/checkpoints
-```
-
-If you are resuming from the mirrored GCS tree, use the remote checkpoint root instead:
-
-```bash
---resume gs://medical-airnd/causal-gen/checkpoints/morphomnist/my_experiment/checkpoints
-```
+Set `workflow.resume` (image model) or `workflow.resume_checkpoint`
+(counterfactual) to a local or GCS Orbax checkpoint root. The loader selects
+the latest valid step.
 
 By default, local training also mirrors the full experiment run tree to GCS under:
 
 ```text
-gs://medical-airnd/causal-gen/checkpoints/<hps>/<exp_name>/
+gs://medical-airnd/causal-gen/checkpoints/<dataset>/<run_name>/
 ```
 
 That means the same Orbax checkpoint root is available locally and in the bucket after each save, and the checkpoint data stays under the run's `checkpoints/` subfolder in both places.

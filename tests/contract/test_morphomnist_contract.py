@@ -1,4 +1,4 @@
-from datasets import MORPHOMNIST_SCHEMA, MorphoMNISTProvider
+from data.morphomnist import MORPHOMNIST_SCHEMA, MorphoMNISTProvider
 
 
 def test_morphomnist_contract_is_explicit_without_loading_remote_data():

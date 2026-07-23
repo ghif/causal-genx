@@ -23,6 +23,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Tuple
 
 
@@ -35,8 +36,7 @@ Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
-PGM_DIR = SRC_DIR / "pgm"
-for path in (str(SRC_DIR), str(PGM_DIR)):
+for path in (str(SRC_DIR),):
     if path not in sys.path:
         sys.path.insert(0, path)
 
@@ -98,10 +98,9 @@ def patch_gradio_asyncio_compatibility() -> None:
 
 patch_gradio_asyncio_compatibility()
 
-from hps import Hparams  # noqa: E402
-from models import HVAE, SimpleVAE  # noqa: E402
-from pgm.flow_pgm import MorphoMNISTPGM  # noqa: E402
-from pgm.sup_aux_pgm import MorphoMNISTSupAuxPredictor  # noqa: E402
+from models.image_vae import HVAE, SimpleVAE  # noqa: E402
+from causal.flow_scm import MorphoMNISTPGM  # noqa: E402
+from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor  # noqa: E402
 from utils import load_checkpoint_with_path, materialize_nnx, open_file, seed_all  # noqa: E402
 
 
@@ -187,7 +186,7 @@ patch_gradio_runtime_compatibility()
 
 @dataclass
 class VisualizerBundle:
-    args: Hparams
+    args: SimpleNamespace
     vae: Any
     pgm: Any
     predictor: Any
@@ -306,7 +305,7 @@ def _build_vae(hparams: Dict[str, Any], seed: int):
         x_like=hparams["x_like"],
         kl_free_bits=hparams["kl_free_bits"],
         std_init=hparams["std_init"],
-        hps=hparams["hps"],
+        dataset_id=hparams.get("dataset", hparams.get("hps", "morphomnist")),
         rngs=nnx.Rngs(seed),
     )
 
@@ -349,7 +348,7 @@ def _load_pgm(path: str, trust_incomplete: bool, seed: int):
     return model, resolved
 
 
-def _load_predictor(path: str, trust_incomplete: bool, seed: int, args: Hparams):
+def _load_predictor(path: str, trust_incomplete: bool, seed: int, args: SimpleNamespace):
     checkpoint, resolved = _load_checkpoint(path, trust_incomplete)
     if checkpoint.get("format_version") != 3:
         raise ValueError(f"Unsupported JAX predictor checkpoint format at {resolved}")
@@ -384,8 +383,7 @@ def load_visualizer_bundle(
     checkpoint_path: str, trust_incomplete: bool, seed: int
 ) -> VisualizerBundle:
     hparams = _read_hparams(checkpoint_path)
-    args = Hparams()
-    args.update(hparams)
+    args = SimpleNamespace(**hparams)
 
     checkpoint, resolved = _load_checkpoint(checkpoint_path, trust_incomplete)
     weights = checkpoint.get("ema_params", checkpoint.get("vae_params"))

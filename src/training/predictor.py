@@ -23,7 +23,7 @@ from utils import (
     load_checkpoint, save_checkpoint, seed_all, sync_file, sync_tree, tree_copy,
 )
 
-from .common import epoch_batches, legacy_run_dir
+from .common import epoch_batches, stage_run_dir
 
 
 @dataclass
@@ -114,7 +114,7 @@ class WarmupEMA:
 
 
 def output_dir(config: ExperimentConfig) -> Path:
-    return legacy_run_dir(config)
+    return stage_run_dir(config)
 
 
 def validate_artifacts(run_dir: str | Path) -> None:
@@ -214,7 +214,7 @@ def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation):
             loss, metrics, new_params, new_batch_stats = _loss_and_state(graphdef, current_params, batch_stats, batch, training=True)
             return loss, (metrics, new_params, new_batch_stats)
         (_, (metrics, _new_params, new_batch_stats)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        grad_norm = optax.tree.norm(grads)
+        grad_norm = optax.global_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_batch_stats, opt_state, metrics, grad_norm
     return train_step
@@ -347,10 +347,3 @@ def run(config: ExperimentConfig) -> str:
     _run(_run_arguments(config))
     validate_artifacts(run_dir)
     return str(run_dir)
-
-
-def run_legacy_args(legacy_args: Any) -> Dict[str, float]:
-    """Compatibility adapter for ``pgm/train_pgm.py --setup sup_aux``."""
-    fields = PredictorRunArguments.__dataclass_fields__
-    args = PredictorRunArguments(**{name: getattr(legacy_args, name, field.default) for name, field in fields.items() if field.init})
-    return _run(args)

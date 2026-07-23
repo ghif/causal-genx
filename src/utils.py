@@ -167,10 +167,10 @@ def checkpoint_root_dir(save_dir: str) -> str:
     return os.path.abspath(os.path.join(save_dir, "checkpoints"))
 
 
-def experiment_run_dir(root_dir: str, hps: str, exp_name: str, default_name: str) -> str:
+def experiment_run_dir(root_dir: str, dataset_id: str, exp_name: str, default_name: str) -> str:
     if not root_dir:
         return ""
-    return os.path.join(root_dir, hps, exp_name or default_name)
+    return os.path.join(root_dir, dataset_id, exp_name or default_name)
 
 
 def materialize_nnx(graphdef, params):
@@ -178,7 +178,6 @@ def materialize_nnx(graphdef, params):
 
 
 def viz_path_for_step(save_dir: str, step: int) -> str:
-    # Keep the legacy artifact name used by the PyTorch trainer.
     return os.path.join(save_dir, f"viz-{int(step)}.png")
 
 
@@ -202,8 +201,9 @@ def sync_tree(local_dir: str, remote_dir: str) -> None:
             sync_file(local_path, os.path.join(remote_path, name))
 
 
-def _is_legacy_checkpoint_file(path: str) -> bool:
-    return path.endswith(".pt") or path.endswith(".pkl")
+def _reject_non_orbax_checkpoint(path: str) -> None:
+    if path.endswith((".pt", ".pkl")):
+        raise ValueError("Only Orbax checkpoint directories are supported; .pt and .pkl files are not supported.")
 
 
 def _checkpoint_manager(root_dir: str, *, create: bool) -> ocp.CheckpointManager:
@@ -401,13 +401,7 @@ def _load_hparams_if_present(root_dir: str, restored: Dict[str, Any]) -> None:
 
 
 def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None, custom_metadata: Optional[Dict[str, Any]] = None) -> None:
-    if _is_legacy_checkpoint_file(path):
-        ensure_parent_dir(path)
-        import pickle
-
-        with open(path, "wb") as f:
-            pickle.dump(data, f)
-        return
+    _reject_non_orbax_checkpoint(path)
 
     path = os.path.abspath(path)
     ensure_dir(path)
@@ -508,8 +502,7 @@ AsyncCheckpointWriter = BackgroundArtifactWriter
 def resolve_checkpoint_path(path: str, allow_incomplete: bool = False) -> str:
     """Resolve a checkpoint root to the exact file or numeric Orbax step restored."""
     path = path.rstrip("/")
-    if _is_legacy_checkpoint_file(path):
-        return path
+    _reject_non_orbax_checkpoint(path)
 
     if _is_orbax_step_dir(path):
         if allow_incomplete or _is_complete_orbax_step_dir(path):
@@ -520,7 +513,7 @@ def resolve_checkpoint_path(path: str, allow_incomplete: bool = False) -> str:
             return latest
         raise ValueError(
             f"Checkpoint {path} is missing commit_success.txt. "
-            "Pass allow_incomplete=True (infer.py: --trust_incomplete_checkpoint) "
+            "Enable workflow.trust_incomplete_checkpoint to restore it anyway. "
             "to restore it anyway."
         )
 
@@ -548,8 +541,6 @@ def resolve_checkpoint_path(path: str, allow_incomplete: bool = False) -> str:
 
 
 def checkpoint_is_complete(path: str) -> bool:
-    if _is_legacy_checkpoint_file(path):
-        return True
     return _is_complete_orbax_step_dir(path)
 
 
@@ -561,12 +552,6 @@ def load_checkpoint_with_path(
     partial_restore: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     resolved_path = resolve_checkpoint_path(path, allow_incomplete=allow_incomplete)
-    if _is_legacy_checkpoint_file(resolved_path):
-        import pickle
-
-        with open(resolved_path, "rb") as f:
-            return pickle.load(f), resolved_path
-
     restored = _restore_orbax_step_direct(
         resolved_path,
         template,
@@ -801,7 +786,7 @@ def write_images(args, model, params, batch, rng_key=None, step: Optional[int] =
         sample, _ = model.sample(parents=pa_jax, return_loc=True, t=temp, rng=rng_key)
         rows.append(postprocess(sample))
 
-    if "morphomnist" in getattr(args, "hps", ""):
+    if getattr(args, "dataset_id", "") == "morphomnist":
         base_pa = np.asarray(pa)[:bs]
         if base_pa.ndim == 4:
             base_pa = base_pa[:, 0, 0, :]

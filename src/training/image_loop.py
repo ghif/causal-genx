@@ -137,7 +137,7 @@ def make_train_step(graphdef, tx, ema_decay: float, grad_skip: float):
             return loss_fn(graphdef, p, batch, beta, rng)
 
         (loss, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
-        grad_norm = optax.tree.norm(grads)
+        grad_norm = optax.global_norm(grads)
         valid = jnp.logical_and(jnp.isfinite(loss), jnp.isfinite(out["nll"]))
         valid = jnp.logical_and(valid, jnp.isfinite(out["kl"]))
         valid = jnp.logical_and(valid, jnp.isfinite(grad_norm))
@@ -173,7 +173,7 @@ def make_pmap_train_step(graphdef, tx, ema_decay: float, grad_skip: float, devic
             return loss_fn(graphdef, p, batch, beta, rng)
 
         (loss, out), grads = jax.value_and_grad(_loss, has_aux=True)(params)
-        grad_norm = optax.tree.norm(grads)
+        grad_norm = optax.global_norm(grads)
         local_valid = jnp.logical_and(jnp.isfinite(loss), jnp.isfinite(out["nll"]))
         local_valid = jnp.logical_and(local_valid, jnp.isfinite(out["kl"]))
         local_valid = jnp.logical_and(local_valid, jnp.isfinite(grad_norm))

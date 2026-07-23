@@ -6,13 +6,12 @@ import os
 import random
 import struct
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import jax.numpy as jnp
 import numpy as np
 from PIL import Image, ImageOps
 
-from hps import Hparams
 from utils import log_standardize, normalize
 from contracts import Batch, CausalGraphSpec, DatasetSpec, ImageSpec, VariableKind, VariableSpec
 
@@ -191,22 +190,32 @@ def _batch_eval_transform(x, pad=2, input_res=32):
     return np.concatenate(out, axis=0)
 
 
-def morphomnist(args: Hparams) -> Dict[str, MorphoMNIST]:
-    if not args.data_dir:
-        args.data_dir = "gs://medical-airnd/causal-gen/datasets/morphomnist"
+class MorphoMNISTSettings(Protocol):
+    data_dir: str
+    pad: int
+    input_res: int
+    parents_x: list[str]
+    context_norm: str
+    concat_pa: bool
+
+
+def morphomnist(settings: MorphoMNISTSettings) -> Dict[str, MorphoMNIST]:
+    """Build the three MorphoMNIST splits from native stage settings."""
+    if not settings.data_dir:
+        raise ValueError("MorphoMNIST requires an explicit dataset.root")
     datasets = {}
     for split in ["train", "valid", "test"]:
         datasets[split] = MorphoMNIST(
-            root_dir=args.data_dir,
+            root_dir=settings.data_dir,
             train=(split == "train"),
-            transform=(lambda x, split=split: _train_transform(x, pad=args.pad, input_res=args.input_res))
+            transform=(lambda x, split=split: _train_transform(x, pad=settings.pad, input_res=settings.input_res))
             if split == "train"
-            else (lambda x, split=split: _eval_transform(x, pad=2, input_res=args.input_res)),
-            columns=args.parents_x,
-            norm=args.context_norm,
-            concat_pa=args.concat_pa,
-            pad=args.pad,
-            input_res=args.input_res,
+            else (lambda x, split=split: _eval_transform(x, pad=2, input_res=settings.input_res)),
+            columns=settings.parents_x,
+            norm=settings.context_norm,
+            concat_pa=settings.concat_pa,
+            pad=settings.pad,
+            input_res=settings.input_res,
         )
     return datasets
 

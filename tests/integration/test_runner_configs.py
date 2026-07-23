@@ -15,6 +15,7 @@ def test_each_standalone_config_validates_with_runner():
         ("train-scm", "morphomnist_scm.yaml"),
         ("train-predictor", "morphomnist_predictor.yaml"),
         ("finetune-counterfactual", "morphomnist_counterfactual.yaml"),
+        ("infer", "morphomnist_inference.yaml"),
     ):
         result = subprocess.run(
             [sys.executable, "scripts/run.py", command, "--config", f"configs/{config}", "--dry-run"],
@@ -26,7 +27,7 @@ def test_each_standalone_config_validates_with_runner():
         assert f"stage={command}" in result.stdout
 
 
-def test_scm_dry_run_reports_legacy_run_directory():
+def test_scm_dry_run_reports_run_directory():
     result = subprocess.run(
         [sys.executable, "scripts/run.py", "train-scm", "--config", "configs/morphomnist_scm.yaml", "--dry-run"],
         cwd=ROOT,
@@ -39,7 +40,7 @@ def test_scm_dry_run_reports_legacy_run_directory():
     assert str(expected) in result.stdout
 
 
-def test_counterfactual_dry_run_reports_legacy_cf_directory():
+def test_counterfactual_dry_run_reports_cf_directory():
     result = subprocess.run(
         [sys.executable, "scripts/run.py", "finetune-counterfactual", "--config", "configs/morphomnist_counterfactual.yaml", "--dry-run"],
         cwd=ROOT,

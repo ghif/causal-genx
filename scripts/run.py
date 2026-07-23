@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "finetune-counterfactual":
             output = ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name / "cf"
         else:
-            output = config.artifacts.root
+            output = ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name / "inference"
         print(f"validated stage={config.workflow.type} output={output}")
         return 0
     if args.dry_run_image:
