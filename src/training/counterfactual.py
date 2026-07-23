@@ -192,6 +192,12 @@ def _portable_cf_state(state: Dict[str, Any], *, replicated: bool) -> Dict[str, 
     return portable
 
 
+def _host_lmbda(state: Dict[str, Any], *, replicated: bool) -> float:
+    """Read the synchronized scalar multiplier for host logging."""
+    value = _first_local_replica(state["lmbda"]) if replicated else state["lmbda"]
+    return float(np.asarray(value))
+
+
 def _restore_args(args, checkpoint):
     saved = checkpoint.get("hparams", {})
     preserved = {
@@ -1392,7 +1398,7 @@ def main(args):
                 writer.add_scalar("speed/eta_sec", eta_sec, state["step"])
                 for key, value in diagnostics.items():
                     writer.add_scalar(f"train/{key}", value, state["step"])
-                writer.add_scalar("train/lmbda", float(state["lmbda"]), state["step"])
+                writer.add_scalar("train/lmbda", _host_lmbda(state, replicated=use_tpu_pmap), state["step"])
                 speed_window_t0 = sync_t0
                 speed_window_step = batch_index
                 speed_window_samples = seen
@@ -1434,14 +1440,14 @@ def main(args):
         total_time = time.perf_counter() - epoch_t0
         _write_epoch_summary(
             writer, epoch=epoch + 1, step=state["step"], train_stats=train_stats,
-            lmbda=float(state["lmbda"]), diagnostics=diagnostics,
+            lmbda=_host_lmbda(state, replicated=use_tpu_pmap), diagnostics=diagnostics,
             train_time=train_time, total_time=total_time,
             iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
             validation=validation,
         )
         _log_epoch_summary(
             logger, epoch=epoch + 1, step=state["step"], train_stats=train_stats,
-            lmbda=float(state["lmbda"]), diagnostics=diagnostics,
+            lmbda=_host_lmbda(state, replicated=use_tpu_pmap), diagnostics=diagnostics,
             train_time=train_time, total_time=total_time,
             iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
             validation=validation,
