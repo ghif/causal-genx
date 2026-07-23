@@ -16,13 +16,13 @@ model:
 optimizer:
   lr: 0.0001
   weight_decay: 0.1
-  batch_size: 32
+  batch_size: 512
 runtime:
   accelerator: cpu
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: cf_jax-cpu_23-07-2026
+  run_name: cf_jax-tpu-v6e4_23-07-2026
   remote_root: gs://medical-airnd/causal-gen/checkpoints
 workflow:
   type: finetune-counterfactual
@@ -31,7 +31,7 @@ workflow:
   image_model_checkpoint: gs://medical-airnd/causal-gen/checkpoints/morphomnist/hvae_jax-tpu-v6e4-v2_23-07-2026/checkpoints
   epochs: 500
   speed_log_freq: 50
-  checkpoint_freq: 1
+  checkpoint_freq: 5
   alpha: 0.1
   lmbda_init: 0.0
   lr_lagrange: 0.01
