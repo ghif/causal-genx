@@ -134,19 +134,25 @@ def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
 
 
 def _validate_scope(args: ScmRunArguments) -> None:
-    if args.dataset != "morphomnist":
-        raise ValueError("SCM training currently supports only dataset=morphomnist")
+    if args.dataset not in {"morphomnist", "cxr_rait"}:
+        raise ValueError("SCM training currently supports dataset=morphomnist or dataset=cxr_rait")
     if args.precision != "fp32":
-        raise ValueError("MorphoMNIST SCM parity requires precision=fp32")
-    if args.input_channels != 1 or args.input_res != 32 or args.pad != 4:
-        raise ValueError("MorphoMNIST SCM requires input_channels=1, input_res=32, and pad=4")
+        raise ValueError("SCM training requires precision=fp32")
 
 
 def _configure_dataset_args(args: ScmRunArguments) -> None:
-    args.parents_x = ["thickness", "intensity", "digit"]
-    args.context_norm = "[-1,1]"
-    args.context_dim = 12
-    args.concat_pa = False
+    if args.dataset == "cxr_rait":
+        from data.cxr_rait import CXR_RAIT_SCHEMA
+        args.parents_x = list(CXR_RAIT_SCHEMA.variable_names)
+        args.context_norm = "[-1,1]"
+        args.context_dim = CXR_RAIT_SCHEMA.encoded_dim
+        args.concat_pa = False
+    else:
+        from data.morphomnist import MORPHOMNIST_SCHEMA
+        args.parents_x = list(MORPHOMNIST_SCHEMA.variable_names)
+        args.context_norm = "[-1,1]"
+        args.context_dim = MORPHOMNIST_SCHEMA.encoded_dim
+        args.concat_pa = False
 
 
 def _setup_logging(args: ScmRunArguments) -> logging.Logger:
@@ -158,19 +164,22 @@ def _setup_logging(args: ScmRunArguments) -> logging.Logger:
         handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt"), mode="a")],
         force=True,
     )
-    return logging.getLogger(args.exp_name or "morphomnist-pgm")
+    return logging.getLogger(args.exp_name or f"{args.dataset}-pgm")
 
 
 def preprocess(batch: Dict[str, np.ndarray]) -> Dict[str, jax.Array]:
     x = np.asarray(batch["x"], dtype=np.float32)
     if x.max(initial=0.0) > 1.5:
         x = (x - 127.5) / 127.5
-    return {
-        "x": jnp.asarray(x),
-        "thickness": jnp.asarray(batch["thickness"], dtype=jnp.float32).reshape((-1, 1)),
-        "intensity": jnp.asarray(batch["intensity"], dtype=jnp.float32).reshape((-1, 1)),
-        "digit": jnp.asarray(batch["digit"], dtype=jnp.float32),
-    }
+    processed = {"x": jnp.asarray(x)}
+    for k, v in batch.items():
+        if k == "x":
+            continue
+        v_arr = jnp.asarray(v, dtype=jnp.float32)
+        if v_arr.ndim == 1:
+            v_arr = v_arr.reshape((-1, 1))
+        processed[k] = v_arr
+    return processed
 
 
 def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bool, rng: np.random.Generator) -> Iterator[Dict[str, jax.Array]]:
@@ -189,9 +198,15 @@ def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bo
 
 def _loss(graphdef: Any, params: Any, batch: Dict[str, jax.Array]):
     model = materialize_nnx(graphdef, params)
-    log_probs = model.log_prob(batch["thickness"], batch["intensity"], batch["digit"])
+    if "age" in batch and "sex" in batch and "tb_status" in batch:
+        log_probs = model.log_prob(batch["age"], batch["sex"], batch["tb_status"])
+        var_names = ("age", "sex", "tb_status")
+    else:
+        log_probs = model.log_prob(batch["thickness"], batch["intensity"], batch["digit"])
+        var_names = ("digit", "thickness", "intensity")
     loss = -jnp.mean(log_probs["joint"])
-    return loss, {"loss": loss, **{f"logp({name})": jnp.mean(log_probs[name]) for name in ("digit", "thickness", "intensity")}}
+    return loss, {"loss": loss, **{f"logp({name})": jnp.mean(log_probs[name]) for name in var_names}}
+
 
 
 def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation):
@@ -244,7 +259,7 @@ def _eval_epoch(graphdef: Any, params: Any, dataset: Any, batch_size: int, rng: 
     count = 0
     for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
         _, metrics = _loss(graphdef, params, batch)
-        size = int(batch["digit"].shape[0])
+        size = int(next(iter(batch.values())).shape[0])
         for key, value in metrics.items():
             totals[key] = totals.get(key, 0.0) + float(value) * size
         count += size
@@ -261,11 +276,14 @@ def _joint_figure(x: np.ndarray, y: np.ndarray, title: str, path: str) -> None:
 
 
 def _plot_joint(args: ScmRunArguments, graphdef: Any, params: Any, dataset: Any, step: int) -> None:
+    if args.dataset == "cxr_rait":
+        return
     data_path = os.path.join(args.save_dir, "joint_data.pdf")
     if not os.path.exists(data_path):
         _joint_figure(np.asarray(dataset.samples["thickness"]), np.asarray(dataset.samples["intensity"]), "Data Joint", data_path)
     samples = materialize_nnx(graphdef, params).sample(args.plot_samples, jax.random.PRNGKey(args.seed + step))
     _joint_figure(np.asarray(samples["thickness"]).squeeze(), np.asarray(samples["intensity"]).squeeze(), f"Model Joint (step {step})", os.path.join(args.save_dir, f"joint_model_{step}.pdf"))
+
 
 
 def _sync_pdf_artifacts(args: ScmRunArguments) -> None:
