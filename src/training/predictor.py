@@ -542,8 +542,9 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     checkpoint: Optional[Dict[str, Any]] = load_checkpoint(args.load_path) if args.load_path else None
     if checkpoint is not None: _restore_args(args, checkpoint)
     _validate_scope(args); _validate_runtime_device(args); dtype = _compute_dtype(args); _configure_dataset_args(args); seed_all(args.seed, args.deterministic)
-    args.save_dir = experiment_run_dir(args.ckpt_dir, "morphomnist", args.exp_name, "pgm")
-    args.checkpoint_dir = checkpoint_root_dir(args.save_dir); args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, "morphomnist", args.exp_name, "pgm")
+    args.save_dir = experiment_run_dir(args.ckpt_dir, args.dataset, args.exp_name, "pgm")
+    args.checkpoint_dir = checkpoint_root_dir(args.save_dir); args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.dataset, args.exp_name, "pgm")
+
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
     logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets, train_dataset = _build_datasets(args); valid_dataset = datasets["valid"]
     if args.dataset == "cxr_rait":

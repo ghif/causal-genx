@@ -423,15 +423,17 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
     if args.load_path:
         checkpoint = load_checkpoint(args.load_path); _restore_args(args, checkpoint); _validate_scope(args)
     _configure_dataset_args(args); seed_all(args.seed, args.deterministic)
-    args.save_dir = experiment_run_dir(args.ckpt_dir, "morphomnist", args.exp_name, "pgm")
+    args.save_dir = experiment_run_dir(args.ckpt_dir, args.dataset, args.exp_name, "pgm")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
-    args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, "morphomnist", args.exp_name, "pgm")
+    args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.dataset, args.exp_name, "pgm")
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
     logger = _setup_logging(args); writer = SummaryWriter(args.save_dir)
     if args.dataset == "cxr_rait":
-        from data.cxr_rait import CxrRaitPGM, cxr_rait
+        from causal.cxr_rait_scm import CxrRaitPGM
+        from data.cxr_rait import cxr_rait
         datasets = cxr_rait(args)
         model = CxrRaitPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
+
     else:
         datasets = morphomnist(args)
         model = MorphoMNISTPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
