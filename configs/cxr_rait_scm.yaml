@@ -22,7 +22,7 @@ runtime:
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: scm_cxr_rait
+  run_name: scm_jax-cpu_27-07-2026
   remote_root: ""
 workflow:
   type: train-scm
