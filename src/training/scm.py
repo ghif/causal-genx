@@ -409,10 +409,16 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir)
     args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, "morphomnist", args.exp_name, "pgm")
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
-    # Build data and model only after resume metadata has restored model settings.
-    logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets = morphomnist(args)
-    model = MorphoMNISTPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
+    logger = _setup_logging(args); writer = SummaryWriter(args.save_dir)
+    if args.dataset == "cxr_rait":
+        from data.cxr_rait import CxrRaitPGM, cxr_rait
+        datasets = cxr_rait(args)
+        model = CxrRaitPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
+    else:
+        datasets = morphomnist(args)
+        model = MorphoMNISTPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
     graphdef, _ = nnx.split(model, nnx.Param); params = nnx.state(model, nnx.Param).to_pure_dict()
+
     optimizer = optax.chain(optax.clip_by_global_norm(200.0), optax.adamw(args.lr, b1=0.9, b2=0.999, eps=1e-8, weight_decay=args.wd))
     opt_state = optimizer.init(params); ema = PGMEMA.init_from(params); start_epoch = step = 0; best_loss = float("inf")
     if checkpoint is not None:

@@ -156,12 +156,32 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
 
 
 def _validate_scope(args: PredictorRunArguments) -> None:
-    if args.dataset != "morphomnist":
-        raise ValueError("Predictor training currently supports only dataset=morphomnist")
+    if args.dataset not in {"morphomnist", "cxr_rait"}:
+        raise ValueError("Predictor training currently supports dataset=morphomnist or dataset=cxr_rait")
     if args.accelerator == "cpu" and args.precision != "fp32":
         raise ValueError("CPU predictor training requires precision=fp32")
-    if args.input_channels != 1 or args.input_res != 32 or args.pad != 4:
-        raise ValueError("MorphoMNIST predictor requires input_channels=1, input_res=32, and pad=4")
+
+
+def _configure_dataset_args(args: PredictorRunArguments) -> None:
+    if args.dataset == "cxr_rait":
+        from data.cxr_rait import CXR_RAIT_SCHEMA
+        args.parents_x = list(CXR_RAIT_SCHEMA.variable_names)
+        args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", CXR_RAIT_SCHEMA.encoded_dim, False
+    else:
+        from data.morphomnist import MORPHOMNIST_SCHEMA
+        args.parents_x = list(MORPHOMNIST_SCHEMA.variable_names)
+        args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", MORPHOMNIST_SCHEMA.encoded_dim, False
+
+
+def _build_datasets(args: PredictorRunArguments):
+    if args.dataset == "cxr_rait":
+        from data.cxr_rait import cxr_rait
+        datasets = cxr_rait(args)
+    else:
+        datasets = morphomnist(args)
+    indices = np.arange(len(datasets["train"]))
+    rng = np.random.RandomState(1); rng.shuffle(indices)
+    return datasets, _IndexedDataset(datasets["train"], indices[:int(args.sup_frac * len(indices))])
 
 
 def _validate_runtime_device(args: PredictorRunArguments) -> jax.Device:
@@ -241,18 +261,6 @@ def _use_tpu_replication(args: PredictorRunArguments) -> bool:
     if requested_mode == "replicated" and not multi_tpu_available:
         raise ValueError("execution_mode=replicated requires accelerator=tpu with multiple local devices")
     return multi_tpu_available and requested_mode != "single_device"
-
-
-def _configure_dataset_args(args: PredictorRunArguments) -> None:
-    args.parents_x = ["thickness", "intensity", "digit"]
-    args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", 12, False
-
-
-def _build_datasets(args: PredictorRunArguments):
-    datasets = morphomnist(args)
-    indices = np.arange(len(datasets["train"]))
-    rng = np.random.RandomState(1); rng.shuffle(indices)
-    return datasets, _IndexedDataset(datasets["train"], indices[:int(args.sup_frac * len(indices))])
 
 
 def _merge(graphdef: Any, params: Any, batch_stats: Any):
@@ -537,9 +545,14 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     args.save_dir = experiment_run_dir(args.ckpt_dir, "morphomnist", args.exp_name, "pgm")
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir); args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, "morphomnist", args.exp_name, "pgm")
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
-    # The labelled subset is deterministic, making partial-supervision runs reproducible.
     logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets, train_dataset = _build_datasets(args); valid_dataset = datasets["valid"]
-    model = MorphoMNISTSupAuxPredictor(input_channels=args.input_channels, input_res=args.input_res, width=8, std_fixed=args.std_fixed, compute_dtype=dtype, rngs=nnx.Rngs(args.seed))
+    if args.dataset == "cxr_rait":
+
+        from causal.cxr_rait_predictor import CxrRaitSupAuxPredictor
+        model = CxrRaitSupAuxPredictor(input_channels=args.input_channels, input_res=args.input_res, width=16, std_fixed=args.std_fixed, compute_dtype=dtype, rngs=nnx.Rngs(args.seed))
+    else:
+        model = MorphoMNISTSupAuxPredictor(input_channels=args.input_channels, input_res=args.input_res, width=8, std_fixed=args.std_fixed, compute_dtype=dtype, rngs=nnx.Rngs(args.seed))
+
     graphdef, params_state, batch_stats_state = nnx.split(model, nnx.Param, nnx.BatchStat); model_params, model_batch_stats = params_state.to_pure_dict(), batch_stats_state.to_pure_dict()
     optimizer = optax.chain(optax.clip_by_global_norm(200.0), optax.adamw(args.lr, b1=0.9, b2=0.999, eps=1e-8, weight_decay=args.wd)); opt_state = optimizer.init(model_params); ema = WarmupEMA.init_from(model_params, model_batch_stats)
     start_epoch = step = 0; best_loss = float("inf")
@@ -662,7 +675,7 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
                 train_time=train_time, total_time=total_time,
                 iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
             )
-            checkpoint_due = _checkpoint_due(epoch + 1, args.checkpoint_freq)
+            checkpoint_due = _checkpoint_due(epoch + 1, getattr(args, "checkpoint_freq", 1))
             if checkpoint_due and valid_stats["loss"] < best_loss:
                 best_loss = valid_stats["loss"]
                 _submit_best_checkpoint(
