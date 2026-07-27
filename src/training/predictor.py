@@ -535,7 +535,10 @@ def _assert_compatible_checkpoint(checkpoint: Dict[str, Any], params: Any, batch
 
 def _setup_logging(args: PredictorRunArguments) -> logging.Logger:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s, %(message)s", datefmt="%d-%b-%y %H:%M:%S", handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt"), mode="a")], force=True)
-    return logging.getLogger(args.exp_name or "morphomnist-predictor")
+    logging.getLogger("orbax").setLevel(logging.WARNING)
+    logging.getLogger("absl").setLevel(logging.WARNING)
+    return logging.getLogger(args.exp_name or f"{args.dataset}-predictor")
+
 
 
 def _run(args: PredictorRunArguments) -> Dict[str, float]:

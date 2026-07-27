@@ -382,7 +382,7 @@ def _restore_orbax_step_direct(
 
 
 @contextmanager
-def _orbax_warning_filter(enabled: bool):
+def _orbax_warning_filter(enabled: bool = True):
     if not enabled:
         yield
         return
@@ -391,10 +391,19 @@ def _orbax_warning_filter(enabled: bool):
 
     previous_verbosity = absl_logging.get_verbosity()
     absl_logging.set_verbosity(absl_logging.ERROR)
+    orbax_logger = logging.getLogger("orbax")
+    absl_logger = logging.getLogger("absl")
+    prev_orbax_level = orbax_logger.level
+    prev_absl_level = absl_logger.level
+    orbax_logger.setLevel(logging.WARNING)
+    absl_logger.setLevel(logging.WARNING)
     try:
         yield
     finally:
         absl_logging.set_verbosity(previous_verbosity)
+        orbax_logger.setLevel(prev_orbax_level)
+        absl_logger.setLevel(prev_absl_level)
+
 
 
 def _load_hparams_if_present(root_dir: str, restored: Dict[str, Any]) -> None:
@@ -416,16 +425,18 @@ def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None,
         metadata.setdefault("hparams", hparams)
         with open(os.path.join(path, "hparams.json"), "w", encoding="utf-8") as f:
             json.dump(hparams, f, indent=2, sort_keys=True)
-    manager = _checkpoint_manager(path, create=True)
-    try:
-        save_step = int(step if step is not None else data.get("step", 0))
-        manager.save(
-            save_step,
-            args=ocp.args.StandardSave(item=item, custom_metadata=metadata),
-        )
-        manager.wait_until_finished()
-    finally:
-        manager.close()
+    with _orbax_warning_filter(True):
+        manager = _checkpoint_manager(path, create=True)
+        try:
+            save_step = int(step if step is not None else data.get("step", 0))
+            manager.save(
+                save_step,
+                args=ocp.args.StandardSave(item=item, custom_metadata=metadata),
+            )
+            manager.wait_until_finished()
+        finally:
+            manager.close()
+
 
 
 def _save_checkpoint_and_sync(

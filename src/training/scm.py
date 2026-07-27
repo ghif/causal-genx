@@ -164,7 +164,10 @@ def _setup_logging(args: ScmRunArguments) -> logging.Logger:
         handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt"), mode="a")],
         force=True,
     )
+    logging.getLogger("orbax").setLevel(logging.WARNING)
+    logging.getLogger("absl").setLevel(logging.WARNING)
     return logging.getLogger(args.exp_name or f"{args.dataset}-pgm")
+
 
 
 def preprocess(batch: Dict[str, np.ndarray]) -> Dict[str, jax.Array]:
