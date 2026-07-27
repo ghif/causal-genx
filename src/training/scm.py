@@ -471,7 +471,8 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
             ):
                 params, opt_state, metrics, grad_norm = train_step(params, opt_state, batch)
                 ema.update(params)
-                size = int(batch["digit"].shape[0])
+                size = int(next(iter(batch.values())).shape[0])
+
                 for key, value in metrics.items():
                     totals[key] = totals.get(key, 0.0) + float(value) * size
                 seen += size; step += 1; last_grad_norm = float(grad_norm)

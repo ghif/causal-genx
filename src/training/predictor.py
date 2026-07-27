@@ -356,7 +356,8 @@ def _eval_epoch(graphdef: Any, params: Any, batch_stats: Any, dataset: Any, batc
     totals: Dict[str, float] = {}; count = 0
     for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
         _, metrics, _, _ = _loss_and_state(graphdef, params, batch_stats, batch, training=False)
-        size = int(batch["digit"].shape[0])
+        size = int(next(iter(batch.values())).shape[0])
+
         for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
         count += size
     return {key: value / max(1, count) for key, value in totals.items()}
@@ -615,11 +616,12 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             ):
                 if use_tpu_pmap:
                     batch = _shard_batch(batch, devices)
-                model_params, model_batch_stats, opt_state, metrics, grad_norm = train_step(model_params, model_batch_stats, opt_state, batch); ema.update(model_params, model_batch_stats); size = int(batch["digit"].shape[0])
+                model_params, model_batch_stats, opt_state, metrics, grad_norm = train_step(model_params, model_batch_stats, opt_state, batch); ema.update(model_params, model_batch_stats); size = int(next(iter(batch.values())).shape[0])
                 if use_tpu_pmap:
                     metrics = _unreplicate(metrics)
                     grad_norm = _first_local_replica(grad_norm)
-                    size *= int(batch["digit"].shape[1])
+                    size *= int(next(iter(batch.values())).shape[1])
+
                 for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
                 seen += size; step += 1
                 if batch_index % max(1, getattr(args, "speed_log_freq", 50)) == 0:
