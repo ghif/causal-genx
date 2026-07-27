@@ -69,18 +69,36 @@ def _load_cxr_rait_metadata(metadata_path: str) -> Dict[str, Dict[str, float]]:
         pid = str(row.get("Patient ID", "")).strip()
         if not pid or pid == "nan":
             continue
-        try:
-            age = float(row.get("Usia", 0.0))
-        except (ValueError, TypeError):
-            age = 0.0
 
+        # Parse Age across possible shifted columns ('Usia', 'Birth', 'Unnamed: 15')
+        age = None
+        for candidate_col in ["Usia", "Birth", "Unnamed: 15"]:
+            val_raw = row.get(candidate_col, None)
+            try:
+                if val_raw is not None and not pd.isna(val_raw):
+                    val = float(val_raw)
+                    if 0.0 < val < 110.0:
+                        age = val
+                        break
+            except (ValueError, TypeError):
+                pass
+        if age is None:
+            age = 45.0  # Median fallback if missing
+
+        # Parse Sex ('Gender')
         gender_raw = row.get("Gender", "")
         g_str = str(gender_raw).strip().upper()
         sex = 1.0 if g_str in ("1", "1.0", "M", "L", "MALE", "LAKI-LAKI") else 0.0
 
-
-        bta_val = str(row.get("BTA", "0")).strip()
-        tb_status = 1.0 if bta_val in ("1", "+") else 0.0
+        # Parse TB status ('BTA.1' or 'BTA')
+        tb_status = 0.0
+        bta1_raw = row.get("BTA.1", None)
+        try:
+            if bta1_raw is not None and not pd.isna(bta1_raw):
+                tb_status = 1.0 if float(bta1_raw) == 1.0 else 0.0
+        except (ValueError, TypeError):
+            bta0_str = str(row.get("BTA", "0")).strip()
+            tb_status = 1.0 if bta0_str in ("1", "+") else 0.0
 
         metadata[pid] = {
             "age": age,
@@ -88,6 +106,7 @@ def _load_cxr_rait_metadata(metadata_path: str) -> Dict[str, Dict[str, float]]:
             "tb_status": tb_status,
         }
     return metadata
+
 
 
 class CxrRaitDataset:
