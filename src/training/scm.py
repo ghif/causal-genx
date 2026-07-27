@@ -266,23 +266,40 @@ def _eval_epoch(graphdef: Any, params: Any, dataset: Any, batch_size: int, rng: 
     return _mean_metrics(totals, count)
 
 
-def _joint_figure(x: np.ndarray, y: np.ndarray, title: str, path: str) -> None:
+def _joint_figure(x: np.ndarray, y: np.ndarray, title: str, path: str, xlabel: str = "thickness", ylabel: str = "intensity") -> None:
     figure = plt.figure(figsize=(6, 6))
     grid = figure.add_gridspec(4, 4, hspace=0.05, wspace=0.05)
     joint = figure.add_subplot(grid[1:, :3]); top = figure.add_subplot(grid[0, :3], sharex=joint); right = figure.add_subplot(grid[1:, 3], sharey=joint)
     joint.scatter(x, y, s=2, alpha=0.2); top.hist(x, bins=50); right.hist(y, bins=50, orientation="horizontal")
-    joint.set_xlabel("thickness"); joint.set_ylabel("intensity"); figure.suptitle(title)
+    joint.set_xlabel(xlabel); joint.set_ylabel(ylabel); figure.suptitle(title)
     figure.savefig(path, bbox_inches="tight"); plt.close(figure)
 
 
 def _plot_joint(args: ScmRunArguments, graphdef: Any, params: Any, dataset: Any, step: int) -> None:
-    if args.dataset == "cxr_rait":
-        return
     data_path = os.path.join(args.save_dir, "joint_data.pdf")
-    if not os.path.exists(data_path):
-        _joint_figure(np.asarray(dataset.samples["thickness"]), np.asarray(dataset.samples["intensity"]), "Data Joint", data_path)
-    samples = materialize_nnx(graphdef, params).sample(args.plot_samples, jax.random.PRNGKey(args.seed + step))
-    _joint_figure(np.asarray(samples["thickness"]).squeeze(), np.asarray(samples["intensity"]).squeeze(), f"Model Joint (step {step})", os.path.join(args.save_dir, f"joint_model_{step}.pdf"))
+    if args.dataset == "cxr_rait":
+        if not os.path.exists(data_path):
+            x_data = np.asarray(dataset.samples["age"]).squeeze()
+            y_data = np.asarray(dataset.samples["tb_status"])
+            if y_data.ndim > 1 and y_data.shape[1] > 1:
+                y_data = np.argmax(y_data, axis=1)
+            else:
+                y_data = y_data.squeeze()
+            _joint_figure(x_data, y_data, "CXR-RAIT Data Joint (age vs tb_status)", data_path, xlabel="age", ylabel="tb_status")
+        samples = materialize_nnx(graphdef, params).sample(args.plot_samples, jax.random.PRNGKey(args.seed + step))
+        x_model = np.asarray(samples["age"]).squeeze()
+        y_model = np.asarray(samples["tb_status"])
+        if y_model.ndim > 1 and y_model.shape[1] > 1:
+            y_model = np.argmax(y_model, axis=1)
+        else:
+            y_model = y_model.squeeze()
+        _joint_figure(x_model, y_model, f"CXR-RAIT Model Joint (step {step})", os.path.join(args.save_dir, f"joint_model_{step}.pdf"), xlabel="age", ylabel="tb_status")
+    else:
+        if not os.path.exists(data_path):
+            _joint_figure(np.asarray(dataset.samples["thickness"]), np.asarray(dataset.samples["intensity"]), "Data Joint", data_path)
+        samples = materialize_nnx(graphdef, params).sample(args.plot_samples, jax.random.PRNGKey(args.seed + step))
+        _joint_figure(np.asarray(samples["thickness"]).squeeze(), np.asarray(samples["intensity"]).squeeze(), f"Model Joint (step {step})", os.path.join(args.save_dir, f"joint_model_{step}.pdf"))
+
 
 
 
