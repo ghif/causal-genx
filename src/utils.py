@@ -381,28 +381,30 @@ def _restore_orbax_step_direct(
             manager.close()
 
 
+def silence_orbax_logging() -> None:
+    """Quiet Orbax and ABSL loggers across all background threads."""
+    try:
+        from absl import logging as absl_logging
+        absl_logging.set_verbosity(absl_logging.ERROR)
+    except Exception:
+        pass
+    for name in ("orbax", "orbax.checkpoint", "absl"):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
+
+
 @contextmanager
 def _orbax_warning_filter(enabled: bool = True):
     if not enabled:
         yield
         return
-
-    from absl import logging as absl_logging
-
-    previous_verbosity = absl_logging.get_verbosity()
-    absl_logging.set_verbosity(absl_logging.ERROR)
-    orbax_logger = logging.getLogger("orbax")
-    absl_logger = logging.getLogger("absl")
-    prev_orbax_level = orbax_logger.level
-    prev_absl_level = absl_logger.level
-    orbax_logger.setLevel(logging.WARNING)
-    absl_logger.setLevel(logging.WARNING)
+    silence_orbax_logging()
     try:
         yield
     finally:
-        absl_logging.set_verbosity(previous_verbosity)
-        orbax_logger.setLevel(prev_orbax_level)
-        absl_logger.setLevel(prev_absl_level)
+        silence_orbax_logging()
+
 
 
 
@@ -483,6 +485,7 @@ class BackgroundArtifactWriter:
         self._worker.start()
 
     def _run(self) -> None:
+        silence_orbax_logging()
         while True:
             with self._condition:
                 while self._pending is None and not self._closed:
@@ -494,7 +497,9 @@ class BackgroundArtifactWriter:
                 self._pending = None
                 self._running = True
             try:
+                silence_orbax_logging()
                 fn(*args, **kwargs)
+
             except BaseException as exc:  # surfaced by flush/close on the host
                 with self._condition:
                     if self._error is None:
