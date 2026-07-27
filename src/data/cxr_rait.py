@@ -74,8 +74,10 @@ def _load_cxr_rait_metadata(metadata_path: str) -> Dict[str, Dict[str, float]]:
         except (ValueError, TypeError):
             age = 0.0
 
-        gender_str = str(row.get("Gender", "M")).strip().upper()
-        sex = 1.0 if gender_str.startswith("M") else 0.0
+        gender_raw = row.get("Gender", "")
+        g_str = str(gender_raw).strip().upper()
+        sex = 1.0 if g_str in ("1", "1.0", "M", "L", "MALE", "LAKI-LAKI") else 0.0
+
 
         bta_val = str(row.get("BTA", "0")).strip()
         tb_status = 1.0 if bta_val in ("1", "+") else 0.0
