@@ -12,6 +12,7 @@ The causal relationships strictly enforce the target directed acyclic graph (DAG
 graph TD
     Age["Age (continuous)"] --> Image["Image X (1x128x128)"]
     Sex["Sex (categorical)"] --> Image["Image X (1x128x128)"]
+    TB["TB Disease (binary)"] --> Image["Image X (1x128x128)"]
     Age["Age (continuous)"] --> TB["TB Disease (binary)"]
 ```
 
@@ -19,7 +20,8 @@ graph TD
 1. **`sex`**: Categorical / Binary ($0 = \text{Female}, 1 = \text{Male}$), `encoded_dim = 2`. Independent parent ($Pa = \emptyset$).
 2. **`age`**: Continuous (years, normalized to $[-1, 1]$). Independent parent ($Pa = \emptyset$).
 3. **`tb_status`**: Categorical / Binary ($0 = \text{TB Negative}, 1 = \text{TB Positive}$), `encoded_dim = 2`. Child of `age` ($\text{age} \rightarrow \text{tb\_status}$).
-4. **`image` ($X$)**: Grayscale chest X-ray ($1 \times 128 \times 128$), child of `age` and `sex` ($\text{age} \rightarrow X$, $\text{sex} \rightarrow X$).
+4. **`image` ($X$)**: Grayscale chest X-ray ($1 \times 128 \times 128$), child of `age`, `sex`, and `tb_status` ($\text{age} \rightarrow X$, $\text{sex} \rightarrow X$, $\text{tb\_status} \rightarrow X$).
+
 
 ---
 

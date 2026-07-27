@@ -13,10 +13,12 @@ class CxrRaitPGM(nnx.Module):
     """Structural Causal Model for CXR-RAIT demography dataset.
     
     DAG structure:
-      sex (categorical, 2D)
-      age (continuous, normalized [-1, 1])
-      age -> tb_status (categorical, 2D)
+      age -> image (X)
+      sex -> image (X)
+      tb_status -> image (X)
+      age -> tb_status
     """
+
 
     variables = {
         "age": "continuous",

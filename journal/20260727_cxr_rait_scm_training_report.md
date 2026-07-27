@@ -16,8 +16,10 @@ This report documents the optimization, convergence trajectory, and epidemiologi
 graph TD
     Age["Age (continuous)"] --> Image["Image X (1x128x128)"]
     Sex["Sex (categorical)"] --> Image["Image X (1x128x128)"]
+    TB["TB Disease (binary)"] --> Image["Image X (1x128x128)"]
     Age["Age (continuous)"] --> TB["TB Disease (binary)"]
 ```
+
 
 Key Findings:
 1. **Convergence Stability**: Training stabilized cleanly over 440 epochs (~40,800 steps), with training loss settling at **111.30** and validation loss converging at **114.02**.
