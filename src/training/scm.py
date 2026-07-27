@@ -273,9 +273,27 @@ def _joint_figure(x: np.ndarray, y: np.ndarray, title: str, path: str, xlabel: s
     figure = plt.figure(figsize=(6, 6))
     grid = figure.add_gridspec(4, 4, hspace=0.05, wspace=0.05)
     joint = figure.add_subplot(grid[1:, :3]); top = figure.add_subplot(grid[0, :3], sharex=joint); right = figure.add_subplot(grid[1:, 3], sharey=joint)
-    joint.scatter(x, y, s=2, alpha=0.2); top.hist(x, bins=50); right.hist(y, bins=50, orientation="horizontal")
+    if ylabel == "tb_status":
+        rng = np.random.default_rng(0)
+        y_jitter = y + rng.uniform(-0.04, 0.04, size=len(y))
+        joint.scatter(x, y_jitter, s=3, alpha=0.15, color="steelblue", label="Samples")
+        # Binned probability trend line
+        bins = np.linspace(x.min(), x.max(), 11)
+        bin_centers = 0.5 * (bins[:-1] + bins[1:])
+        bin_means = []
+        for i in range(len(bins) - 1):
+            mask = (x >= bins[i]) & (x < bins[i + 1])
+            bin_means.append(y[mask].mean() if mask.any() else np.nan)
+        joint.plot(bin_centers, bin_means, "r-o", linewidth=2, label="P(TB=1|age)")
+        joint.set_ylim(-0.1, 1.1)
+        joint.set_yticks([0, 1], ["0 (Neg)", "1 (Pos)"])
+        joint.legend(loc="upper left")
+    else:
+        joint.scatter(x, y, s=2, alpha=0.2)
+    top.hist(x, bins=50); right.hist(y, bins=50, orientation="horizontal")
     joint.set_xlabel(xlabel); joint.set_ylabel(ylabel); figure.suptitle(title)
     figure.savefig(path, bbox_inches="tight"); plt.close(figure)
+
 
 
 def _plot_joint(args: ScmRunArguments, graphdef: Any, params: Any, dataset: Any, step: int) -> None:
