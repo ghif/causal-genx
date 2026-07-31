@@ -201,9 +201,9 @@ def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bo
 
 def _loss(graphdef: Any, params: Any, batch: Dict[str, jax.Array]):
     model = materialize_nnx(graphdef, params)
-    if "age" in batch and "sex" in batch and "tb_status" in batch:
-        log_probs = model.log_prob(batch["age"], batch["sex"], batch["tb_status"])
-        var_names = ("age", "sex", "tb_status")
+    if "age" in batch and "gender" in batch and "tb_status" in batch:
+        log_probs = model.log_prob(batch["age"], batch["gender"], batch["tb_status"])
+        var_names = ("age", "gender", "tb_status")
     else:
         log_probs = model.log_prob(batch["thickness"], batch["intensity"], batch["digit"])
         var_names = ("digit", "thickness", "intensity")

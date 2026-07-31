@@ -14,7 +14,7 @@ class CxrRaitPGM(nnx.Module):
     
     DAG structure:
       age -> image (X)
-      sex -> image (X)
+      gender -> image (X)
       tb_status -> image (X)
       age -> tb_status
     """
@@ -22,7 +22,7 @@ class CxrRaitPGM(nnx.Module):
 
     variables = {
         "age": "continuous",
-        "sex": "categorical",
+        "gender": "categorical",
         "tb_status": "categorical",
     }
 
@@ -39,8 +39,8 @@ class CxrRaitPGM(nnx.Module):
         self.bound = float(bound)
         self.compute_dtype = compute_dtype
 
-        # Marginal Sex distribution (2 classes: Female=0, Male=1)
-        self.sex_logits = nnx.Param(jnp.zeros((1, 2), dtype=jnp.float32))
+        # Marginal Gender distribution (2 classes: Female=0, Male=1)
+        self.gender_logits = nnx.Param(jnp.zeros((1, 2), dtype=jnp.float32))
 
         # Spline parameters for Continuous Age
         self.age_widths = nnx.Param(jnp.zeros((1, self.num_bins), dtype=jnp.float32))
@@ -78,13 +78,13 @@ class CxrRaitPGM(nnx.Module):
         return self.tb_fc2(h)
 
     def log_prob(
-        self, age: jax.Array, sex: jax.Array, tb_status: jax.Array
+        self, age: jax.Array, gender: jax.Array, tb_status: jax.Array
     ) -> Dict[str, jax.Array]:
         age_base, age_logdet = self.age_inverse(age)
         age_log_prob = jnp.sum(_normal_log_prob(age_base) + age_logdet, axis=-1)
 
-        sex_log_prob = jnp.sum(
-            jnp.asarray(sex) * jax.nn.log_softmax(self.sex_logits[...], axis=-1),
+        gender_log_prob = jnp.sum(
+            jnp.asarray(gender) * jax.nn.log_softmax(self.gender_logits[...], axis=-1),
             axis=-1,
         )
 
@@ -93,20 +93,20 @@ class CxrRaitPGM(nnx.Module):
 
         return {
             "age": age_log_prob,
-            "sex": sex_log_prob,
+            "gender": gender_log_prob,
             "tb_status": tb_log_prob,
-            "joint": age_log_prob + sex_log_prob + tb_log_prob,
+            "joint": age_log_prob + gender_log_prob + tb_log_prob,
         }
 
     def sample(
         self, n_samples: int = 1, rng: Optional[jax.Array] = None
     ) -> Dict[str, jax.Array]:
         rng = jax.random.PRNGKey(0) if rng is None else rng
-        sex_key, age_key, tb_key = jax.random.split(rng, 3)
+        gender_key, age_key, tb_key = jax.random.split(rng, 3)
 
-        # Sample Sex
-        sex_idx = jax.random.categorical(sex_key, self.sex_logits[0], shape=(n_samples,))
-        sex = jax.nn.one_hot(sex_idx, 2)
+        # Sample Gender
+        gender_idx = jax.random.categorical(gender_key, self.gender_logits[0], shape=(n_samples,))
+        gender = jax.nn.one_hot(gender_idx, 2)
 
         # Sample Age
         age, _ = self.age_forward(jax.random.normal(age_key, (n_samples, 1)))
@@ -116,10 +116,10 @@ class CxrRaitPGM(nnx.Module):
         tb_idx = jax.random.categorical(tb_key, tb_logits, axis=-1)
         tb_status = jax.nn.one_hot(tb_idx, 2)
 
-        pa = jnp.concatenate([age, sex, tb_status], axis=-1)
+        pa = jnp.concatenate([age, gender, tb_status], axis=-1)
         return {
             "age": age,
-            "sex": sex,
+            "gender": gender,
             "tb_status": tb_status,
             "pa": pa,
         }
@@ -135,7 +135,7 @@ class CxrRaitPGM(nnx.Module):
         rng: Optional[jax.Array] = None,
     ) -> Dict[str, jax.Array]:
         exogeneous = self.infer_exogeneous(obs)
-        sex = jnp.asarray(intervention.get("sex", obs["sex"]))
+        gender = jnp.asarray(intervention.get("gender", obs["gender"]))
 
         if "age" in intervention:
             age = _as_column(intervention["age"])
@@ -149,10 +149,10 @@ class CxrRaitPGM(nnx.Module):
             tb_idx = jnp.argmax(tb_logits, axis=-1)
             tb_status = jax.nn.one_hot(tb_idx, 2)
 
-        pa = jnp.concatenate([age, sex, tb_status], axis=-1)
+        pa = jnp.concatenate([age, gender, tb_status], axis=-1)
         return {
             "age": age,
-            "sex": sex,
+            "gender": gender,
             "tb_status": tb_status,
             "pa": pa,
         }

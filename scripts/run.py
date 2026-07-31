@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Causal-GenX experiment runner")
-    parser.add_argument("command", choices=("train-scm", "train-predictor", "train-image-model", "finetune-counterfactual", "infer"))
+    parser.add_argument("command", choices=("train-scm", "train-predictor", "finetune-predictor", "train-image-model", "finetune-counterfactual", "infer"))
     parser.add_argument("--config", required=True, help="Fully resolved experiment YAML")
     parser.add_argument("--dry-run", action="store_true", help="Validate config and report selected workflow without training")
     parser.add_argument("--dry-run-image", action="store_true", help="Build the image model and write one visualization without training")
@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--dry-run-image is only supported for train-image-model")
     configure_backend(config.runtime.accelerator, config.runtime.gpu_id)
     if args.dry_run:
-        if args.command in {"train-scm", "train-predictor", "train-image-model"}:
+        if args.command in {"train-scm", "train-predictor", "finetune-predictor", "train-image-model"}:
             output = ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name
         elif args.command == "finetune-counterfactual":
             output = ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name / "cf"
@@ -63,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     stage_modules = {
         "train-scm": "training.scm",
         "train-predictor": "training.predictor",
+        "finetune-predictor": "training.predictor",
         "train-image-model": "training.image_model",
         "finetune-counterfactual": "training.counterfactual",
         "infer": "training.inference",

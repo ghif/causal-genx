@@ -8,7 +8,7 @@ dataset:
   context_norm: "[-1,1]"
 causal_schema:
   version: "1"
-  variables: [age, sex, tb_status]
+  variables: [age, gender, tb_status]
   edges: [[age, tb_status]]
 model:
   name: hierarchical_vae
@@ -24,7 +24,7 @@ runtime:
 artifacts:
   root: checkpoints
   run_name: image_model_cxr_rait
-  remote_root: ""
+  remote_root: gs://cxr-rait/checkpoints
 workflow:
   type: train-image-model
   epochs: 1000

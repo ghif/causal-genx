@@ -8,7 +8,7 @@ dataset:
   context_norm: "[-1,1]"
 causal_schema:
   version: "1"
-  variables: [age, sex, tb_status]
+  variables: [age, gender, tb_status]
   edges: [[age, tb_status]]
 model:
   name: hierarchical_vae
@@ -22,13 +22,16 @@ runtime:
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: predictor_cxr_rait
-  remote_root: ""
+  run_name: predictor_torchxray-frozen_jax-cpu_31-07-2026
+  remote_root: gs://cxr-rait/checkpoints
 workflow:
-  type: train-predictor
+  type: finetune-predictor
   predictor_model: cxr_rait_image_parent_predictor
-  epochs: 1000
+  epochs: 100
   speed_log_freq: 50
   execution_mode: auto
   drop_remainder: true
   checkpoint_freq: 1
+  # Produced by: python scripts/convert_cxr_weights.py
+  pretrained_weights_path: checkpoints/pretrained/torchxrayvision_densenet121_flax.npz
+  freeze_backbone: true

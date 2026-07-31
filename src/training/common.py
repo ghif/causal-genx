@@ -25,17 +25,25 @@ def stage_run_dir(config: ExperimentConfig) -> Path:
     return REPOSITORY_ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name
 
 
-def morphomnist_batch(batch: Dict[str, np.ndarray]) -> Dict[str, jax.Array]:
-    """Convert a MorphoMNIST provider batch to the shared JAX batch format."""
-    image = np.asarray(batch["x"], dtype=np.float32)
-    if image.max(initial=0.0) > 1.5:
-        image = (image - 127.5) / 127.5
-    return {
-        "x": jnp.asarray(image),
-        "thickness": jnp.asarray(batch["thickness"], dtype=jnp.float32).reshape((-1, 1)),
-        "intensity": jnp.asarray(batch["intensity"], dtype=jnp.float32).reshape((-1, 1)),
-        "digit": jnp.asarray(batch["digit"], dtype=jnp.float32),
-    }
+def to_jax_batch(batch: Dict[str, np.ndarray]) -> Dict[str, jax.Array]:
+    """Convert a provider batch from any dataset to generic JAX batch format."""
+    out: Dict[str, jax.Array] = {}
+    for key, value in batch.items():
+        if key == "x":
+            image = np.asarray(value, dtype=np.float32)
+            if image.max(initial=0.0) > 1.5:
+                image = (image - 127.5) / 127.5
+            out["x"] = jnp.asarray(image)
+        else:
+            arr = np.asarray(value, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape((-1, 1))
+            out[key] = jnp.asarray(arr)
+    return out
+
+
+# Alias for backward compatibility
+morphomnist_batch = to_jax_batch
 
 
 def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bool, rng: np.random.Generator) -> Iterator[Dict[str, jax.Array]]:
@@ -54,7 +62,7 @@ def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bo
                 key: np.stack([np.asarray(dataset[int(index)][key]) for index in batch_indices])
                 for key in dataset[0]
             }
-        yield morphomnist_batch(batch)
+        yield to_jax_batch(batch)
 
 
 def resolve_checkpoint_reference(checkpoint: str, remote_root: str = "") -> str:
