@@ -699,7 +699,8 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             "execution_mode=replicated local_device_count=%d global_batch_size=%d per_device_batch_size=%d",
             device_count, args.bs, args.bs // device_count,
         )
-        train_step = _make_pmap_train_step(graphdef, optimizer, devices, backbone_lr_scale=args.backbone_lr_scale)
+        backbone_lr_scale = float(getattr(args, "backbone_lr_scale", 1.0))
+        train_step = _make_pmap_train_step(graphdef, optimizer, devices, backbone_lr_scale=backbone_lr_scale)
         model_params = _replicate(model_params, devices)
         model_batch_stats = _replicate(model_batch_stats, devices)
         opt_state = _replicate(opt_state, devices)
@@ -714,7 +715,8 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             "execution_mode=single_device accelerator=%s local_device_count=%d global_batch_size=%d",
             args.accelerator, jax.local_device_count(), args.bs,
         )
-        train_step = _make_train_step(graphdef, optimizer, backbone_lr_scale=args.backbone_lr_scale)
+        backbone_lr_scale = float(getattr(args, "backbone_lr_scale", 1.0))
+        train_step = _make_train_step(graphdef, optimizer, backbone_lr_scale=backbone_lr_scale)
     final_stats: Dict[str, float] = {}
     artifact_writer = BackgroundArtifactWriter()
     metric_artifact_writer = BackgroundArtifactWriter()
