@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MorphoMNIST Causal Visualizer</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="config.js"></script>
+    <script defer src="app.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <p class="eyebrow">Causal-GenX · MorphoMNIST</p>
+        <h1>Counterfactual digit studio</h1>
+        <p>Generate a digit from its parent nodes, or upload a digit and intervene on its thickness and intensity.</p>
+        <p id="api-status" class="status" role="status">Checking local API…</p>
+      </header>
+
+      <div class="tabs" role="tablist" aria-label="Visualizer mode">
+        <button id="generation-tab" class="tab" type="button" role="tab" aria-selected="true" aria-controls="generation-panel">Generate image</button>
+        <button id="counterfactual-tab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="counterfactual-panel">Render counterfactual</button>
+      </div>
+
+      <section id="generation-panel" class="tab-panel" role="tabpanel" aria-labelledby="generation-tab">
+        <div class="workspace">
+          <form class="controls" aria-label="Image generation parent nodes">
+            <p class="panel-intro">Choose the parent nodes that condition a newly generated image.</p>
+            <div class="control-group">
+              <label>Digit</label>
+              <div id="digit-control" class="digit-control" role="radiogroup" aria-label="Generated digit"></div>
+            </div>
+            <label for="style-seed">Style seed <output id="style-seed-value">0</output></label>
+            <input id="style-seed" type="range" min="0" max="999999" step="1" value="0">
+            <label for="generation-thickness">Thickness <output id="generation-thickness-value">3.50</output></label>
+            <input id="generation-thickness" type="range" min="0.87598526" max="6.255515" step="0.01" value="3.5">
+            <label for="generation-intensity">Intensity <output id="generation-intensity-value">160.0</output></label>
+            <input id="generation-intensity" type="range" min="66.601204" max="254.90317" step="0.5" value="160" aria-describedby="generation-intensity-hint">
+            <p id="generation-intensity-hint" class="hint">Changing thickness updates intensity from the SCM (<span aria-label="thickness causes intensity">thickness → intensity</span>). You can then adjust intensity independently.</p>
+            <div class="actions"><button id="generate" class="primary" type="button">Generate image</button></div>
+          </form>
+          <section class="results" aria-live="polite">
+            <p id="generation-status" class="status">Set the parent nodes, then generate an image.</p>
+            <figure class="single-image"><img id="generated-image" alt="Generated digit preview"><figcaption>Generated image</figcaption></figure>
+            <div class="factor-grid one-column"><section><h2>Generated parent nodes</h2><pre id="generated-factors">—</pre></section></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="counterfactual-panel" class="tab-panel" role="tabpanel" aria-labelledby="counterfactual-tab" hidden>
+        <div class="workspace">
+          <form class="controls" aria-label="Counterfactual intervention">
+            <p class="panel-intro">Upload a factual digit, inspect its inferred parents, then set the thickness and intensity intervention. The digit identity is preserved.</p>
+            <label class="upload" for="seed-image"><span>Factual digit image</span><input id="seed-image" type="file" accept="image/png,image/jpeg"></label>
+            <p class="hint">Use a 28×28 or 32×32 PNG/JPEG. The image is sent to the inference API and is not retained.</p>
+            <button id="load-factors" type="button">Analyze factual image</button>
+            <label for="cf-thickness">Intervention: thickness <output id="cf-thickness-value">3.50</output></label>
+            <input id="cf-thickness" type="range" min="0.87598526" max="6.255515" step="0.01" value="3.5" disabled>
+            <label for="cf-intensity">Intervention: intensity <output id="cf-intensity-value">160.0</output></label>
+            <input id="cf-intensity" type="range" min="66.601204" max="254.90317" step="0.5" value="160" disabled>
+            <p class="hint">Changing thickness updates this intensity from the SCM using the factual image. You can then adjust intensity independently.</p>
+            <p id="digit-identity" class="hint">Analyze an image to preserve its inferred digit identity.</p>
+            <div class="actions"><button id="render-counterfactual" class="primary" type="button" disabled>Render intervention</button></div>
+          </form>
+          <section class="results" aria-live="polite">
+            <p id="counterfactual-status" class="status">Upload and analyze a factual image to begin.</p>
+            <div class="image-grid two-columns">
+              <figure><img id="seed-preview" alt="Factual input image preview"><figcaption>Factual image</figcaption></figure>
+              <figure><img id="counterfactual-image" alt="Counterfactual image preview"><figcaption>Counterfactual image</figcaption></figure>
+            </div>
+            <div class="factor-grid two-columns">
+              <section><h2>Inferred factual parents</h2><pre id="factual-factors">—</pre></section>
+              <section><h2>Counterfactual parents</h2><pre id="counterfactual-factors">—</pre></section>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
