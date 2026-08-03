@@ -22,5 +22,5 @@ gcloud run deploy "${SERVICE_NAME}" \
   --min-instances 0 \
   --max-instances 3 \
   --cpu-boost \
-  --set-env-vars "TRUST_INCOMPLETE_CHECKPOINT=true,DEFAULT_SEED=7,ALLOWED_ORIGINS=${ALLOWED_ORIGINS}" \
+  --set-env-vars "TRUST_INCOMPLETE_CHECKPOINT=true,DEFAULT_SEED=7,RATE_LIMIT_REQUESTS=30,RATE_LIMIT_WINDOW_SECONDS=60,ALLOWED_ORIGINS=${ALLOWED_ORIGINS}" \
   --startup-probe=httpGet.path=/readyz,httpGet.port=8080,initialDelaySeconds=0,periodSeconds=10,timeoutSeconds=5,failureThreshold=30

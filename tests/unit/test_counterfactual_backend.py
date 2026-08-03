@@ -161,3 +161,25 @@ def test_rate_limiter_rejects_excess_inference_requests():
     assert first.status_code == 200
     assert second.status_code == 429
     assert second.headers["retry-after"] == "60"
+
+
+def test_default_rate_limit_is_thirty_requests_per_minute(monkeypatch):
+    monkeypatch.delenv("RATE_LIMIT_REQUESTS", raising=False)
+    monkeypatch.delenv("RATE_LIMIT_WINDOW_SECONDS", raising=False)
+    client = TestClient(create_app(_FakeRegistry()))
+
+    for _ in range(30):
+        response = client.post(
+            "/v1/generate",
+            data={"digit": "4", "thickness": "3.0", "intensity": "170.0", "style_seed": "12"},
+            headers={"x-forwarded-for": "198.51.100.1"},
+        )
+        assert response.status_code == 200
+
+    rejected = client.post(
+        "/v1/generate",
+        data={"digit": "4", "thickness": "3.0", "intensity": "170.0", "style_seed": "12"},
+        headers={"x-forwarded-for": "198.51.100.1"},
+    )
+    assert rejected.status_code == 429
+    assert rejected.headers["retry-after"] == "60"

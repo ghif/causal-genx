@@ -45,7 +45,11 @@ async function request(path, body) {
   return content;
 }
 
-function showImage(id, base64) { document.querySelector(id).src = `data:image/png;base64,${base64}`; }
+function showImage(id, source, isBase64 = true) {
+  const image = document.querySelector(id);
+  image.src = isBase64 ? `data:image/png;base64,${source}` : source;
+  image.closest(".preview-canvas").classList.add("has-image");
+}
 
 function showFactors(id, parents, extra = {}) {
   const values = { ...parents.physical, ...extra };
@@ -189,7 +193,7 @@ async function selectSample(sample) {
     counterfactual.image = new File([imageBlob], source.split("/").pop(), { type: imageBlob.type || "image/png" });
     resetCounterfactualSelection();
     document.querySelectorAll(".sample-card").forEach((card) => card.classList.toggle("selected", card === sample));
-    document.querySelector("#seed-preview").src = source;
+    showImage("#seed-preview", source, false);
     document.querySelector("#sample-dropzone").textContent = `${sample.dataset.sampleLabel} selected. Analyze to infer its factual parents.`;
     setStatus("#counterfactual-status", "Factual sample selected. Analyze it to begin.", "ready");
   } catch (error) { setStatus("#counterfactual-status", error.message, "error"); }

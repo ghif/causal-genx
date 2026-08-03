@@ -14,7 +14,7 @@
         <p class="eyebrow">Causal-GenX · MorphoMNIST</p>
         <h1>Counterfactual Digit Studio</h1>
         <p>Generate a digit from its parent nodes, or choose a factual digit and intervene on its thickness and intensity.</p>
-        <p id="api-status" class="status" role="status">Checking local API…</p>
+        <!-- <p id="api-status" class="status" role="status">Checking local API…</p> -->
       </header>
 
       <div class="tabs" role="tablist" aria-label="Visualizer mode">
@@ -41,7 +41,10 @@
           </form>
           <section class="results" aria-live="polite">
             <p id="generation-status" class="status">Set the parent nodes, then generate an image.</p>
-            <figure class="single-image"><img id="generated-image" alt="Generated digit preview"><figcaption>Generated image</figcaption></figure>
+            <figure class="single-image">
+              <div class="preview-canvas"><img id="generated-image" alt="Generated digit preview"><div class="canvas-empty" aria-hidden="true"><span class="canvas-glyph">+</span><span>Awaiting generation</span></div></div>
+              <figcaption>Generated image</figcaption>
+            </figure>
             <div class="factor-grid one-column"><section><h2>Generated parent nodes</h2><pre id="generated-factors">—</pre></section></div>
           </section>
         </div>
@@ -80,10 +83,16 @@
             <div class="actions"><button id="render-counterfactual" class="primary" type="button" disabled>Render intervention</button></div>
           </form>
           <section class="results" aria-live="polite">
-            <p id="counterfactual-status" class="status">Upload and analyze a factual image to begin.</p>
+            <p id="counterfactual-status" class="status">Choose and analyze a factual sample to begin.</p>
             <div class="image-grid two-columns">
-              <figure><img id="seed-preview" alt="Factual input image preview"><figcaption>Factual image</figcaption></figure>
-              <figure><img id="counterfactual-image" alt="Counterfactual image preview"><figcaption>Counterfactual image</figcaption></figure>
+              <figure>
+                <div class="preview-canvas"><img id="seed-preview" alt="Factual input image preview"><div class="canvas-empty" aria-hidden="true"><span class="canvas-glyph">+</span><span>Choose a sample</span></div></div>
+                <figcaption>Factual image</figcaption>
+              </figure>
+              <figure>
+                <div class="preview-canvas"><img id="counterfactual-image" alt="Counterfactual image preview"><div class="canvas-empty" aria-hidden="true"><span class="canvas-glyph">+</span><span>Awaiting intervention</span></div></div>
+                <figcaption>Counterfactual image</figcaption>
+              </figure>
             </div>
             <div class="factor-grid two-columns">
               <section><h2>Inferred factual parents</h2><pre id="factual-factors">—</pre></section>

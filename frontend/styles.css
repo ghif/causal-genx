@@ -44,7 +44,11 @@ button:disabled { cursor: wait; opacity: .55; }
 .factor-grid.one-column { grid-template-columns: minmax(0, 1fr); }
 .single-image { max-width: min(100%, 480px); margin: 0 auto; }
 figure { margin: 0; min-width: 0; }
-figure img { display: block; width: 100%; aspect-ratio: 1; border: 1px solid #334150; border-radius: 12px; background: #0c1116; image-rendering: pixelated; object-fit: contain; }
+.preview-canvas { position: relative; display: grid; width: 100%; aspect-ratio: 1; overflow: hidden; border: 1px solid #334150; border-radius: 12px; background-color: #0c1116; background-image: linear-gradient(#17212b 1px, transparent 1px), linear-gradient(90deg, #17212b 1px, transparent 1px); background-position: center; background-size: 12.5% 12.5%; }
+.preview-canvas img { display: block; width: 100%; height: 100%; background: #0c1116; image-rendering: pixelated; object-fit: contain; }
+.preview-canvas:not(.has-image) img { display: none; }
+.canvas-empty { display: grid; place-content: center; gap: .5rem; color: #718392; font-size: .74rem; font-weight: 650; letter-spacing: .03em; text-align: center; }
+.canvas-glyph { display: grid; place-items: center; width: 2rem; height: 2rem; margin: 0 auto; border: 1px dashed #526474; border-radius: 50%; color: #79d1ba; font-size: 1.3rem; font-weight: 400; }
 figcaption { color: #aeb9c4; font-size: .82rem; margin-top: .45rem; text-align: center; }
 .factor-grid { margin-top: 1.2rem; }
 .factor-grid section { min-width: 0; padding: .8rem; }

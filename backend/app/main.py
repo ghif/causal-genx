@@ -65,7 +65,7 @@ def create_app(
 ) -> FastAPI:
     models = registry or CounterfactualModels(ModelSettings.from_environment())
     limiter = rate_limiter or ClientRateLimiter(
-        limit=int(os.getenv("RATE_LIMIT_REQUESTS", "12")),
+        limit=int(os.getenv("RATE_LIMIT_REQUESTS", "30")),
         window_seconds=float(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")),
     )
 
