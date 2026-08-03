@@ -151,10 +151,12 @@ def test_rate_limiter_rejects_excess_inference_requests():
     first = client.post(
         "/v1/generate",
         data={"digit": "4", "thickness": "3.0", "intensity": "170.0", "style_seed": "12"},
+        headers={"x-forwarded-for": "198.51.100.1"},
     )
     second = client.post(
         "/v1/generate",
         data={"digit": "4", "thickness": "3.0", "intensity": "170.0", "style_seed": "12"},
+        headers={"x-forwarded-for": "198.51.100.2"},
     )
     assert first.status_code == 200
     assert second.status_code == 429

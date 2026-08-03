@@ -12,8 +12,8 @@
     <main class="shell">
       <header class="hero">
         <p class="eyebrow">Causal-GenX · MorphoMNIST</p>
-        <h1>Counterfactual digit studio</h1>
-        <p>Generate a digit from its parent nodes, or upload a digit and intervene on its thickness and intensity.</p>
+        <h1>Counterfactual Digit Studio</h1>
+        <p>Generate a digit from its parent nodes, or choose a factual digit and intervene on its thickness and intensity.</p>
         <p id="api-status" class="status" role="status">Checking local API…</p>
       </header>
 
@@ -50,9 +50,26 @@
       <section id="counterfactual-panel" class="tab-panel" role="tabpanel" aria-labelledby="counterfactual-tab" hidden>
         <div class="workspace">
           <form class="controls" aria-label="Counterfactual intervention">
-            <p class="panel-intro">Upload a factual digit, inspect its inferred parents, then set the thickness and intensity intervention. The digit identity is preserved.</p>
-            <label class="upload" for="seed-image"><span>Factual digit image</span><input id="seed-image" type="file" accept="image/png,image/jpeg"></label>
-            <p class="hint">Use a 28×28 or 32×32 PNG/JPEG. The image is sent to the inference API and is not retained.</p>
+            <p class="panel-intro">Drag one of the factual digit samples into the drop zone, inspect its inferred parents, then set the thickness and intensity intervention. The digit identity is preserved.</p>
+            <div id="sample-gallery" class="sample-gallery" aria-label="Factual digit samples">
+              <button class="sample-card" type="button" draggable="true" data-sample-src="assets/morphomnist/sample_02_train_55121_digit_1.png" data-sample-label="Digit 1 sample">
+                <img src="assets/morphomnist/sample_02_train_55121_digit_1.png" alt="Sample digit 1"><span>Digit 1</span>
+              </button>
+              <button class="sample-card" type="button" draggable="true" data-sample-src="assets/morphomnist/sample_01_train_13313_digit_2.png" data-sample-label="Digit 2 sample">
+                <img src="assets/morphomnist/sample_01_train_13313_digit_2.png" alt="Sample digit 2"><span>Digit 2</span>
+              </button>
+              <button class="sample-card" type="button" draggable="true" data-sample-src="assets/morphomnist/sample_07_train_05067_digit_3.png" data-sample-label="Digit 3 sample">
+                <img src="assets/morphomnist/sample_07_train_05067_digit_3.png" alt="Sample digit 3"><span>Digit 3</span>
+              </button>
+              <button class="sample-card" type="button" draggable="true" data-sample-src="assets/morphomnist/sample_04_train_51104_digit_8.png" data-sample-label="Digit 8 sample">
+                <img src="assets/morphomnist/sample_04_train_51104_digit_8.png" alt="Sample digit 8"><span>Digit 8</span>
+              </button>
+              <button class="sample-card" type="button" draggable="true" data-sample-src="assets/morphomnist/sample_03_test_01452_digit_9.png" data-sample-label="Digit 9 sample">
+                <img src="assets/morphomnist/sample_03_test_01452_digit_9.png" alt="Sample digit 9"><span>Digit 9</span>
+              </button>
+            </div>
+            <div id="sample-dropzone" class="sample-dropzone" tabindex="0" role="status" aria-live="polite">Drag a sample here, or select one above.</div>
+            <p class="hint">The selected 28×28 MorphoMNIST sample is sent to the inference API and is not retained.</p>
             <button id="load-factors" type="button">Analyze factual image</button>
             <label for="cf-thickness">Intervention: thickness <output id="cf-thickness-value">3.50</output></label>
             <input id="cf-thickness" type="range" min="0.87598526" max="6.255515" step="0.01" value="3.5" disabled>

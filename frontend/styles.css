@@ -22,9 +22,13 @@ input[type="range"] { accent-color: #79d1ba; width: 100%; }
 .digit-control input { position: absolute; opacity: 0; }
 .digit-control label { cursor: pointer; justify-content: center; border: 1px solid #3d4d5b; border-radius: 9px; padding: .45rem; color: #c8d3db; }
 .digit-control input:checked + label { background: #79d1ba; color: #10211d; border-color: #79d1ba; }
-.upload { border: 1px dashed #526474; border-radius: 12px; padding: .75rem; display: block; cursor: pointer; }
-.upload span { display: block; margin-bottom: .5rem; }
-.upload input { width: 100%; }
+.sample-gallery { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .4rem; }
+.sample-card { display: grid; gap: .25rem; padding: .35rem; color: #aeb9c4; font-size: .68rem; font-weight: 600; }
+.sample-card img { width: 100%; aspect-ratio: 1; border-radius: 6px; background: #0c1116; image-rendering: pixelated; object-fit: contain; }
+.sample-card.selected { border-color: #79d1ba; background: #1d332f; color: #79d1ba; }
+.sample-dropzone { border: 1px dashed #526474; border-radius: 12px; padding: .8rem; color: #aeb9c4; font-size: .83rem; line-height: 1.4; text-align: center; transition: border-color .15s, background .15s; }
+.sample-dropzone.drag-over { border-color: #79d1ba; background: #1d332f; color: #79d1ba; }
+.sample-dropzone:focus-visible, .sample-card:focus-visible { outline: 2px solid #79d1ba; outline-offset: 2px; }
 .hint { margin: -.2rem 0 .2rem; color: #8f9eaa; font-size: .78rem; line-height: 1.45; }
 .actions { display: grid; gap: .55rem; margin-top: .35rem; }
 button { border: 1px solid #526474; border-radius: 9px; background: #202a35; color: #eef3f7; cursor: pointer; font: inherit; font-weight: 650; padding: .7rem .85rem; }

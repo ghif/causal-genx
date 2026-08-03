@@ -6,7 +6,7 @@ const generation = {
   styleSeed: document.querySelector("#style-seed"),
 };
 const counterfactual = {
-  image: document.querySelector("#seed-image"),
+  image: null,
   thickness: document.querySelector("#cf-thickness"),
   intensity: document.querySelector("#cf-intensity"),
   digit: null,
@@ -34,7 +34,7 @@ function updateOutput(input, digits) {
 
 function imageFormData() {
   const data = new FormData();
-  data.append("image", counterfactual.image.files[0]);
+  data.append("image", counterfactual.image);
   return data;
 }
 
@@ -94,7 +94,7 @@ async function syncGenerationIntensity() {
 }
 
 async function syncCounterfactualIntensity() {
-  if (!counterfactual.image.files[0] || counterfactual.digit === null) return;
+  if (!counterfactual.image || counterfactual.digit === null) return;
   counterfactualIntensityAbortController?.abort();
   counterfactualIntensityAbortController = new AbortController();
   const data = imageFormData();
@@ -115,7 +115,7 @@ async function syncCounterfactualIntensity() {
 }
 
 async function analyzeFactualImage() {
-  if (!counterfactual.image.files[0]) { setStatus("#counterfactual-status", "Upload a factual image first.", "error"); return; }
+  if (!counterfactual.image) { setStatus("#counterfactual-status", "Choose a factual sample first.", "error"); return; }
   setBusy(true); setStatus("#counterfactual-status", "Inferring factual parent nodes…");
   try {
     const result = await request("/v1/predict-parents", imageFormData());
@@ -133,7 +133,7 @@ async function analyzeFactualImage() {
 }
 
 async function renderCounterfactual() {
-  if (!counterfactual.image.files[0] || counterfactual.digit === null) { setStatus("#counterfactual-status", "Analyze the factual image before rendering.", "error"); return; }
+  if (!counterfactual.image || counterfactual.digit === null) { setStatus("#counterfactual-status", "Analyze the factual sample before rendering.", "error"); return; }
   const data = imageFormData();
   data.append("digit", counterfactual.digit);
   data.append("thickness", counterfactual.thickness.value);
@@ -172,13 +172,44 @@ generation.thickness.addEventListener("change", syncGenerationIntensity);
 counterfactual.thickness.addEventListener("input", () => updateOutput(counterfactual.thickness, 2));
 counterfactual.intensity.addEventListener("input", () => updateOutput(counterfactual.intensity, 1));
 counterfactual.thickness.addEventListener("change", syncCounterfactualIntensity);
-counterfactual.image.addEventListener("change", () => {
-  const file = counterfactual.image.files[0];
+function resetCounterfactualSelection() {
   counterfactual.digit = null;
   counterfactual.thickness.disabled = true; counterfactual.intensity.disabled = true;
   document.querySelector("#render-counterfactual").disabled = true;
-  document.querySelector("#digit-identity").textContent = "Analyze an image to preserve its inferred digit identity.";
-  if (file) document.querySelector("#seed-preview").src = URL.createObjectURL(file);
+  document.querySelector("#digit-identity").textContent = "Analyze a sample to preserve its inferred digit identity.";
+}
+
+async function selectSample(sample) {
+  const source = sample.dataset.sampleSrc;
+  setStatus("#counterfactual-status", "Loading factual sample…");
+  try {
+    const response = await fetch(source);
+    if (!response.ok) throw new Error("Unable to load the selected sample.");
+    const imageBlob = await response.blob();
+    counterfactual.image = new File([imageBlob], source.split("/").pop(), { type: imageBlob.type || "image/png" });
+    resetCounterfactualSelection();
+    document.querySelectorAll(".sample-card").forEach((card) => card.classList.toggle("selected", card === sample));
+    document.querySelector("#seed-preview").src = source;
+    document.querySelector("#sample-dropzone").textContent = `${sample.dataset.sampleLabel} selected. Analyze to infer its factual parents.`;
+    setStatus("#counterfactual-status", "Factual sample selected. Analyze it to begin.", "ready");
+  } catch (error) { setStatus("#counterfactual-status", error.message, "error"); }
+}
+
+const sampleDropzone = document.querySelector("#sample-dropzone");
+document.querySelectorAll(".sample-card").forEach((sample) => {
+  sample.addEventListener("click", () => selectSample(sample));
+  sample.addEventListener("dragstart", (event) => {
+    event.dataTransfer.setData("text/plain", sample.dataset.sampleSrc);
+    event.dataTransfer.effectAllowed = "copy";
+  });
+});
+sampleDropzone.addEventListener("dragover", (event) => { event.preventDefault(); sampleDropzone.classList.add("drag-over"); });
+sampleDropzone.addEventListener("dragleave", () => sampleDropzone.classList.remove("drag-over"));
+sampleDropzone.addEventListener("drop", (event) => {
+  event.preventDefault(); sampleDropzone.classList.remove("drag-over");
+  const source = event.dataTransfer.getData("text/plain");
+  const sample = [...document.querySelectorAll(".sample-card")].find((card) => card.dataset.sampleSrc === source);
+  if (sample) selectSample(sample);
 });
 document.querySelector("#generation-tab").addEventListener("click", () => activateTab("generation-tab"));
 document.querySelector("#counterfactual-tab").addEventListener("click", () => activateTab("counterfactual-tab"));

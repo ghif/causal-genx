@@ -32,6 +32,7 @@ class ClientRateLimiter:
         self.limit = limit
         self.window_seconds = window_seconds
         self._requests: dict[str, deque[float]] = defaultdict(deque)
+        self._all_requests: deque[float] = deque()
         self._lock = threading.Lock()
 
     def allow(self, client_id: str) -> bool:
@@ -39,10 +40,13 @@ class ClientRateLimiter:
         with self._lock:
             entries = self._requests[client_id]
             cutoff = now - self.window_seconds
+            while self._all_requests and self._all_requests[0] <= cutoff:
+                self._all_requests.popleft()
             while entries and entries[0] <= cutoff:
                 entries.popleft()
-            if len(entries) >= self.limit:
+            if len(self._all_requests) >= self.limit or len(entries) >= self.limit:
                 return False
+            self._all_requests.append(now)
             entries.append(now)
             return True
 
