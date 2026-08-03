@@ -90,6 +90,11 @@ class PredictorTrainingConfig(BaseModel):
     freeze_backbone: bool = True
     backbone_lr_scale: float = 1.0
     pretrained_weights_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz"
+    warmup_epochs: int = 0
+    label_smoothing: float = 0.0
+    torchxray_preprocessing: bool = False
+    dropout_rate: float = 0.0
+
 
 
 class ImageModelTrainingConfig(BaseModel):

@@ -77,7 +77,29 @@ def _load_dicom_image(path: str, target_res: int = 128) -> np.ndarray:
         pil_img = pil_img.resize((target_res, target_res), resample=Image.Resampling.BILINEAR)
 
     # Scale to [0.0, 1.0] float32 array
-    return np.asarray(pil_img, dtype=np.float32) / 255.0
+    arr = np.asarray(pil_img, dtype=np.float32) / 255.0
+    if torchxray_norm:
+        arr = (arr * 2048.0) - 1024.0
+    return arr
+
+
+def preprocess_cxr_image(img: np.ndarray, target_res: int = 224, torchxray_norm: bool = False) -> np.ndarray:
+    """Resize and normalize chest X-ray image to match TorchXRayVision expectations."""
+    from PIL import Image
+    if img.ndim == 2:
+        img = img[:, :, None]
+    if img.shape[0] == 1 and img.ndim == 3:
+        img = img[0]
+    if img.shape[:2] != (target_res, target_res):
+        pil_img = Image.fromarray((img * 255.0).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8))
+        pil_img = pil_img.resize((target_res, target_res), resample=Image.Resampling.BILINEAR)
+        img = np.asarray(pil_img, dtype=np.float32) / 255.0
+    if torchxray_norm:
+        img = (img * 2048.0) - 1024.0
+    if img.ndim == 2:
+        img = img[None, :, :]
+    return img.astype(np.float32)
+
 
 
 def _load_cxr_rait_metadata(metadata_path: str) -> Dict[str, Dict[str, float]]:
@@ -216,6 +238,7 @@ class CxrRaitDataset:
         concat_pa: bool = True,
         input_res: int = 128,
         augment: bool = False,
+        torchxray_preprocessing: bool = False,
         seed: int = 7,
     ):
         self.root_dir = root_dir
@@ -226,6 +249,8 @@ class CxrRaitDataset:
         self.concat_pa = concat_pa
         self.input_res = input_res
         self.augment = augment
+        self.torchxray_preprocessing = torchxray_preprocessing
+
 
         metadata_path = os.path.join(root_dir, "data_demography.xlsx")
         meta_dict = _load_cxr_rait_metadata(metadata_path)
@@ -344,8 +369,9 @@ class CxrRaitDataset:
 
         path = self.image_paths[idx]
         try:
-            img = _load_dicom_image(path, target_res=self.input_res)
+            img = _load_dicom_image(path, target_res=self.input_res, torchxray_norm=self.torchxray_preprocessing)
         except Exception:
+
             # Synthetic fallback blank image for dry-run/mock tests
             img = np.zeros((self.input_res, self.input_res), dtype=np.float32)
         res = img[None, ...]  # 1 x H x W
@@ -469,5 +495,7 @@ def cxr_rait(settings) -> Dict[str, CxrRaitDataset]:
             concat_pa=settings.concat_pa,
             input_res=settings.input_res,
             augment=(should_augment if split == "train" else False),
+            torchxray_preprocessing=getattr(settings, "torchxray_preprocessing", False),
         )
     return datasets
+

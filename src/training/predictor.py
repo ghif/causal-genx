@@ -73,11 +73,16 @@ class PredictorRunArguments:
     freeze_backbone: bool = True
     backbone_lr_scale: float = 1.0
     pretrained_weights_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz"
+    warmup_epochs: int = 0
+    label_smoothing: float = 0.0
+    torchxray_preprocessing: bool = False
+    dropout_rate: float = 0.0
     augment: bool = True
     type: str = "train-predictor"
     save_dir: str = ""
     checkpoint_dir: str = ""
     remote_save_dir: str = ""
+
 
 
 class _IndexedDataset:
@@ -162,9 +167,14 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         freeze_backbone=freeze_backbone,
         backbone_lr_scale=backbone_lr_scale,
         pretrained_weights_path=workflow.pretrained_weights_path,
+        warmup_epochs=getattr(workflow, "warmup_epochs", 0),
+        label_smoothing=getattr(workflow, "label_smoothing", 0.0),
+        torchxray_preprocessing=getattr(workflow, "torchxray_preprocessing", False),
+        dropout_rate=getattr(workflow, "dropout_rate", 0.0),
         augment=augment,
         type=workflow.type,
     )
+
 
 
 def _validate_scope(args: PredictorRunArguments) -> None:
@@ -275,17 +285,32 @@ def _use_tpu_replication(args: PredictorRunArguments) -> bool:
     return multi_tpu_available and requested_mode != "single_device"
 
 
-def _merge(graphdef: Any, params: Any, batch_stats: Any):
-    return nnx.merge(graphdef, params, batch_stats)
+def _merge(graphdef: Any, params: Any, batch_stats: Any, rng_state: Any):
+    """Reconstruct a predictor, including mutable NNX Dropout RNG state."""
+    return nnx.merge(graphdef, params, batch_stats, rng_state)
 
 
-def _loss_and_state(graphdef: Any, params: Any, batch_stats: Any, batch: Dict[str, jax.Array], *, training: bool):
-    model = _merge(graphdef, params, batch_stats)
+def _loss_and_state(
+    graphdef: Any,
+    params: Any,
+    batch_stats: Any,
+    rng_state: Any,
+    batch: Dict[str, jax.Array],
+    *,
+    training: bool,
+):
+    model = _merge(graphdef, params, batch_stats, rng_state)
     model.train() if training else model.eval()
     log_probs = model.model_anticausal(**batch)
     loss = -jnp.mean(log_probs["joint"])
     metrics = {"loss": loss, **{f"logp({key})": jnp.mean(value) for key, value in log_probs.items() if key != "joint"}}
-    return loss, metrics, nnx.state(model, nnx.Param).to_pure_dict(), nnx.state(model, nnx.BatchStat).to_pure_dict()
+    return (
+        loss,
+        metrics,
+        nnx.state(model, nnx.Param).to_pure_dict(),
+        nnx.state(model, nnx.BatchStat).to_pure_dict(),
+        nnx.state(model, nnx.RngState).to_pure_dict(),
+    )
 
 
 def _scale_backbone_grads(grads: Any, scale: float) -> Any:
@@ -301,15 +326,17 @@ def _scale_backbone_grads(grads: Any, scale: float) -> Any:
 def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation, backbone_lr_scale: float = 1.0):
     """Compile one predictor update, including BatchNorm state evolution."""
     @jax.jit
-    def train_step(params, batch_stats, opt_state, batch):
+    def train_step(params, batch_stats, rng_state, opt_state, batch):
         def loss_fn(current_params):
-            loss, metrics, new_params, new_batch_stats = _loss_and_state(graphdef, current_params, batch_stats, batch, training=True)
-            return loss, (metrics, new_params, new_batch_stats)
-        (_, (metrics, _new_params, new_batch_stats)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+            loss, metrics, new_params, new_batch_stats, new_rng_state = _loss_and_state(
+                graphdef, current_params, batch_stats, rng_state, batch, training=True
+            )
+            return loss, (metrics, new_params, new_batch_stats, new_rng_state)
+        (_, (metrics, _new_params, new_batch_stats, new_rng_state)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = _scale_backbone_grads(grads, backbone_lr_scale)
         grad_norm = optax.global_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), new_batch_stats, opt_state, metrics, grad_norm
+        return optax.apply_updates(params, updates), new_batch_stats, new_rng_state, opt_state, metrics, grad_norm
     return train_step
 
 
@@ -320,14 +347,14 @@ def _make_pmap_train_step(
     backbone_lr_scale: float = 1.0,
 ):
     """Compile a synchronized multi-core TPU predictor update."""
-    def train_step(params, batch_stats, opt_state, batch):
+    def train_step(params, batch_stats, rng_state, opt_state, batch):
         def loss_fn(current_params):
-            loss, metrics, _new_params, new_batch_stats = _loss_and_state(
-                graphdef, current_params, batch_stats, batch, training=True
+            loss, metrics, _new_params, new_batch_stats, new_rng_state = _loss_and_state(
+                graphdef, current_params, batch_stats, rng_state, batch, training=True
             )
-            return loss, (metrics, new_batch_stats)
+            return loss, (metrics, new_batch_stats, new_rng_state)
 
-        (_, (metrics, new_batch_stats)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (_, (metrics, new_batch_stats, new_rng_state)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = jax.lax.pmean(grads, axis_name="devices")
         grads = _scale_backbone_grads(grads, backbone_lr_scale)
         metrics = jax.tree_util.tree_map(
@@ -338,12 +365,12 @@ def _make_pmap_train_step(
         )
         grad_norm = optax.global_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), new_batch_stats, opt_state, metrics, grad_norm
+        return optax.apply_updates(params, updates), new_batch_stats, new_rng_state, opt_state, metrics, grad_norm
 
     return jax.pmap(
         train_step,
         axis_name="devices",
-        in_axes=(0, 0, 0, 0),
+        in_axes=(0, 0, 0, 0, 0),
         devices=devices,
     )
 
@@ -351,17 +378,19 @@ def _make_pmap_train_step(
 def _portable_training_state(
     model_params: Any,
     batch_stats: Any,
+    rng_state: Any,
     ema: WarmupEMA,
     opt_state: Any,
     *,
     replicated: bool,
-) -> tuple[Any, Any, WarmupEMA, Any]:
+) -> tuple[Any, Any, Any, WarmupEMA, Any]:
     """Return ordinary single-device trees for evaluation and persistence."""
     if not replicated:
-        return model_params, batch_stats, ema, opt_state
+        return model_params, batch_stats, rng_state, ema, opt_state
     return (
         _unreplicate(model_params),
         _unreplicate(batch_stats),
+        _unreplicate(rng_state),
         WarmupEMA(
             params=_unreplicate(ema.params),
             batch_stats=_unreplicate(ema.batch_stats),
@@ -377,10 +406,10 @@ def _portable_training_state(
     )
 
 
-def _eval_epoch(graphdef: Any, params: Any, batch_stats: Any, dataset: Any, batch_size: int, rng: np.random.Generator) -> Dict[str, float]:
+def _eval_epoch(graphdef: Any, params: Any, batch_stats: Any, rng_state: Any, dataset: Any, batch_size: int, rng: np.random.Generator) -> Dict[str, float]:
     totals: Dict[str, float] = {}; count = 0
     for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
-        _, metrics, _, _ = _loss_and_state(graphdef, params, batch_stats, batch, training=False)
+        _, metrics, _, _, _ = _loss_and_state(graphdef, params, batch_stats, rng_state, batch, training=False)
         size = int(next(iter(batch.values())).shape[0])
 
         for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
@@ -654,9 +683,12 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
                 std_fixed=args.std_fixed,
                 freeze_backbone=getattr(args, "freeze_backbone", True),
                 weights_path=args.pretrained_weights_path,
+                dropout_rate=getattr(args, "dropout_rate", 0.0),
+                label_smoothing=getattr(args, "label_smoothing", 0.0),
                 compute_dtype=dtype,
                 rngs=nnx.Rngs(args.seed),
             )
+
         else:
             from causal.cxr_rait_predictor import CxrRaitSupAuxPredictor
             model = CxrRaitSupAuxPredictor(
@@ -670,7 +702,12 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     else:
         model = MorphoMNISTSupAuxPredictor(input_channels=args.input_channels, input_res=args.input_res, width=8, std_fixed=args.std_fixed, compute_dtype=dtype, rngs=nnx.Rngs(args.seed))
 
-    graphdef, params_state, batch_stats_state = nnx.split(model, nnx.Param, nnx.BatchStat); model_params, model_batch_stats = params_state.to_pure_dict(), batch_stats_state.to_pure_dict()
+    graphdef, params_state, batch_stats_state, rng_state = nnx.split(
+        model, nnx.Param, nnx.BatchStat, nnx.RngState
+    )
+    model_params = params_state.to_pure_dict()
+    model_batch_stats = batch_stats_state.to_pure_dict()
+    model_rng_state = rng_state.to_pure_dict()
     optimizer = optax.chain(optax.clip_by_global_norm(200.0), optax.adamw(args.lr, b1=0.9, b2=0.999, eps=1e-8, weight_decay=args.wd)); opt_state = optimizer.init(model_params); ema = WarmupEMA.init_from(model_params, model_batch_stats)
     start_epoch = step = 0; best_loss = float("inf")
     if checkpoint is not None:
@@ -680,7 +717,10 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     rng = np.random.default_rng(args.seed)
     if args.testing:
         if checkpoint is None: raise ValueError("testing requires load_path")
-        stats = _prediction_metrics(args, _merge(graphdef, ema.params, ema.batch_stats), datasets["test"], args.bs, rng); logger.info("test | %s", _prediction_description(stats)); writer.close(); return stats
+        stats = _prediction_metrics(
+            args, _merge(graphdef, ema.params, ema.batch_stats, model_rng_state),
+            datasets["test"], args.bs, rng,
+        ); logger.info("test | %s", _prediction_description(stats)); writer.close(); return stats
     for key in sorted(vars(args)):
         logger.info("--%s=%s", key, getattr(args, key))
     logger.info("Data splits: #labelled: %d - #unlabelled: %d", len(train_dataset), len(datasets["train"]) - len(train_dataset))
@@ -703,6 +743,7 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
         train_step = _make_pmap_train_step(graphdef, optimizer, devices, backbone_lr_scale=backbone_lr_scale)
         model_params = _replicate(model_params, devices)
         model_batch_stats = _replicate(model_batch_stats, devices)
+        model_rng_state = _replicate(model_rng_state, devices)
         opt_state = _replicate(opt_state, devices)
         ema = WarmupEMA(
             params=_replicate(ema.params, devices), batch_stats=_replicate(ema.batch_stats, devices),
@@ -733,7 +774,9 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             ):
                 if use_tpu_pmap:
                     batch = _shard_batch(batch, devices)
-                model_params, model_batch_stats, opt_state, metrics, grad_norm = train_step(model_params, model_batch_stats, opt_state, batch); ema.update(model_params, model_batch_stats); size = int(next(iter(batch.values())).shape[0])
+                model_params, model_batch_stats, model_rng_state, opt_state, metrics, grad_norm = train_step(
+                    model_params, model_batch_stats, model_rng_state, opt_state, batch
+                ); ema.update(model_params, model_batch_stats); size = int(next(iter(batch.values())).shape[0])
                 if use_tpu_pmap:
                     metrics = _unreplicate(metrics)
                     grad_norm = _first_local_replica(grad_norm)
@@ -773,12 +816,15 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
                     speed_window_samples = seen
             # Evaluate with EMA parameters and EMA BatchNorm statistics, not the live model.
             train_stats = {key: value / max(1, seen) for key, value in totals.items()}
-            portable_params, portable_batch_stats, portable_ema, portable_opt_state = _portable_training_state(
-                model_params, model_batch_stats, ema, opt_state, replicated=use_tpu_pmap,
+            portable_params, portable_batch_stats, portable_rng_state, portable_ema, portable_opt_state = _portable_training_state(
+                model_params, model_batch_stats, model_rng_state, ema, opt_state, replicated=use_tpu_pmap,
             )
-            valid_stats = _eval_epoch(graphdef, portable_ema.params, portable_ema.batch_stats, valid_dataset, args.bs, rng); final_stats = valid_stats
+            valid_stats = _eval_epoch(
+                graphdef, portable_ema.params, portable_ema.batch_stats, portable_rng_state,
+                valid_dataset, args.bs, rng,
+            ); final_stats = valid_stats
             train_time = time.perf_counter() - epoch_step_t0
-            eval_model = _merge(graphdef, portable_ema.params, portable_ema.batch_stats)
+            eval_model = _merge(graphdef, portable_ema.params, portable_ema.batch_stats, portable_rng_state)
             train_prediction_stats = _prediction_metrics(args, eval_model, train_dataset, args.bs, rng)
             prediction_stats = _prediction_metrics(args, eval_model, valid_dataset, args.bs, rng)
             epoch_iter_per_sec = total_batches / max(train_time, 1e-12)

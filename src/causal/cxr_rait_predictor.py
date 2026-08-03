@@ -294,6 +294,9 @@ class CxrRaitPretrainedPredictor(nnx.Module):
         std_fixed: float = 0.0,
         freeze_backbone: bool = True,
         weights_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz",
+
+        dropout_rate: float = 0.0,
+        label_smoothing: float = 0.0,
         compute_dtype: jnp.dtype = jnp.float32,
         rngs: Optional[nnx.Rngs] = None,
     ):
@@ -305,12 +308,17 @@ class CxrRaitPretrainedPredictor(nnx.Module):
         self.width = int(width)  # Retained for checkpoint/config compatibility; DenseNet-121 has fixed widths.
         self.std_fixed = float(std_fixed)
         self.freeze_backbone = bool(freeze_backbone)
+        self.dropout_rate = float(dropout_rate)
+        self.label_smoothing = float(label_smoothing)
         self.compute_dtype = compute_dtype
         # Base feature extractor mirrors torchxrayvision.models.DenseNet
         # (DenseNet-121: growth_rate=32, block_config=(6, 12, 24, 16)).
         # Its converted state-dict archive is loaded immediately and strictly.
         self.encoder_shared = TorchXRayVisionDenseNet121(compute_dtype=self.compute_dtype, rngs=rngs)
         _load_torchxrayvision_weights(self.encoder_shared, weights_path)
+
+        if self.dropout_rate > 0.0:
+            self.dropout = nnx.Dropout(self.dropout_rate, rngs=rngs)
 
         # Prediction Heads conditioned on shared representation
         self.head_age = nnx.Linear(self.encoder_shared.output_features, 2, rngs=rngs)
@@ -321,7 +329,10 @@ class CxrRaitPretrainedPredictor(nnx.Module):
         h = self.encoder_shared(x)
         if getattr(self, "freeze_backbone", True):
             h = jax.lax.stop_gradient(h)
+        if hasattr(self, "dropout") and self.dropout_rate > 0.0:
+            h = self.dropout(h)
         return h
+
 
     def _age_params(self, x):
         h = self._extract_features(x)
@@ -354,20 +365,26 @@ class CxrRaitPretrainedPredictor(nnx.Module):
         a_scale = _positive_scale(a_logscale, self.std_fixed)
         age = _as_column(age)
 
+        gender_target = jnp.asarray(gender, dtype=jnp.float32)
+        tb_target = jnp.asarray(tb_status, dtype=jnp.float32)
+        if getattr(self, "label_smoothing", 0.0) > 0.0:
+            smooth = self.label_smoothing / 2.0
+            gender_target = gender_target * (1.0 - self.label_smoothing) + smooth
+            tb_target = tb_target * (1.0 - self.label_smoothing) + smooth
+
         age_log_prob = jnp.sum(
             _normal_log_prob((age - a_loc) / a_scale) - jnp.log(a_scale),
             axis=-1,
         )
         gender_log_prob = jnp.sum(
-            jnp.asarray(gender, dtype=jnp.float32)
-            * jax.nn.log_softmax(gender_logits, axis=-1),
+            gender_target * jax.nn.log_softmax(gender_logits, axis=-1),
             axis=-1,
         )
         tb_log_prob = jnp.sum(
-            jnp.asarray(tb_status, dtype=jnp.float32)
-            * jax.nn.log_softmax(tb_logits, axis=-1),
+            tb_target * jax.nn.log_softmax(tb_logits, axis=-1),
             axis=-1,
         )
+
         joint = age_log_prob + gender_log_prob + tb_log_prob
         return {
             "age_aux": age_log_prob,

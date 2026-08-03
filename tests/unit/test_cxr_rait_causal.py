@@ -6,6 +6,7 @@ from flax import nnx
 
 from causal.cxr_rait_scm import CxrRaitPGM
 from causal.cxr_rait_predictor import CxrRaitSupAuxPredictor, TorchXRayVisionDenseNet121
+from training.predictor import _merge
 
 
 def test_cxr_rait_pgm_shapes_and_sampling():
@@ -66,3 +67,23 @@ def test_torchxrayvision_backbone_matches_densenet121_topology():
         backbone.denseblock4,
     )) == (6, 12, 24, 16)
     assert backbone.output_features == 1024
+
+
+def test_dropout_rng_state_is_included_when_rebuilding_predictor_graph():
+    class DropoutCarrier(nnx.Module):
+        def __init__(self):
+            self.dropout = nnx.Dropout(0.2, rngs=nnx.Rngs(7))
+
+    model = DropoutCarrier()
+    graphdef, params, batch_stats, rng_state = nnx.split(
+        model, nnx.Param, nnx.BatchStat, nnx.RngState
+    )
+
+    rebuilt = _merge(
+        graphdef,
+        params.to_pure_dict(),
+        batch_stats.to_pure_dict(),
+        rng_state.to_pure_dict(),
+    )
+    rebuilt.train()
+    assert rebuilt.dropout(jnp.ones((2, 4))).shape == (2, 4)
