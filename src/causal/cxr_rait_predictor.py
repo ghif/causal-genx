@@ -348,9 +348,11 @@ class CxrRaitPretrainedPredictor(nnx.Module):
         return self.head_tb(h).astype(jnp.float32)
 
     def predict(self, *, x, **_):
-        a_loc, _ = self._age_params(x)
-        gender_logits = self._gender_logits(x)
-        tb_logits = self._tb_logits(x)
+        h = self._extract_features(x)
+        loc, _ = jnp.split(self.head_age(h), 2, axis=-1)
+        a_loc = jnp.tanh(loc.astype(jnp.float32))
+        gender_logits = self.head_gender(h).astype(jnp.float32)
+        tb_logits = self.head_tb(h).astype(jnp.float32)
         return {
             "age": a_loc,
             "gender": jax.nn.softmax(gender_logits, axis=-1),
@@ -358,9 +360,12 @@ class CxrRaitPretrainedPredictor(nnx.Module):
         }
 
     def anticausal_log_probs(self, *, x, age, gender, tb_status, **_):
-        a_loc, a_logscale = self._age_params(x)
-        gender_logits = self._gender_logits(x)
-        tb_logits = self._tb_logits(x)
+        h = self._extract_features(x)
+        loc, a_logscale = jnp.split(self.head_age(h), 2, axis=-1)
+        a_loc = jnp.tanh(loc.astype(jnp.float32))
+        a_logscale = a_logscale.astype(jnp.float32)
+        gender_logits = self.head_gender(h).astype(jnp.float32)
+        tb_logits = self.head_tb(h).astype(jnp.float32)
 
         a_scale = _positive_scale(a_logscale, self.std_fixed)
         age = _as_column(age)

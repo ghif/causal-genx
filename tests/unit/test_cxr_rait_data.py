@@ -17,3 +17,15 @@ def test_cxr_rait_provider_mock(tmp_path):
     assert provider.spec.dataset_id == "cxr_rait"
     assert provider.spec.image.height == 128
     assert provider.fingerprint() is not None
+
+
+def test_cxr_rait_dataset_cache_dir_isolation(tmp_path, monkeypatch):
+    import sys
+    import data.cxr_rait
+    monkeypatch.setattr(sys.modules["data.cxr_rait"], "_load_cxr_rait_metadata", lambda path: {"PID1": {"age": 50.0, "gender": 1.0, "tb_status": 0.0}})
+    ds_standard = CxrRaitDataset(root_dir=str(tmp_path), input_res=224, torchxray_preprocessing=False)
+    ds_torchxray = CxrRaitDataset(root_dir=str(tmp_path), input_res=224, torchxray_preprocessing=True)
+    assert ds_standard.cache_dir.endswith("_224")
+    assert ds_torchxray.cache_dir.endswith("_224_torchxray")
+    assert ds_standard.cache_dir != ds_torchxray.cache_dir
+

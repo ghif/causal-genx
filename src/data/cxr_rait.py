@@ -337,7 +337,10 @@ class CxrRaitDataset:
         }
 
         self._image_cache: Dict[int, np.ndarray] = {}
-        self.cache_dir = os.path.expanduser(f"~/.cache/cxr_rait_{self.input_res}")
+        cache_suffix = f"_{self.input_res}"
+        if self.torchxray_preprocessing:
+            cache_suffix += "_torchxray"
+        self.cache_dir = os.path.expanduser(f"~/.cache/cxr_rait{cache_suffix}")
         os.makedirs(self.cache_dir, exist_ok=True)
         self._preload_images()
 
