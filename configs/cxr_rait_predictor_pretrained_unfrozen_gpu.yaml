@@ -30,6 +30,6 @@ artifacts:
 
 seed: 7
 runtime:
-  accelerator: cpu
-  gpu_id: null
-  precision: fp32
+  accelerator: gpu
+  gpu_id: 0
+  precision: bf16
