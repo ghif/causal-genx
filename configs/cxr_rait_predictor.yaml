@@ -22,7 +22,8 @@ runtime:
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: predictor_torchxray-frozen_jax-cpu_31-07-2026
+  # run_name: predictor_torchxray-frozen_jax-cpu_31-07-2026
+  run_name: predictor_torchxray-unfrozen_jax-cpu_01-08-2026
   remote_root: gs://cxr-rait/checkpoints
 workflow:
   type: finetune-predictor
@@ -34,4 +35,5 @@ workflow:
   checkpoint_freq: 1
   # Produced by: python scripts/convert_cxr_weights.py
   pretrained_weights_path: checkpoints/pretrained/torchxrayvision_densenet121_flax.npz
-  freeze_backbone: true
+  # freeze_backbone: true
+  freeze_backbone: false
