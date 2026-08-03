@@ -6,7 +6,9 @@ SERVICE_NAME="${SERVICE_NAME:-causal-genx-counterfactual}"
 REGION="${REGION:-asia-southeast2}"
 REPOSITORY="${REPOSITORY:-causal-genx}"
 : "${SERVICE_ACCOUNT:?Set SERVICE_ACCOUNT to the Cloud Run runtime service account email}"
-ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-http://127.0.0.1:8000,http://localhost:8000}"
+# GitHub Pages is the production browser client. Local origins remain the
+# application defaults for backend/run.sh and tests, not this Cloud Run deploy.
+ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-https://ghif.github.io}"
 
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/${SERVICE_NAME}:$(git rev-parse --short HEAD)"
 gcloud builds submit --config backend/cloudbuild.yaml --substitutions "_IMAGE=${IMAGE}" .

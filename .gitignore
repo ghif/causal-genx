@@ -1,6 +1,9 @@
 .DS_Store
 AGENTS.md
 docs/
+!frontend/docs/
+frontend/docs/*
+!frontend/docs/deploy-github.md
 __pycache__/
 *.py[cod]
 .pytest_cache/

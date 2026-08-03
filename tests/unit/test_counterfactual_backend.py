@@ -146,6 +146,20 @@ def test_local_frontend_origin_is_allowed_by_cors():
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:8000"
 
 
+def test_github_pages_origin_is_allowed_when_configured(monkeypatch):
+    monkeypatch.setenv("ALLOWED_ORIGINS", "https://ghif.github.io")
+    client = TestClient(create_app(_FakeRegistry()))
+    response = client.options(
+        "/v1/generate",
+        headers={
+            "Origin": "https://ghif.github.io",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://ghif.github.io"
+
+
 def test_rate_limiter_rejects_excess_inference_requests():
     client = TestClient(create_app(_FakeRegistry(), rate_limiter=ClientRateLimiter(limit=1, window_seconds=60)))
     first = client.post(

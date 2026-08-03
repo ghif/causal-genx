@@ -1,0 +1,48 @@
+name: Deploy frontend to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/deploy-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate JavaScript syntax
+        run: node --check frontend/app.js
+      - name: Validate published frontend assets
+        run: |
+          test -f frontend/index.html
+          test -f frontend/config.js
+          test -f frontend/styles.css
+          test -d frontend/assets/morphomnist
+          test "$(find frontend/assets/morphomnist -name '*.png' -type f | wc -l | tr -d ' ')" -ge 5
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: frontend
+      - id: deployment
+        uses: actions/deploy-pages@v4
