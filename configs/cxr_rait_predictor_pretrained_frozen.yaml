@@ -1,0 +1,35 @@
+dataset:
+  name: cxr_rait
+  root: gs://cxr-rait/cxr-demography-data
+  input_res: 224
+  pad: 0
+  augment: true
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.1
+  batch_size: 16
+
+workflow:
+  type: finetune-predictor
+  epochs: 100
+  checkpoint_freq: 1
+  execution_mode: auto
+  freeze_backbone: true
+  backbone_lr_scale: 0.0
+  warmup_epochs: 0
+  label_smoothing: 0.05
+  torchxray_preprocessing: true
+  dropout_rate: 0.2
+  pretrained_weights_path: checkpoints/pretrained/torchxrayvision_densenet121_flax.npz
+
+artifacts:
+  root: checkpoints
+  remote_root: gs://cxr-rait/checkpoints
+  run_name: predictor_densenet121-frozen_jax-cpu_03-08-2026
+
+seed: 7
+runtime:
+  accelerator: cpu
+  gpu_id: null
+  precision: fp32
