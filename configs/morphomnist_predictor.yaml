@@ -22,7 +22,8 @@ runtime:
   precision: fp32
 artifacts:
   root: checkpoints
-  run_name: predictor_jax-cpu-v2_23-07-2026
+  # run_name: predictor_jax-cpu-v2_23-07-2026
+  run_name: predictor_jax-cpu_27-07-2026
   remote_root: gs://medical-airnd/causal-gen/checkpoints
 workflow:
   type: train-predictor

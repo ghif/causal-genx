@@ -18,6 +18,7 @@ class DatasetConfig(BaseModel):
     pad: int = 4
     hflip: float = 0.5
     context_norm: str = "[-1,1]"
+    augment: bool = True
 
 
 class RuntimeConfig(BaseModel):
@@ -79,13 +80,16 @@ class ScmTrainingConfig(BaseModel):
 
 class PredictorTrainingConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
-    type: Literal["train-predictor"]
+    type: Literal["train-predictor", "finetune-predictor"]
     predictor_model: str = "morphomnist_image_parent_predictor"
     epochs: PositiveInt = 1000
     speed_log_freq: PositiveInt = 50
     checkpoint_freq: PositiveInt = 1
     execution_mode: Literal["auto", "single_device", "replicated"] = "auto"
     drop_remainder: bool = True
+    freeze_backbone: bool = True
+    backbone_lr_scale: float = 1.0
+    pretrained_weights_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz"
 
 
 class ImageModelTrainingConfig(BaseModel):

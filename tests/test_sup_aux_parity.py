@@ -253,7 +253,7 @@ def test_sup_aux_ema_and_checkpoint_round_trip(tmp_path):
             {"value": jnp.array(float(index))}, {"mean": jnp.array(float(index))}
         )
     assert ema.step == 101
-    assert not ema.initted
+    assert ema.initted
     np.testing.assert_allclose(ema.params["value"], 100.0)
 
     ema.update({"value": jnp.array(1.0)}, {"mean": jnp.array(1.0)})

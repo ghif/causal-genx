@@ -70,6 +70,11 @@ class PredictorRunArguments:
     context_norm: str = ""
     context_dim: int = 0
     concat_pa: bool = False
+    freeze_backbone: bool = True
+    backbone_lr_scale: float = 1.0
+    pretrained_weights_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz"
+    augment: bool = True
+    type: str = "train-predictor"
     save_dir: str = ""
     checkpoint_dir: str = ""
     remote_save_dir: str = ""
@@ -101,19 +106,16 @@ class WarmupEMA:
     beta: float = 0.999
     update_after_step: int = 100
     inv_gamma: float = 1.0
-    power: float = 1.0
+    power: float = 2.0 / 3.0
     min_value: float = 0.0
 
     @classmethod
     def init_from(cls, params: Any, batch_stats: Any) -> "WarmupEMA":
-        return cls(params=tree_copy(params), batch_stats=tree_copy(batch_stats))
+        return cls(params=tree_copy(params), batch_stats=tree_copy(batch_stats), step=0, initted=False)
 
     def update(self, params: Any, batch_stats: Any) -> None:
-        current_step = self.step
         self.step += 1
-        if current_step <= self.update_after_step:
-            self.params, self.batch_stats = tree_copy(params), tree_copy(batch_stats)
-            return
+        decay = float(np.clip(1.0 - (1.0 + self.step / self.inv_gamma) ** (-self.power), self.min_value, self.beta)) if self.step < self.update_after_step else self.beta
         if not self.initted:
             self.params, self.batch_stats, self.initted = tree_copy(params), tree_copy(batch_stats), True
         epoch = max(self.step - self.update_after_step - 1, 0)
@@ -141,6 +143,11 @@ def validate_artifacts(run_dir: str | Path) -> None:
 def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
     workflow = config.workflow
     assert isinstance(workflow, PredictorTrainingConfig)
+    freeze_backbone = getattr(workflow, "freeze_backbone", True)
+    if workflow.type == "finetune-predictor" and not hasattr(config.workflow, "freeze_backbone"):
+        freeze_backbone = False
+    backbone_lr_scale = float(getattr(workflow, "backbone_lr_scale", 1.0))
+    augment = getattr(config.dataset, "augment", True)
     return PredictorRunArguments(
         accelerator=config.runtime.accelerator, gpu_id=config.runtime.gpu_id,
         precision=config.runtime.precision, exp_name=config.artifacts.run_name,
@@ -152,16 +159,41 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         checkpoint_freq=workflow.checkpoint_freq, speed_log_freq=workflow.speed_log_freq,
         execution_mode=workflow.execution_mode, drop_remainder=workflow.drop_remainder,
         widths=[32, 32],
+        freeze_backbone=freeze_backbone,
+        backbone_lr_scale=backbone_lr_scale,
+        pretrained_weights_path=workflow.pretrained_weights_path,
+        augment=augment,
+        type=workflow.type,
     )
 
 
 def _validate_scope(args: PredictorRunArguments) -> None:
-    if args.dataset != "morphomnist":
-        raise ValueError("Predictor training currently supports only dataset=morphomnist")
+    if args.dataset not in {"morphomnist", "cxr_rait"}:
+        raise ValueError("Predictor training currently supports dataset=morphomnist or dataset=cxr_rait")
     if args.accelerator == "cpu" and args.precision != "fp32":
         raise ValueError("CPU predictor training requires precision=fp32")
-    if args.input_channels != 1 or args.input_res != 32 or args.pad != 4:
-        raise ValueError("MorphoMNIST predictor requires input_channels=1, input_res=32, and pad=4")
+
+
+def _configure_dataset_args(args: PredictorRunArguments) -> None:
+    if args.dataset == "cxr_rait":
+        from data.cxr_rait import CXR_RAIT_SCHEMA
+        args.parents_x = list(CXR_RAIT_SCHEMA.variable_names)
+        args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", CXR_RAIT_SCHEMA.encoded_dim, False
+    else:
+        from data.morphomnist import MORPHOMNIST_SCHEMA
+        args.parents_x = list(MORPHOMNIST_SCHEMA.variable_names)
+        args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", MORPHOMNIST_SCHEMA.encoded_dim, False
+
+
+def _build_datasets(args: PredictorRunArguments):
+    if args.dataset == "cxr_rait":
+        from data.cxr_rait import cxr_rait
+        datasets = cxr_rait(args)
+    else:
+        datasets = morphomnist(args)
+    indices = np.arange(len(datasets["train"]))
+    rng = np.random.RandomState(1); rng.shuffle(indices)
+    return datasets, _IndexedDataset(datasets["train"], indices[:int(args.sup_frac * len(indices))])
 
 
 def _validate_runtime_device(args: PredictorRunArguments) -> jax.Device:
@@ -243,18 +275,6 @@ def _use_tpu_replication(args: PredictorRunArguments) -> bool:
     return multi_tpu_available and requested_mode != "single_device"
 
 
-def _configure_dataset_args(args: PredictorRunArguments) -> None:
-    args.parents_x = ["thickness", "intensity", "digit"]
-    args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", 12, False
-
-
-def _build_datasets(args: PredictorRunArguments):
-    datasets = morphomnist(args)
-    indices = np.arange(len(datasets["train"]))
-    rng = np.random.RandomState(1); rng.shuffle(indices)
-    return datasets, _IndexedDataset(datasets["train"], indices[:int(args.sup_frac * len(indices))])
-
-
 def _merge(graphdef: Any, params: Any, batch_stats: Any):
     return nnx.merge(graphdef, params, batch_stats)
 
@@ -264,11 +284,21 @@ def _loss_and_state(graphdef: Any, params: Any, batch_stats: Any, batch: Dict[st
     model.train() if training else model.eval()
     log_probs = model.model_anticausal(**batch)
     loss = -jnp.mean(log_probs["joint"])
-    metrics = {"loss": loss, **{f"logp({key})": jnp.mean(log_probs[key]) for key in ("thickness_aux", "intensity_aux", "digit_aux")}}
+    metrics = {"loss": loss, **{f"logp({key})": jnp.mean(value) for key, value in log_probs.items() if key != "joint"}}
     return loss, metrics, nnx.state(model, nnx.Param).to_pure_dict(), nnx.state(model, nnx.BatchStat).to_pure_dict()
 
 
-def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation):
+def _scale_backbone_grads(grads: Any, scale: float) -> Any:
+    if scale == 1.0:
+        return grads
+    def _scale(path, val):
+        if any("encoder_shared" in str(p) for p in path):
+            return val * scale
+        return val
+    return jax.tree_util.tree_map_with_path(_scale, grads)
+
+
+def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation, backbone_lr_scale: float = 1.0):
     """Compile one predictor update, including BatchNorm state evolution."""
     @jax.jit
     def train_step(params, batch_stats, opt_state, batch):
@@ -276,6 +306,7 @@ def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation):
             loss, metrics, new_params, new_batch_stats = _loss_and_state(graphdef, current_params, batch_stats, batch, training=True)
             return loss, (metrics, new_params, new_batch_stats)
         (_, (metrics, _new_params, new_batch_stats)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        grads = _scale_backbone_grads(grads, backbone_lr_scale)
         grad_norm = optax.global_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_batch_stats, opt_state, metrics, grad_norm
@@ -286,6 +317,7 @@ def _make_pmap_train_step(
     graphdef: Any,
     optimizer: optax.GradientTransformation,
     devices: list[jax.Device],
+    backbone_lr_scale: float = 1.0,
 ):
     """Compile a synchronized multi-core TPU predictor update."""
     def train_step(params, batch_stats, opt_state, batch):
@@ -297,6 +329,7 @@ def _make_pmap_train_step(
 
         (_, (metrics, new_batch_stats)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = jax.lax.pmean(grads, axis_name="devices")
+        grads = _scale_backbone_grads(grads, backbone_lr_scale)
         metrics = jax.tree_util.tree_map(
             lambda value: jax.lax.pmean(value, axis_name="devices"), metrics
         )
@@ -348,25 +381,24 @@ def _eval_epoch(graphdef: Any, params: Any, batch_stats: Any, dataset: Any, batc
     totals: Dict[str, float] = {}; count = 0
     for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
         _, metrics, _, _ = _loss_and_state(graphdef, params, batch_stats, batch, training=False)
-        size = int(batch["digit"].shape[0])
+        size = int(next(iter(batch.values())).shape[0])
+
         for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
         count += size
     return {key: value / max(1, count) for key, value in totals.items()}
 
 
 def _progress_description(mode: str, stats: Dict[str, float], grad_norm: Optional[float] = None) -> str:
-    ordered = ("loss", "logp(digit_aux)", "logp(thickness_aux)", "logp(intensity_aux)")
+    keys = ["loss"] + [k for k in sorted(stats.keys()) if k != "loss" and k.startswith("logp(")]
     description = " => " + mode + " | " + ", ".join(
-        f"{key}: {stats[key]:.4f}" for key in ordered if key in stats
+        f"{key}: {stats[key]:.4f}" for key in keys if key in stats
     )
     return description if grad_norm is None else f"{description}, grad_norm: {grad_norm:.3f}"
 
 
 def _prediction_description(metrics: Dict[str, float]) -> str:
     return " - ".join(
-        f"{key}: {metrics[key]:.4f}"
-        for key in ("thickness_mae", "intensity_mae", "digit_acc")
-        if key in metrics
+        f"{key}: {metrics[key]:.4f}" for key in sorted(metrics.keys())
     )
 
 
@@ -441,10 +473,14 @@ def _write_epoch_summary(
     total_time: float,
     iter_per_sec: float,
     sample_per_sec: float,
+    train_prediction_stats: Optional[Dict[str, float]] = None,
 ) -> None:
     """Persist the complete completed-epoch predictor summary to TensorBoard."""
     for key, value in train_stats.items():
         writer.add_scalar(f"train/{key}", value, step)
+    if train_prediction_stats:
+        for key, value in train_prediction_stats.items():
+            writer.add_scalar(f"train/{key}", value, step)
     for key, value in valid_stats.items():
         writer.add_scalar(f"valid/{key}", value, step)
     for key, value in prediction_stats.items():
@@ -471,11 +507,15 @@ def _log_epoch_summary(
     total_time: float,
     iter_per_sec: float,
     sample_per_sec: float,
+    train_prediction_stats: Optional[Dict[str, float]] = None,
 ) -> None:
     """Write the same completed-epoch metrics to the console and train log."""
+    train_desc = _progress_description("train", train_stats).strip()
+    if train_prediction_stats:
+        train_desc = f"{train_desc} - {_prediction_description(train_prediction_stats)}"
     logger.info(
         "%s - steps: %d - it/s: %.3f - samples/s: %.3f",
-        _progress_description("train", train_stats).strip(), step, iter_per_sec, sample_per_sec,
+        train_desc, step, iter_per_sec, sample_per_sec,
     )
     logger.info(
         "%s - %s - steps: %d",
@@ -495,13 +535,17 @@ def _prediction_metrics(args: PredictorRunArguments, model: Any, dataset: Any, b
         for key in targets: targets[key].extend(np.asarray(batch[key]))
         for key, value in model.predict(**batch).items(): predictions[key].extend(np.asarray(value))
     stats: Dict[str, float] = {}
-    for key in model.variables:
-        if key == "digit":
-            stats["digit_acc"] = float((np.asarray(targets[key]).argmax(-1) == np.asarray(predictions[key]).argmax(-1)).mean())
+    for key, var_kind in getattr(model, "variables", {}).items():
+        if var_kind == "categorical" or key == "digit":
+            stats[f"{key}_acc"] = float((np.asarray(targets[key]).argmax(-1) == np.asarray(predictions[key]).argmax(-1)).mean())
         else:
-            low, high = dataset.min_max[key]
-            prediction = ((np.asarray(predictions[key]).squeeze(-1) + 1.0) / 2.0) * (high - low) + low
-            target = ((np.asarray(targets[key]).squeeze(-1) + 1.0) / 2.0) * (high - low) + low
+            if hasattr(dataset, "min_max") and key in dataset.min_max:
+                low, high = dataset.min_max[key]
+                prediction = ((np.asarray(predictions[key]).squeeze(-1) + 1.0) / 2.0) * (high - low) + low
+                target = ((np.asarray(targets[key]).squeeze(-1) + 1.0) / 2.0) * (high - low) + low
+            else:
+                prediction = np.asarray(predictions[key]).squeeze(-1)
+                target = np.asarray(targets[key]).squeeze(-1)
             stats[f"{key}_mae"] = float(np.mean(np.abs(target - prediction)))
     return stats
 
@@ -526,7 +570,67 @@ def _assert_compatible_checkpoint(checkpoint: Dict[str, Any], params: Any, batch
 
 def _setup_logging(args: PredictorRunArguments) -> logging.Logger:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s, %(message)s", datefmt="%d-%b-%y %H:%M:%S", handlers=[logging.StreamHandler(), logging.FileHandler(os.path.join(args.save_dir, "trainlog.txt"), mode="a")], force=True)
-    return logging.getLogger(args.exp_name or "morphomnist-predictor")
+    logging.getLogger("orbax").setLevel(logging.WARNING)
+    logging.getLogger("absl").setLevel(logging.WARNING)
+    return logging.getLogger(args.exp_name or f"{args.dataset}-predictor")
+
+
+
+def _log_input_normalization(
+    logger: logging.Logger,
+    dataset: Any,
+    train_dataset: Any,
+    args: Any,
+) -> Dict[str, Any]:
+    """Display and log input preprocessing and attribute normalization statistics."""
+    logger.info(
+        "Input Normalization Check (dataset=%s, context_norm=%s, input_res=%d, pad=%d):",
+        args.dataset, getattr(args, "context_norm", "N/A"), args.input_res, args.pad,
+    )
+
+    try:
+        sample_batch = train_dataset.make_batch(np.arange(min(len(train_dataset), 8)))
+        if "x" in sample_batch:
+            x = sample_batch["x"]
+            logger.info(
+                "  Image 'x': shape=%s, min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
+                tuple(x.shape[1:]), float(np.min(x)), float(np.max(x)), float(np.mean(x)), float(np.std(x)),
+            )
+    except Exception as err:
+        logger.warning("  Image 'x': could not compute sample stats (%s)", err)
+
+    min_max = getattr(dataset, "min_max", {})
+    samples = getattr(dataset, "samples", {})
+    stats_summary = {}
+
+    for var in getattr(args, "parents_x", []) or []:
+        if var in samples:
+            data = samples[var]
+            is_one_hot = (data.ndim == 2 and data.shape[1] > 1) or (var == "digit")
+            if is_one_hot:
+                dim = data.shape[1] if data.ndim == 2 else 10
+                logger.info(
+                    "  Variable '%s' (categorical): dim=%d, min=%.4f, max=%.4f",
+                    var, dim, float(np.min(data)), float(np.max(data)),
+                )
+                stats_summary[var] = {"kind": "categorical", "dim": dim}
+            else:
+                raw_range_str = f"[{min_max[var][0]:.4f}, {min_max[var][1]:.4f}]" if var in min_max else "N/A"
+                norm_min, norm_max = float(np.min(data)), float(np.max(data))
+                norm_mean, norm_std = float(np.mean(data)), float(np.std(data))
+                logger.info(
+                    "  Variable '%s' (continuous): raw_min_max=%s, norm_min=%.4f, norm_max=%.4f, norm_mean=%.4f, norm_std=%.4f",
+                    var, raw_range_str, norm_min, norm_max, norm_mean, norm_std,
+                )
+                stats_summary[var] = {
+                    "kind": "continuous",
+                    "raw_min_max": min_max.get(var),
+                    "norm_min": norm_min,
+                    "norm_max": norm_max,
+                    "norm_mean": norm_mean,
+                    "norm_std": norm_std,
+                }
+    return stats_summary
 
 
 def _run(args: PredictorRunArguments) -> Dict[str, float]:
@@ -534,12 +638,38 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     checkpoint: Optional[Dict[str, Any]] = load_checkpoint(args.load_path) if args.load_path else None
     if checkpoint is not None: _restore_args(args, checkpoint)
     _validate_scope(args); _validate_runtime_device(args); dtype = _compute_dtype(args); _configure_dataset_args(args); seed_all(args.seed, args.deterministic)
-    args.save_dir = experiment_run_dir(args.ckpt_dir, "morphomnist", args.exp_name, "pgm")
-    args.checkpoint_dir = checkpoint_root_dir(args.save_dir); args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, "morphomnist", args.exp_name, "pgm")
+    args.save_dir = experiment_run_dir(args.ckpt_dir, args.dataset, args.exp_name, "pgm")
+    args.checkpoint_dir = checkpoint_root_dir(args.save_dir); args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.dataset, args.exp_name, "pgm")
+
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
-    # The labelled subset is deterministic, making partial-supervision runs reproducible.
     logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets, train_dataset = _build_datasets(args); valid_dataset = datasets["valid"]
-    model = MorphoMNISTSupAuxPredictor(input_channels=args.input_channels, input_res=args.input_res, width=8, std_fixed=args.std_fixed, compute_dtype=dtype, rngs=nnx.Rngs(args.seed))
+    _log_input_normalization(logger, datasets["train"], train_dataset, args)
+    if args.dataset == "cxr_rait":
+        if args.type == "finetune-predictor" or getattr(args, "freeze_backbone", False) or getattr(args, "pretrained", False):
+            from causal.cxr_rait_predictor import CxrRaitPretrainedPredictor
+            model = CxrRaitPretrainedPredictor(
+                input_channels=args.input_channels,
+                input_res=args.input_res,
+                width=32,
+                std_fixed=args.std_fixed,
+                freeze_backbone=getattr(args, "freeze_backbone", True),
+                weights_path=args.pretrained_weights_path,
+                compute_dtype=dtype,
+                rngs=nnx.Rngs(args.seed),
+            )
+        else:
+            from causal.cxr_rait_predictor import CxrRaitSupAuxPredictor
+            model = CxrRaitSupAuxPredictor(
+                input_channels=args.input_channels,
+                input_res=args.input_res,
+                width=16,
+                std_fixed=args.std_fixed,
+                compute_dtype=dtype,
+                rngs=nnx.Rngs(args.seed),
+            )
+    else:
+        model = MorphoMNISTSupAuxPredictor(input_channels=args.input_channels, input_res=args.input_res, width=8, std_fixed=args.std_fixed, compute_dtype=dtype, rngs=nnx.Rngs(args.seed))
+
     graphdef, params_state, batch_stats_state = nnx.split(model, nnx.Param, nnx.BatchStat); model_params, model_batch_stats = params_state.to_pure_dict(), batch_stats_state.to_pure_dict()
     optimizer = optax.chain(optax.clip_by_global_norm(200.0), optax.adamw(args.lr, b1=0.9, b2=0.999, eps=1e-8, weight_decay=args.wd)); opt_state = optimizer.init(model_params); ema = WarmupEMA.init_from(model_params, model_batch_stats)
     start_epoch = step = 0; best_loss = float("inf")
@@ -569,7 +699,8 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             "execution_mode=replicated local_device_count=%d global_batch_size=%d per_device_batch_size=%d",
             device_count, args.bs, args.bs // device_count,
         )
-        train_step = _make_pmap_train_step(graphdef, optimizer, devices)
+        backbone_lr_scale = float(getattr(args, "backbone_lr_scale", 1.0))
+        train_step = _make_pmap_train_step(graphdef, optimizer, devices, backbone_lr_scale=backbone_lr_scale)
         model_params = _replicate(model_params, devices)
         model_batch_stats = _replicate(model_batch_stats, devices)
         opt_state = _replicate(opt_state, devices)
@@ -584,7 +715,8 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             "execution_mode=single_device accelerator=%s local_device_count=%d global_batch_size=%d",
             args.accelerator, jax.local_device_count(), args.bs,
         )
-        train_step = _make_train_step(graphdef, optimizer)
+        backbone_lr_scale = float(getattr(args, "backbone_lr_scale", 1.0))
+        train_step = _make_train_step(graphdef, optimizer, backbone_lr_scale=backbone_lr_scale)
     final_stats: Dict[str, float] = {}
     artifact_writer = BackgroundArtifactWriter()
     metric_artifact_writer = BackgroundArtifactWriter()
@@ -601,11 +733,12 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             ):
                 if use_tpu_pmap:
                     batch = _shard_batch(batch, devices)
-                model_params, model_batch_stats, opt_state, metrics, grad_norm = train_step(model_params, model_batch_stats, opt_state, batch); ema.update(model_params, model_batch_stats); size = int(batch["digit"].shape[0])
+                model_params, model_batch_stats, opt_state, metrics, grad_norm = train_step(model_params, model_batch_stats, opt_state, batch); ema.update(model_params, model_batch_stats); size = int(next(iter(batch.values())).shape[0])
                 if use_tpu_pmap:
                     metrics = _unreplicate(metrics)
                     grad_norm = _first_local_replica(grad_norm)
-                    size *= int(batch["digit"].shape[1])
+                    size *= int(next(iter(batch.values())).shape[1])
+
                 for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
                 seen += size; step += 1
                 if batch_index % max(1, getattr(args, "speed_log_freq", 50)) == 0:
@@ -645,7 +778,9 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             )
             valid_stats = _eval_epoch(graphdef, portable_ema.params, portable_ema.batch_stats, valid_dataset, args.bs, rng); final_stats = valid_stats
             train_time = time.perf_counter() - epoch_step_t0
-            prediction_stats = _prediction_metrics(args, _merge(graphdef, portable_ema.params, portable_ema.batch_stats), valid_dataset, args.bs, rng)
+            eval_model = _merge(graphdef, portable_ema.params, portable_ema.batch_stats)
+            train_prediction_stats = _prediction_metrics(args, eval_model, train_dataset, args.bs, rng)
+            prediction_stats = _prediction_metrics(args, eval_model, valid_dataset, args.bs, rng)
             epoch_iter_per_sec = total_batches / max(train_time, 1e-12)
             epoch_sample_per_sec = seen / max(train_time, 1e-12)
             total_time = time.perf_counter() - epoch_t0
@@ -654,6 +789,7 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
                 valid_stats=valid_stats, prediction_stats=prediction_stats,
                 train_time=train_time, total_time=total_time,
                 iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
+                train_prediction_stats=train_prediction_stats,
             )
             _writer_add_custom_scalars(writer)
             _log_epoch_summary(
@@ -661,8 +797,9 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
                 valid_stats=valid_stats, prediction_stats=prediction_stats,
                 train_time=train_time, total_time=total_time,
                 iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
+                train_prediction_stats=train_prediction_stats,
             )
-            checkpoint_due = _checkpoint_due(epoch + 1, args.checkpoint_freq)
+            checkpoint_due = _checkpoint_due(epoch + 1, getattr(args, "checkpoint_freq", 1))
             if checkpoint_due and valid_stats["loss"] < best_loss:
                 best_loss = valid_stats["loss"]
                 _submit_best_checkpoint(

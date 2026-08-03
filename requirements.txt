@@ -24,3 +24,6 @@ fastapi>=0.112.0,<0.113.0
 huggingface-hub>=0.19.3,<1.0
 pydantic>=2.0,<2.10
 PyYAML>=6.0
+pydicom>=2.4.0
+openpyxl>=3.1.0
+

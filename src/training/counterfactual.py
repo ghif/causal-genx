@@ -1129,8 +1129,8 @@ def main(args):
     seed_all(args.seed, args.deterministic)
     if args.do_pa in {"None", "none", "null", ""}:
         args.do_pa = None
-    if args.dataset != "morphomnist":
-        raise ValueError("JAX counterfactual finetuning currently supports --dataset morphomnist only")
+    if args.dataset not in {"morphomnist", "cxr_rait"}:
+        raise ValueError("JAX counterfactual finetuning currently supports dataset morphomnist or cxr_rait")
 
     if not hasattr(args, "elbo_constraint") or args.elbo_constraint is None:
         args.elbo_constraint = 1.841216802597046
@@ -1138,7 +1138,12 @@ def main(args):
     # Load and validate each upstream component independently. This fails early
     # if a checkpoint has the wrong architecture, schema, or device topology.
     vae_ckpt, vae_bundle = _load_vae_bundle(args)
-    datasets = morphomnist(args)
+    if args.dataset == "cxr_rait":
+        from data.cxr_rait import cxr_rait
+        datasets = cxr_rait(args)
+    else:
+        datasets = morphomnist(args)
+
     _print_dataset_normalization(datasets)
     _validate_vae_checkpoint(args, vae_bundle, datasets["test"])
 

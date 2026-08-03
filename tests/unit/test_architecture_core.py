@@ -126,11 +126,13 @@ def test_predictor_epoch_summary_writes_tensorboard_metrics_and_trainlog(caplog)
     }
     valid_stats = {key: value + 0.5 for key, value in train_stats.items()}
     prediction_stats = {"thickness_mae": 0.4, "intensity_mae": 0.5, "digit_acc": 0.6}
+    train_prediction_stats = {"thickness_mae": 0.1, "intensity_mae": 0.2, "digit_acc": 0.9}
 
     predictor._write_epoch_summary(
         RecordingWriter(), epoch=2, step=12, train_stats=train_stats,
         valid_stats=valid_stats, prediction_stats=prediction_stats,
         train_time=3.0, total_time=5.0, iter_per_sec=4.0, sample_per_sec=128.0,
+        train_prediction_stats=train_prediction_stats,
     )
     logger = logging.getLogger("predictor-epoch-summary-test")
     with caplog.at_level(logging.INFO, logger=logger.name):
@@ -138,10 +140,11 @@ def test_predictor_epoch_summary_writes_tensorboard_metrics_and_trainlog(caplog)
             logger, epoch=2, step=12, train_stats=train_stats,
             valid_stats=valid_stats, prediction_stats=prediction_stats,
             train_time=3.0, total_time=5.0, iter_per_sec=4.0, sample_per_sec=128.0,
+            train_prediction_stats=train_prediction_stats,
         )
 
     scalar_tags = {tag for tag, _, _ in scalars}
-    assert {f"train/{key}" for key in train_stats} <= scalar_tags
+    assert {f"train/{key}" for key in train_stats | train_prediction_stats} <= scalar_tags
     assert {f"valid/{key}" for key in valid_stats | prediction_stats} <= scalar_tags
     assert {
         "elbo/train", "elbo/valid", "epoch/number", "epoch/global_step",
@@ -149,7 +152,7 @@ def test_predictor_epoch_summary_writes_tensorboard_metrics_and_trainlog(caplog)
         "epoch/sample_per_sec",
     } <= scalar_tags
     assert all(step == 12 for _, _, step in scalars)
-    assert "=> train |" in caplog.text
+    assert "=> train | loss: 1.0000, logp(digit_aux): -0.1000, logp(intensity_aux): -0.3000, logp(thickness_aux): -0.2000 - digit_acc: 0.9000 - intensity_mae: 0.2000 - thickness_mae: 0.1000" in caplog.text
     assert "=> valid |" in caplog.text
     assert "train_time=3.0s total_time=5.0s" in caplog.text
 

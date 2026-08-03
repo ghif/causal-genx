@@ -106,7 +106,8 @@ from utils import load_checkpoint_with_path, materialize_nnx, open_file, seed_al
 
 DEFAULT_CHECKPOINT = (
     "gs://medical-airnd/causal-gen/checkpoints/morphomnist/"
-    "cf_jax-gpu-g4_17-07-2026/checkpoints/15444"
+    # "cf_jax-gpu-g4_17-07-2026/checkpoints/15444"
+    "cf_jax-tpu-v6e4_23-07-2026/checkpoints/15795"
 )
 
 MORPHO_MIN_MAX = {

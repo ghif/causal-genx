@@ -381,20 +381,31 @@ def _restore_orbax_step_direct(
             manager.close()
 
 
+def silence_orbax_logging() -> None:
+    """Quiet Orbax and ABSL loggers across all background threads."""
+    try:
+        from absl import logging as absl_logging
+        absl_logging.set_verbosity(absl_logging.ERROR)
+    except Exception:
+        pass
+    for name in ("orbax", "orbax.checkpoint", "absl"):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
+
+
 @contextmanager
-def _orbax_warning_filter(enabled: bool):
+def _orbax_warning_filter(enabled: bool = True):
     if not enabled:
         yield
         return
-
-    from absl import logging as absl_logging
-
-    previous_verbosity = absl_logging.get_verbosity()
-    absl_logging.set_verbosity(absl_logging.ERROR)
+    silence_orbax_logging()
     try:
         yield
     finally:
-        absl_logging.set_verbosity(previous_verbosity)
+        silence_orbax_logging()
+
+
 
 
 def _load_hparams_if_present(root_dir: str, restored: Dict[str, Any]) -> None:
@@ -416,16 +427,18 @@ def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None,
         metadata.setdefault("hparams", hparams)
         with open(os.path.join(path, "hparams.json"), "w", encoding="utf-8") as f:
             json.dump(hparams, f, indent=2, sort_keys=True)
-    manager = _checkpoint_manager(path, create=True)
-    try:
-        save_step = int(step if step is not None else data.get("step", 0))
-        manager.save(
-            save_step,
-            args=ocp.args.StandardSave(item=item, custom_metadata=metadata),
-        )
-        manager.wait_until_finished()
-    finally:
-        manager.close()
+    with _orbax_warning_filter(True):
+        manager = _checkpoint_manager(path, create=True)
+        try:
+            save_step = int(step if step is not None else data.get("step", 0))
+            manager.save(
+                save_step,
+                args=ocp.args.StandardSave(item=item, custom_metadata=metadata),
+            )
+            manager.wait_until_finished()
+        finally:
+            manager.close()
+
 
 
 def _save_checkpoint_and_sync(
@@ -472,6 +485,7 @@ class BackgroundArtifactWriter:
         self._worker.start()
 
     def _run(self) -> None:
+        silence_orbax_logging()
         while True:
             with self._condition:
                 while self._pending is None and not self._closed:
@@ -483,7 +497,9 @@ class BackgroundArtifactWriter:
                 self._pending = None
                 self._running = True
             try:
+                silence_orbax_logging()
                 fn(*args, **kwargs)
+
             except BaseException as exc:  # surfaced by flush/close on the host
                 with self._condition:
                     if self._error is None:

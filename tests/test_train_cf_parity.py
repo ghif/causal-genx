@@ -325,7 +325,7 @@ def test_eval_split_rejects_nan_batches(monkeypatch):
             "thickness": jnp.zeros((batch["x"].shape[0], 1), dtype=jnp.float32)
         },
     )
-    monkeypatch.setattr(train_cf, "tqdm", lambda iterable, **kwargs: _DummyTqdm(iterable, **kwargs))
+    monkeypatch.setattr(train_cf, "tqdm", lambda iterable, **kwargs: _DummyTqdm(iterable, **kwargs), raising=False)
     monkeypatch.setattr(
         train_cf,
         "_predictor_metrics",
@@ -387,7 +387,7 @@ def test_predictor_preflight_normalizes_images_before_likelihood(monkeypatch):
     predictor = _FinitePredictor()
     bundle = SimpleNamespace(materialize=lambda: predictor)
 
-    monkeypatch.setattr(train_cf, "tqdm", lambda iterable, **kwargs: _DummyTqdm(iterable, **kwargs))
+    monkeypatch.setattr(train_cf, "tqdm", lambda iterable, **kwargs: _DummyTqdm(iterable, **kwargs), raising=False)
 
     metrics_calls = []
 
