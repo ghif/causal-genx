@@ -26,7 +26,7 @@ workflow:
 artifacts:
   root: checkpoints
   remote_root: gs://cxr-rait/checkpoints
-  run_name: predictor_densenet121-unfrozen_jax-cpu_03-08-2026
+  run_name: predictor_densenet121-unfrozen_jax-gpu_03-08-2026
 
 seed: 7
 runtime:
