@@ -34,6 +34,6 @@ workflow:
   drop_remainder: true
   checkpoint_freq: 1
   # Produced by: python scripts/convert_cxr_weights.py
-  pretrained_weights_path: checkpoints/pretrained/torchxrayvision_densenet121_flax.npz
+  pretrained_weights_path: gs://cxr-rait/checkpoints/pretrained/torchxrayvision_densenet121_flax.npz
   # freeze_backbone: true
   freeze_backbone: false

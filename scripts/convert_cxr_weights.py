@@ -4,10 +4,21 @@
 import argparse
 import os
 import sys
+from pathlib import Path
 import numpy as np
 
 
-def convert_torchxrayvision_to_flax(weights_name: str = "densenet121-res224-all", output_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz"):
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+
+def convert_torchxrayvision_to_flax(
+    weights_name: str = "densenet121-res224-all",
+    output_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz",
+    remote_output: str = "gs://cxr-rait/checkpoints/pretrained/torchxrayvision_densenet121_flax.npz",
+):
     import torch
     import torchxrayvision as xrv
 
@@ -35,15 +46,30 @@ def convert_torchxrayvision_to_flax(weights_name: str = "densenet121-res224-all"
     np.savez_compressed(output_path, **flax_weights)
     print(f"✅ Successfully converted {len(flax_weights)} layers!")
     print(f"Saved JAX/Flax checkpoint to: {output_path}")
+    if remote_output:
+        from utils import sync_file
+
+        sync_file(output_path, remote_output)
+        print(f"Uploaded canonical checkpoint to: {remote_output}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Convert TorchXRayVision PyTorch weights to JAX/Flax format.")
     parser.add_argument("--weights", type=str, default="densenet121-res224-all", help="TorchXRayVision weights specifier")
     parser.add_argument("--output", type=str, default="checkpoints/pretrained/torchxrayvision_densenet121_flax.npz", help="Output .npz file path")
+    parser.add_argument(
+        "--remote-output",
+        type=str,
+        default="gs://cxr-rait/checkpoints/pretrained/torchxrayvision_densenet121_flax.npz",
+        help="Canonical GCS destination; pass an empty string to skip upload.",
+    )
     args = parser.parse_args()
 
-    convert_torchxrayvision_to_flax(weights_name=args.weights, output_path=args.output)
+    convert_torchxrayvision_to_flax(
+        weights_name=args.weights,
+        output_path=args.output,
+        remote_output=args.remote_output,
+    )
 
 
 if __name__ == "__main__":

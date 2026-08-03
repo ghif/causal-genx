@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,8 @@ from config import ExperimentConfig, PredictorTrainingConfig
 from data.morphomnist import morphomnist
 from utils import (
     BackgroundArtifactWriter, SummaryWriter, checkpoint_root_dir, ensure_dir,
-    experiment_run_dir, load_checkpoint, seed_all, sync_file, tree_copy,
+    ensure_parent_dir, experiment_run_dir, load_checkpoint, local_staging_path,
+    open_file, seed_all, sync_file, tree_copy,
 )
 
 from .common import epoch_batches, stage_run_dir
@@ -72,7 +74,7 @@ class PredictorRunArguments:
     concat_pa: bool = False
     freeze_backbone: bool = True
     backbone_lr_scale: float = 1.0
-    pretrained_weights_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz"
+    pretrained_weights_path: str = "gs://cxr-rait/checkpoints/pretrained/torchxrayvision_densenet121_flax.npz"
     warmup_epochs: int = 0
     label_smoothing: float = 0.0
     torchxray_preprocessing: bool = False
@@ -204,6 +206,20 @@ def _build_datasets(args: PredictorRunArguments):
     indices = np.arange(len(datasets["train"]))
     rng = np.random.RandomState(1); rng.shuffle(indices)
     return datasets, _IndexedDataset(datasets["train"], indices[:int(args.sup_frac * len(indices))])
+
+
+def _materialize_pretrained_weights(weights_path: str) -> str:
+    """Download the canonical GCS archive into a disposable local read cache."""
+    if not weights_path.startswith("gs://"):
+        raise ValueError(
+            "pretrained_weights_path must be a gs:// URI so GCS remains the source of truth; "
+            f"got {weights_path!r}"
+        )
+    local_path = local_staging_path(weights_path)
+    ensure_parent_dir(local_path)
+    with open_file(weights_path, "rb") as source, open(local_path, "wb") as destination:
+        shutil.copyfileobj(source, destination)
+    return local_path
 
 
 def _validate_runtime_device(args: PredictorRunArguments) -> jax.Device:
@@ -676,13 +692,19 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     if args.dataset == "cxr_rait":
         if args.type == "finetune-predictor" or getattr(args, "freeze_backbone", False) or getattr(args, "pretrained", False):
             from causal.cxr_rait_predictor import CxrRaitPretrainedPredictor
+            local_weights_path = _materialize_pretrained_weights(args.pretrained_weights_path)
+            logger.info(
+                "pretrained_weights_source=%s local_cache=%s",
+                args.pretrained_weights_path,
+                local_weights_path,
+            )
             model = CxrRaitPretrainedPredictor(
                 input_channels=args.input_channels,
                 input_res=args.input_res,
                 width=32,
                 std_fixed=args.std_fixed,
                 freeze_backbone=getattr(args, "freeze_backbone", True),
-                weights_path=args.pretrained_weights_path,
+                weights_path=local_weights_path,
                 dropout_rate=getattr(args, "dropout_rate", 0.0),
                 label_smoothing=getattr(args, "label_smoothing", 0.0),
                 compute_dtype=dtype,

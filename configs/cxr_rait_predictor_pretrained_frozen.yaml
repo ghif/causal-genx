@@ -21,7 +21,7 @@ workflow:
   label_smoothing: 0.05
   torchxray_preprocessing: true
   dropout_rate: 0.2
-  pretrained_weights_path: checkpoints/pretrained/torchxrayvision_densenet121_flax.npz
+  pretrained_weights_path: gs://cxr-rait/checkpoints/pretrained/torchxrayvision_densenet121_flax.npz
 
 artifacts:
   root: checkpoints

@@ -1,6 +1,10 @@
 import logging
+from io import BytesIO
 import numpy as np
 from types import SimpleNamespace
+import pytest
+
+from training import predictor
 from training.predictor import _log_input_normalization
 
 
@@ -37,3 +41,16 @@ def test_log_input_normalization(caplog):
     assert "Input Normalization Check" in caplog.text
     assert "Image 'x'" in caplog.text
     assert "Variable 'thickness'" in caplog.text
+
+
+def test_pretrained_weights_are_materialized_from_gcs(tmp_path, monkeypatch):
+    remote_path = "gs://cxr-rait/checkpoints/pretrained/weights.npz"
+    cache_path = tmp_path / "weights.npz"
+    monkeypatch.setattr(predictor, "local_staging_path", lambda _: str(cache_path))
+    monkeypatch.setattr(predictor, "open_file", lambda path, mode: BytesIO(b"canonical-weights"))
+
+    assert predictor._materialize_pretrained_weights(remote_path) == str(cache_path)
+    assert cache_path.read_bytes() == b"canonical-weights"
+
+    with pytest.raises(ValueError, match="gs:// URI"):
+        predictor._materialize_pretrained_weights("checkpoints/pretrained/weights.npz")
