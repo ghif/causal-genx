@@ -14,6 +14,11 @@ class DatasetConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     name: str = "morphomnist"
     root: str = "gs://medical-airnd/causal-gen/datasets/morphomnist"
+    metadata: str = ""
+    image_prefix: str = ""
+    split_manifest: str = ""
+    tb_label_mode: Literal["any_tb", "tb_only", "tb_or_sequelae"] = "tb_or_sequelae"
+    min_category_count: PositiveInt = 1
     input_res: PositiveInt = 32
     pad: int = 4
     hflip: float = 0.5

@@ -12,11 +12,14 @@ from typing import Any
 from config import CounterfactualTrainingConfig, ExperimentConfig, ImageModelTrainingConfig
 from data.morphomnist import MORPHOMNIST_SCHEMA
 from data.cxr_rait import CXR_RAIT_SCHEMA
+from data.padchest import PAD_CHEST_SCHEMA
 
 
 def _get_schema(dataset_name: str):
     if dataset_name == "cxr_rait":
         return CXR_RAIT_SCHEMA
+    if dataset_name == "padchest":
+        return PAD_CHEST_SCHEMA
     return MORPHOMNIST_SCHEMA
 
 

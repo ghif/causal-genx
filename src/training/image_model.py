@@ -19,6 +19,7 @@ from flax import nnx
 
 from config import ExperimentConfig
 from data.morphomnist import morphomnist
+from data.padchest import padchest
 from models.image_vae import HVAE, SimpleVAE
 from utils import (
     SummaryWriter,
@@ -135,7 +136,7 @@ def _run(args: ImageModelSettings) -> None:
     )
     logger.info("loading datasets")
     writer = SummaryWriter(args.save_dir)
-    datasets = morphomnist(args)
+    datasets = padchest(args) if args.dataset_id == "padchest" else morphomnist(args)
     logger.info("datasets loaded")
     logger.info("building model")
     model = _build_model(args)

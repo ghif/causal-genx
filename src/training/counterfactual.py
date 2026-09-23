@@ -26,6 +26,7 @@ from flax import nnx
 
 from config import CounterfactualTrainingConfig, ExperimentConfig
 from data.morphomnist import morphomnist
+from data.padchest import padchest
 from models.image_vae import HVAE
 from .counterfactual_support import (
     clip_counterfactual_grads,
@@ -1129,8 +1130,8 @@ def main(args):
     seed_all(args.seed, args.deterministic)
     if args.do_pa in {"None", "none", "null", ""}:
         args.do_pa = None
-    if args.dataset not in {"morphomnist", "cxr_rait"}:
-        raise ValueError("JAX counterfactual finetuning currently supports dataset morphomnist or cxr_rait")
+    if args.dataset not in {"morphomnist", "cxr_rait", "padchest"}:
+        raise ValueError("JAX counterfactual finetuning currently supports dataset morphomnist, cxr_rait, or padchest")
 
     if not hasattr(args, "elbo_constraint") or args.elbo_constraint is None:
         args.elbo_constraint = 1.841216802597046
@@ -1141,6 +1142,8 @@ def main(args):
     if args.dataset == "cxr_rait":
         from data.cxr_rait import cxr_rait
         datasets = cxr_rait(args)
+    elif args.dataset == "padchest":
+        datasets = padchest(args)
     else:
         datasets = morphomnist(args)
 

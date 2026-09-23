@@ -56,6 +56,8 @@ class ScmRunArguments:
     exp_name: str
     dataset: str
     data_dir: str
+    metadata: str
+    image_prefix: str
     ckpt_dir: str
     remote_ckpt_dir: str
     seed: int
@@ -116,6 +118,8 @@ def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
         exp_name=config.artifacts.run_name,
         dataset=config.dataset.name,
         data_dir=config.dataset.root,
+        metadata=config.dataset.metadata,
+        image_prefix=config.dataset.image_prefix,
         ckpt_dir=config.artifacts.root,
         remote_ckpt_dir=config.artifacts.remote_root,
         seed=config.seed,
@@ -134,8 +138,8 @@ def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
 
 
 def _validate_scope(args: ScmRunArguments) -> None:
-    if args.dataset not in {"morphomnist", "cxr_rait"}:
-        raise ValueError("SCM training currently supports dataset=morphomnist or dataset=cxr_rait")
+    if args.dataset not in {"morphomnist", "cxr_rait", "padchest"}:
+        raise ValueError("SCM training currently supports dataset=morphomnist, cxr_rait, or padchest")
     if args.precision != "fp32":
         raise ValueError("SCM training requires precision=fp32")
 
@@ -143,9 +147,16 @@ def _validate_scope(args: ScmRunArguments) -> None:
 def _configure_dataset_args(args: ScmRunArguments) -> None:
     if args.dataset == "cxr_rait":
         from data.cxr_rait import CXR_RAIT_SCHEMA
-        args.parents_x = list(CXR_RAIT_SCHEMA.variable_names)
+        schema = CXR_RAIT_SCHEMA
+    elif args.dataset == "padchest":
+        from data.padchest import PAD_CHEST_SCHEMA
+        schema = PAD_CHEST_SCHEMA
+    else:
+        schema = None
+    if schema is not None:
+        args.parents_x = list(schema.variable_names)
         args.context_norm = "[-1,1]"
-        args.context_dim = CXR_RAIT_SCHEMA.encoded_dim
+        args.context_dim = schema.encoded_dim
         args.concat_pa = False
     else:
         from data.morphomnist import MORPHOMNIST_SCHEMA
@@ -471,7 +482,11 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
         from data.cxr_rait import cxr_rait
         datasets = cxr_rait(args)
         model = CxrRaitPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
-
+    elif args.dataset == "padchest":
+        from data.padchest import padchest
+        from causal.cxr_rait_scm import CxrRaitPGM
+        datasets = padchest(args)
+        model = CxrRaitPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
     else:
         datasets = morphomnist(args)
         model = MorphoMNISTPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))

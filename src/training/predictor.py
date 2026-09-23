@@ -24,6 +24,7 @@ from flax import nnx
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
 from config import ExperimentConfig, PredictorTrainingConfig
 from data.morphomnist import morphomnist
+from data.padchest import padchest
 from utils import (
     BackgroundArtifactWriter, SummaryWriter, checkpoint_root_dir, ensure_dir,
     ensure_parent_dir, experiment_run_dir, load_checkpoint, local_staging_path,
@@ -180,8 +181,8 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
 
 
 def _validate_scope(args: PredictorRunArguments) -> None:
-    if args.dataset not in {"morphomnist", "cxr_rait"}:
-        raise ValueError("Predictor training currently supports dataset=morphomnist or dataset=cxr_rait")
+    if args.dataset not in {"morphomnist", "cxr_rait", "padchest"}:
+        raise ValueError("Predictor training currently supports dataset=morphomnist, cxr_rait, or padchest")
     if args.accelerator == "cpu" and args.precision != "fp32":
         raise ValueError("CPU predictor training requires precision=fp32")
 
@@ -189,8 +190,15 @@ def _validate_scope(args: PredictorRunArguments) -> None:
 def _configure_dataset_args(args: PredictorRunArguments) -> None:
     if args.dataset == "cxr_rait":
         from data.cxr_rait import CXR_RAIT_SCHEMA
-        args.parents_x = list(CXR_RAIT_SCHEMA.variable_names)
-        args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", CXR_RAIT_SCHEMA.encoded_dim, False
+        schema = CXR_RAIT_SCHEMA
+    elif args.dataset == "padchest":
+        from data.padchest import PAD_CHEST_SCHEMA
+        schema = PAD_CHEST_SCHEMA
+    else:
+        schema = None
+    if schema is not None:
+        args.parents_x = list(schema.variable_names)
+        args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", schema.encoded_dim, False
     else:
         from data.morphomnist import MORPHOMNIST_SCHEMA
         args.parents_x = list(MORPHOMNIST_SCHEMA.variable_names)
@@ -201,6 +209,8 @@ def _build_datasets(args: PredictorRunArguments):
     if args.dataset == "cxr_rait":
         from data.cxr_rait import cxr_rait
         datasets = cxr_rait(args)
+    elif args.dataset == "padchest":
+        datasets = padchest(args)
     else:
         datasets = morphomnist(args)
     indices = np.arange(len(datasets["train"]))

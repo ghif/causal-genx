@@ -1,0 +1,40 @@
+version: "1"
+seed: 7
+dataset:
+  name: padchest
+  root: gs://external-cxr-dataset/padchest/unpacked/images-224
+  metadata: gs://external-cxr-dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv
+  image_prefix: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224
+  input_res: 128
+  pad: 0
+  context_norm: "[-1,1]"
+  tb_label_mode: tb_or_sequelae
+causal_schema:
+  version: "1"
+  variables: [age_at_study, sex, pediatric, tb_status, projection, view_position, study_year]
+  edges: [[age_at_study, tb_status], [sex, tb_status], [pediatric, tb_status]]
+model:
+  name: hierarchical_vae
+  context_dim: 22
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.1
+  batch_size: 64
+runtime:
+  accelerator: tpu
+  precision: bf16
+  expected_local_device_count: 1
+  expected_global_device_count: 1
+artifacts:
+  root: checkpoints
+  run_name: predictor_padchest_tpu_v6e1
+  remote_root: gs://external-cxr-dataset/padchest/checkpoints
+workflow:
+  type: train-predictor
+  predictor_model: cxr_rait_image_parent_predictor
+  epochs: 100
+  speed_log_freq: 10
+  execution_mode: single_device
+  drop_remainder: true
+  checkpoint_freq: 1
+  freeze_backbone: false
