@@ -18,7 +18,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -184,10 +184,12 @@ def _setup_logging(args: ScmRunArguments) -> logging.Logger:
 
 
 def preprocess(batch: Dict[str, np.ndarray]) -> Dict[str, jax.Array]:
-    x = np.asarray(batch["x"], dtype=np.float32)
-    if x.max(initial=0.0) > 1.5:
-        x = (x - 127.5) / 127.5
-    processed = {"x": jnp.asarray(x)}
+    processed: Dict[str, jax.Array] = {}
+    if "x" in batch:
+        x = np.asarray(batch["x"], dtype=np.float32)
+        if x.max(initial=0.0) > 1.5:
+            x = (x - 127.5) / 127.5
+        processed["x"] = jnp.asarray(x)
     for k, v in batch.items():
         if k == "x":
             continue
@@ -198,7 +200,32 @@ def preprocess(batch: Dict[str, np.ndarray]) -> Dict[str, jax.Array]:
     return processed
 
 
-def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bool, rng: np.random.Generator) -> Iterator[Dict[str, jax.Array]]:
+def _samples_batch(dataset: Any, batch_indices: np.ndarray, variables: Sequence[str] | None) -> Dict[str, np.ndarray] | None:
+    """Return a variable-only batch from ``dataset.samples`` when available.
+
+    SCM training optimizes tabular causal variables and does not consume image
+    tensors.  Remote image datasets such as PadChest can expose all required
+    variables through in-memory metadata, so this path avoids per-batch image
+    downloads while retaining the existing image-backed ``make_batch`` contract
+    for stages that need pixels.
+    """
+    if not variables:
+        return None
+    samples = getattr(dataset, "samples", None)
+    if samples is None or any(name not in samples for name in variables):
+        return None
+    return {name: np.asarray(samples[name])[batch_indices] for name in variables}
+
+
+def epoch_batches(
+    dataset: Any,
+    batch_size: int,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    rng: np.random.Generator,
+    variables: Sequence[str] | None = None,
+) -> Iterator[Dict[str, jax.Array]]:
     indices = np.arange(len(dataset), dtype=np.int64)
     if shuffle:
         rng.shuffle(indices)
@@ -206,9 +233,11 @@ def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bo
         batch_indices = indices[start : start + batch_size]
         if drop_last and batch_indices.size < batch_size:
             continue
-        batch = dataset.make_batch(batch_indices, rng=rng, shuffle=shuffle) if hasattr(dataset, "make_batch") else {
-            key: np.stack([np.asarray(dataset[int(index)][key]) for index in batch_indices]) for key in dataset[0]
-        }
+        batch = _samples_batch(dataset, batch_indices, variables)
+        if batch is None:
+            batch = dataset.make_batch(batch_indices, rng=rng, shuffle=shuffle) if hasattr(dataset, "make_batch") else {
+                key: np.stack([np.asarray(dataset[int(index)][key]) for index in batch_indices]) for key in dataset[0]
+            }
         yield preprocess(batch)
 
 
@@ -276,10 +305,17 @@ def _progress_description(mode: str, stats: Dict[str, float], grad_norm: Optiona
     return description if grad_norm is None else f"{description}, grad_norm: {grad_norm:.3f}"
 
 
-def _eval_epoch(graphdef: Any, params: Any, dataset: Any, batch_size: int, rng: np.random.Generator) -> Dict[str, float]:
+def _eval_epoch(
+    graphdef: Any,
+    params: Any,
+    dataset: Any,
+    batch_size: int,
+    rng: np.random.Generator,
+    variables: Sequence[str] | None = None,
+) -> Dict[str, float]:
     totals: Dict[str, float] = {}
     count = 0
-    for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
+    for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng, variables=variables):
         _, metrics = _loss(graphdef, params, batch)
         size = int(next(iter(batch.values())).shape[0])
         for key, value in metrics.items():
@@ -520,6 +556,7 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
     else:
         datasets = morphomnist(args)
         model = MorphoMNISTPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
+    variable_names = _model_variable_names(model)
     graphdef, _ = nnx.split(model, nnx.Param); params = nnx.state(model, nnx.Param).to_pure_dict()
 
     optimizer = optax.chain(optax.clip_by_global_norm(200.0), optax.adamw(args.lr, b1=0.9, b2=0.999, eps=1e-8, weight_decay=args.wd))
@@ -534,7 +571,7 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
     rng = np.random.default_rng(args.seed)
     if args.testing:
         if checkpoint is None: raise ValueError("testing requires load_path")
-        stats = _eval_epoch(graphdef, ema.params, datasets["test"], args.bs, rng); logger.info("test | %s", stats)
+        stats = _eval_epoch(graphdef, ema.params, datasets["test"], args.bs, rng, variable_names); logger.info("test | %s", stats)
         _plot_joint(args, graphdef, ema.params, datasets["test"], 0); _sync_pdf_artifacts(args); writer.close(); return stats
     for key in sorted(vars(args)): logger.info("--%s=%s", key, getattr(args, key))
     train_step = _make_train_step(graphdef, optimizer); final_stats: Dict[str, float] = {}
@@ -550,7 +587,7 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
             speed_window_step = 0
             speed_window_samples = 0
             for batch_index, batch in enumerate(
-                epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng), start=1
+                epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=True, rng=rng, variables=variable_names), start=1
             ):
                 params, opt_state, metrics, grad_norm = train_step(params, opt_state, batch)
                 ema.update(params)
@@ -595,7 +632,7 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
             valid_stats: Dict[str, float] | None = None
             if checkpoint_due:
                 # Validation and plots use EMA weights so saved samples match inference.
-                valid_stats = _eval_epoch(graphdef, ema.params, datasets["valid"], args.bs, rng)
+                valid_stats = _eval_epoch(graphdef, ema.params, datasets["valid"], args.bs, rng, variable_names)
                 final_stats = valid_stats
                 _plot_joint(args, graphdef, ema.params, datasets["train"], step)
             epoch_iter_per_sec = total_batches / max(train_time, 1e-12)
