@@ -53,6 +53,8 @@ class PredictorRunArguments:
     wd: float
     input_res: int
     pad: int
+    metadata: str = ""
+    image_prefix: str = ""
     input_channels: int = 1
     sup_frac: float = 1.0
     std_fixed: float = 0.0
@@ -160,6 +162,7 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         accelerator=config.runtime.accelerator, gpu_id=config.runtime.gpu_id,
         precision=config.runtime.precision, exp_name=config.artifacts.run_name,
         dataset=config.dataset.name, data_dir=config.dataset.root,
+        metadata=config.dataset.metadata, image_prefix=config.dataset.image_prefix,
         ckpt_dir=config.artifacts.root, remote_ckpt_dir=config.artifacts.remote_root,
         seed=config.seed, epochs=workflow.epochs, bs=config.optimizer.batch_size,
         lr=config.optimizer.lr, wd=config.optimizer.weight_decay,
