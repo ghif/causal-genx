@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from flax import nnx
 
-from causal.cxr_rait_scm import CxrRaitPGM
+from causal.cxr_rait_scm import CxrRaitPGM, PadChestPGM
 from causal.cxr_rait_predictor import CxrRaitSupAuxPredictor, TorchXRayVisionDenseNet121
 from training.predictor import _merge
 
@@ -19,6 +19,24 @@ def test_cxr_rait_pgm_shapes_and_sampling():
     assert samples["pa"].shape == (4, 5)
 
     log_probs = model.log_prob(samples["age"], samples["gender"], samples["tb_status"])
+    assert "joint" in log_probs
+    assert log_probs["joint"].shape == (4,)
+
+
+def test_padchest_pgm_shapes_and_sampling():
+    model = PadChestPGM(widths=(16, 16), rngs=nnx.Rngs(0))
+    samples = model.sample(n_samples=4, rng=jax.random.PRNGKey(0))
+
+    assert samples["age_at_study"].shape == (4, 1)
+    assert samples["sex"].shape == (4, 2)
+    assert samples["pediatric"].shape == (4, 1)
+    assert samples["tb_status"].shape == (4, 1)
+    assert samples["projection"].shape == (4, 5)
+    assert samples["view_position"].shape == (4, 6)
+    assert samples["study_year"].shape == (4, 1)
+    assert samples["pa"].shape == (4, 17)
+
+    log_probs = model.log_prob(**{name: samples[name] for name in model.variables})
     assert "joint" in log_probs
     assert log_probs["joint"].shape == (4,)
 

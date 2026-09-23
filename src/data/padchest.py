@@ -96,6 +96,14 @@ class PadChestDataset:
         self.rows = [row for patient in selected for row in groups[patient] if row.get("ImageID")]
         self.root, self.image_prefix, self.input_res, self.tb_label_mode = root, image_prefix, input_res, tb_label_mode
         self._metadata = [_derive(row, tb_label_mode) for row in self.rows]
+        self.samples = {
+            spec.name: (
+                np.stack([np.asarray(metadata[spec.name]) for metadata in self._metadata]).astype(np.float32)
+                if self._metadata
+                else np.empty((0, spec.encoded_dim), dtype=np.float32)
+            )
+            for spec in PAD_CHEST_SCHEMA.variables
+        }
 
     def __len__(self):
         return len(self.rows)
@@ -113,8 +121,9 @@ class PadChestDataset:
         return np.asarray(image, dtype=np.float32)[None] / 255.0
 
     def make_batch(self, indices: Sequence[int], **_: Any) -> dict[str, np.ndarray]:
-        images = np.stack([self._get_image(int(index)) for index in indices])
-        variables = {name: np.stack([np.asarray(self._metadata[int(index)][name]) for index in indices]) for name in PAD_CHEST_SCHEMA.variable_names}
+        batch_indices = np.asarray(indices, dtype=np.int64)
+        images = np.stack([self._get_image(int(index)) for index in batch_indices])
+        variables = {name: np.asarray(values[batch_indices], dtype=np.float32) for name, values in self.samples.items()}
         return {"x": images, **variables}
 
 

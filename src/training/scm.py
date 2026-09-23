@@ -58,6 +58,7 @@ class ScmRunArguments:
     data_dir: str
     metadata: str
     image_prefix: str
+    scm_model: str
     ckpt_dir: str
     remote_ckpt_dir: str
     seed: int
@@ -120,6 +121,7 @@ def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
         data_dir=config.dataset.root,
         metadata=config.dataset.metadata,
         image_prefix=config.dataset.image_prefix,
+        scm_model=workflow.scm_model,
         ckpt_dir=config.artifacts.root,
         remote_ckpt_dir=config.artifacts.remote_root,
         seed=config.seed,
@@ -210,14 +212,20 @@ def epoch_batches(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bo
         yield preprocess(batch)
 
 
+def _model_variable_names(model: Any) -> tuple[str, ...]:
+    variables = getattr(model, "variables", None)
+    if not variables:
+        raise ValueError(f"SCM model {type(model).__name__} must declare a variables mapping")
+    return tuple(variables.keys())
+
+
 def _loss(graphdef: Any, params: Any, batch: Dict[str, jax.Array]):
     model = materialize_nnx(graphdef, params)
-    if "age" in batch and "gender" in batch and "tb_status" in batch:
-        log_probs = model.log_prob(batch["age"], batch["gender"], batch["tb_status"])
-        var_names = ("age", "gender", "tb_status")
-    else:
-        log_probs = model.log_prob(batch["thickness"], batch["intensity"], batch["digit"])
-        var_names = ("digit", "thickness", "intensity")
+    var_names = _model_variable_names(model)
+    missing = [name for name in var_names if name not in batch]
+    if missing:
+        raise KeyError(f"Batch is missing SCM variables for {type(model).__name__}: {missing}")
+    log_probs = model.log_prob(**{name: batch[name] for name in var_names})
     loss = -jnp.mean(log_probs["joint"])
     return loss, {"loss": loss, **{f"logp({name})": jnp.mean(log_probs[name]) for name in var_names}}
 
@@ -307,30 +315,52 @@ def _joint_figure(x: np.ndarray, y: np.ndarray, title: str, path: str, xlabel: s
 
 
 
+def _plot_pair(model: Any) -> tuple[str, str]:
+    configured = getattr(model, "plot_variables", None)
+    if configured and len(configured) >= 2:
+        return configured[0], configured[1]
+    names = _model_variable_names(model)
+    if len(names) < 2:
+        raise ValueError(f"SCM model {type(model).__name__} needs at least two variables to plot")
+    return names[0], names[1]
+
+
+def _plot_values(values: Any) -> np.ndarray:
+    array = np.asarray(values)
+    if array.ndim > 1 and array.shape[-1] > 1:
+        return np.argmax(array, axis=-1).reshape(-1)
+    return array.reshape(-1)
+
+
+def _dataset_values(dataset: Any, name: str) -> np.ndarray:
+    samples = getattr(dataset, "samples", None)
+    if samples is None or name not in samples:
+        raise KeyError(f"Dataset {type(dataset).__name__} does not expose samples[{name!r}] for SCM plotting")
+    return _plot_values(samples[name])
+
+
 def _plot_joint(args: ScmRunArguments, graphdef: Any, params: Any, dataset: Any, step: int) -> None:
+    model = materialize_nnx(graphdef, params)
+    x_name, y_name = _plot_pair(model)
     data_path = os.path.join(args.save_dir, "joint_data.pdf")
-    if args.dataset == "cxr_rait":
-        if not os.path.exists(data_path):
-            x_data = np.asarray(dataset.samples["age"]).squeeze()
-            y_data = np.asarray(dataset.samples["tb_status"])
-            if y_data.ndim > 1 and y_data.shape[1] > 1:
-                y_data = np.argmax(y_data, axis=1)
-            else:
-                y_data = y_data.squeeze()
-            _joint_figure(x_data, y_data, "CXR-RAIT Data Joint (age vs tb_status)", data_path, xlabel="age", ylabel="tb_status")
-        samples = materialize_nnx(graphdef, params).sample(args.plot_samples, jax.random.PRNGKey(args.seed + step))
-        x_model = np.asarray(samples["age"]).squeeze()
-        y_model = np.asarray(samples["tb_status"])
-        if y_model.ndim > 1 and y_model.shape[1] > 1:
-            y_model = np.argmax(y_model, axis=1)
-        else:
-            y_model = y_model.squeeze()
-        _joint_figure(x_model, y_model, f"CXR-RAIT Model Joint (step {step})", os.path.join(args.save_dir, f"joint_model_{step}.pdf"), xlabel="age", ylabel="tb_status")
-    else:
-        if not os.path.exists(data_path):
-            _joint_figure(np.asarray(dataset.samples["thickness"]), np.asarray(dataset.samples["intensity"]), "Data Joint", data_path)
-        samples = materialize_nnx(graphdef, params).sample(args.plot_samples, jax.random.PRNGKey(args.seed + step))
-        _joint_figure(np.asarray(samples["thickness"]).squeeze(), np.asarray(samples["intensity"]).squeeze(), f"Model Joint (step {step})", os.path.join(args.save_dir, f"joint_model_{step}.pdf"))
+    if not os.path.exists(data_path):
+        _joint_figure(
+            _dataset_values(dataset, x_name),
+            _dataset_values(dataset, y_name),
+            f"{args.dataset} Data Joint ({x_name} vs {y_name})",
+            data_path,
+            xlabel=x_name,
+            ylabel=y_name,
+        )
+    samples = model.sample(args.plot_samples, jax.random.PRNGKey(args.seed + step))
+    _joint_figure(
+        _plot_values(samples[x_name]),
+        _plot_values(samples[y_name]),
+        f"{args.dataset} Model Joint (step {step})",
+        os.path.join(args.save_dir, f"joint_model_{step}.pdf"),
+        xlabel=x_name,
+        ylabel=y_name,
+    )
 
 
 
@@ -484,9 +514,9 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
         model = CxrRaitPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
     elif args.dataset == "padchest":
         from data.padchest import padchest
-        from causal.cxr_rait_scm import CxrRaitPGM
+        from causal.cxr_rait_scm import PadChestPGM
         datasets = padchest(args)
-        model = CxrRaitPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
+        model = PadChestPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
     else:
         datasets = morphomnist(args)
         model = MorphoMNISTPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))

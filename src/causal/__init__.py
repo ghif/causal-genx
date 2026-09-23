@@ -3,7 +3,7 @@
 from .deep_scm import DeepStructuralCausalModel
 from .flow_scm import MorphoMNISTPGM
 from .image_parent_predictor import MorphoMNISTSupAuxPredictor
-from .cxr_rait_scm import CxrRaitPGM
+from .cxr_rait_scm import CxrRaitPGM, PadChestPGM
 from .cxr_rait_predictor import CxrRaitSupAuxPredictor
 
 __all__ = [
@@ -11,6 +11,7 @@ __all__ = [
     "MorphoMNISTPGM",
     "MorphoMNISTSupAuxPredictor",
     "CxrRaitPGM",
+    "PadChestPGM",
     "CxrRaitSupAuxPredictor",
 ]
 

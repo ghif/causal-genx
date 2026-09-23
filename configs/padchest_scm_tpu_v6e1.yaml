@@ -31,7 +31,7 @@ artifacts:
   remote_root: gs://external-cxr-dataset/padchest/checkpoints
 workflow:
   type: train-scm
-  scm_model: cxr_rait_scm
+  scm_model: padchest_scm
   epochs: 100
   speed_log_freq: 10
   checkpoint_freq: 1

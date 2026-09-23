@@ -184,6 +184,7 @@ class MorphoMNISTPGM(nnx.Module):
         "intensity": "continuous",
         "digit": "categorical",
     }
+    plot_variables = ("thickness", "intensity")
 
     def __init__(
         self,
