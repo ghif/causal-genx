@@ -1,0 +1,244 @@
+{
+  "checkpoint": {
+    "best_loss": 6.793773543390678,
+    "ema_initted": true,
+    "ema_param_tree_compatible": true,
+    "ema_step": 200500,
+    "epoch": 100,
+    "format_version": 2,
+    "keys": [
+      "best_loss",
+      "ema_initted",
+      "ema_params",
+      "ema_step",
+      "epoch",
+      "format_version",
+      "hparams",
+      "model_params",
+      "opt_state",
+      "params",
+      "step"
+    ],
+    "model_param_tree_compatible": true,
+    "params_param_tree_compatible": true,
+    "requested": "/mnt/data/firstmate/projects/causal-genx/checkpoints/padchest/scm_padchest_tpu_v6e1/checkpoints/200500",
+    "resolved": "/mnt/data/firstmate/projects/causal-genx/checkpoints/padchest/scm_padchest_tpu_v6e1/checkpoints/200500",
+    "step": 200500
+  },
+  "created_unix": 1790178718,
+  "manifest_sha256": "985294aa17797aea062deb51ee4290b3d16ff1a2061d69dd9fff992ef4ce7091",
+  "run_name": "scm_padchest_tpu_v6e1",
+  "schema": {
+    "context_dim": 17,
+    "context_norm": "[-1,1]",
+    "dataset_id": "padchest",
+    "edges": [
+      [
+        "age_at_study",
+        "tb_status"
+      ],
+      [
+        "sex",
+        "tb_status"
+      ],
+      [
+        "pediatric",
+        "tb_status"
+      ]
+    ],
+    "encoded_dim": 17,
+    "image_prefix": "gs://external-cxr-dataset/padchest/unpacked/images-224/images-224",
+    "metadata_source_sha256": "b02e42e5f1c53609298b47b1246a5dbed725fcae88e2cff407b772dfe10d2ddc",
+    "metadata_source_used_for_validation": "/mnt/data/dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv",
+    "metadata_uri": "gs://external-cxr-dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv",
+    "normalization_constants": {
+      "age_at_study": {
+        "max": 110.0,
+        "min": 0.0,
+        "space": "[-1,1]"
+      },
+      "pediatric": {
+        "positive_when": "Pediatric == yes"
+      },
+      "projection": {
+        "categories": [
+          "PA",
+          "AP",
+          "AP_horizontal",
+          "L",
+          "COSTAL"
+        ],
+        "fallback": "PA"
+      },
+      "sex": {
+        "categories": [
+          "not_M_or_unknown",
+          "M"
+        ]
+      },
+      "study_year": {
+        "max": 2017.0,
+        "min": 2007.0,
+        "space": "[-1,1]"
+      },
+      "tb_status": {
+        "mode": "tb_or_sequelae",
+        "positive_labels": [
+          "tuberculosis",
+          "tuberculosis sequelae"
+        ]
+      },
+      "view_position": {
+        "categories": [
+          "POSTEROANTERIOR",
+          "ANTEROPOSTERIOR",
+          "LATERAL",
+          "AP",
+          "PA",
+          "OTHER"
+        ],
+        "fallback": "OTHER"
+      }
+    },
+    "schema_version": "1",
+    "seed": 7,
+    "variable_order": [
+      "age_at_study",
+      "sex",
+      "pediatric",
+      "tb_status",
+      "projection",
+      "view_position",
+      "study_year"
+    ],
+    "variables": [
+      {
+        "encoded_dim": 1,
+        "kind": "continuous",
+        "name": "age_at_study",
+        "normalization": "[-1,1]"
+      },
+      {
+        "encoded_dim": 2,
+        "kind": "categorical",
+        "name": "sex",
+        "normalization": null
+      },
+      {
+        "encoded_dim": 1,
+        "kind": "binary",
+        "name": "pediatric",
+        "normalization": null
+      },
+      {
+        "encoded_dim": 1,
+        "kind": "binary",
+        "name": "tb_status",
+        "normalization": null
+      },
+      {
+        "encoded_dim": 5,
+        "kind": "categorical",
+        "name": "projection",
+        "normalization": null
+      },
+      {
+        "encoded_dim": 6,
+        "kind": "categorical",
+        "name": "view_position",
+        "normalization": null
+      },
+      {
+        "encoded_dim": 1,
+        "kind": "continuous",
+        "name": "study_year",
+        "normalization": "[-1,1]"
+      }
+    ]
+  },
+  "split": {
+    "fingerprint_sha256": "b21463f06015f8d2d424fe836da750511d68221d27328be83851a266ef44ddcf",
+    "metadata_source_used_for_validation": "/mnt/data/dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv",
+    "metadata_uri": "gs://external-cxr-dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv",
+    "normalization_constants": {
+      "age_at_study": {
+        "max": 110.0,
+        "min": 0.0,
+        "space": "[-1,1]"
+      },
+      "pediatric": {
+        "positive_when": "Pediatric == yes"
+      },
+      "projection": {
+        "categories": [
+          "PA",
+          "AP",
+          "AP_horizontal",
+          "L",
+          "COSTAL"
+        ],
+        "fallback": "PA"
+      },
+      "sex": {
+        "categories": [
+          "not_M_or_unknown",
+          "M"
+        ]
+      },
+      "study_year": {
+        "max": 2017.0,
+        "min": 2007.0,
+        "space": "[-1,1]"
+      },
+      "tb_status": {
+        "mode": "tb_or_sequelae",
+        "positive_labels": [
+          "tuberculosis",
+          "tuberculosis sequelae"
+        ]
+      },
+      "view_position": {
+        "categories": [
+          "POSTEROANTERIOR",
+          "ANTEROPOSTERIOR",
+          "LATERAL",
+          "AP",
+          "PA",
+          "OTHER"
+        ],
+        "fallback": "OTHER"
+      }
+    },
+    "schema_version": "1",
+    "seed": 7,
+    "splits": {
+      "test": {
+        "patient_sha256": "b7f9fb4156fe619632ebfc44d31df5dd0034e5e9347c281ad87b922f80d2cbbc",
+        "patients": 6763,
+        "rows_with_image_id": 16221
+      },
+      "train": {
+        "patient_sha256": "1900cb21293709615413ed029be7c3be40bef02b82f56b328d50c923d3626129",
+        "patients": 54100,
+        "rows_with_image_id": 128343
+      },
+      "valid": {
+        "patient_sha256": "2122f210a95078bef45f4b4205242669c5ab89a2ede88d02c929a9f0a5650870",
+        "patients": 6762,
+        "rows_with_image_id": 16297
+      }
+    },
+    "total_patients": 67625,
+    "total_rows": 160861,
+    "total_rows_with_image_id": 160861,
+    "variable_order": [
+      "age_at_study",
+      "sex",
+      "pediatric",
+      "tb_status",
+      "projection",
+      "view_position",
+      "study_year"
+    ]
+  }
+}

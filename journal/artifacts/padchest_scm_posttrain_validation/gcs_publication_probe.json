@@ -1,0 +1,21 @@
+{
+  "active_account": "mghifary@gmail.com",
+  "checked_unix": 1790178762,
+  "commands": [
+    {
+      "command": "gcloud auth list --filter=status:ACTIVE --format=value(account)",
+      "result": "mghifary@gmail.com"
+    },
+    {
+      "command": "gcloud storage ls gs://external-cxr-dataset/padchest/checkpoints/padchest/scm_padchest_tpu_v6e1/trainlog.txt",
+      "result": "ERROR: one or more URLs matched no objects"
+    },
+    {
+      "command": "google.cloud.storage Bucket.test_iam_permissions([storage.objects.create, storage.objects.get, storage.objects.list]) on external-cxr-dataset",
+      "result": "Forbidden 403: current account lacks serviceusage.services.use on the Google Cloud project; permissions could not be confirmed and storage.objects.create is not available to the local validation path"
+    }
+  ],
+  "prior_training_failure": "The completed run's trainlog/firstmate log ended with storage.objects.create Forbidden while syncing trainlog.txt to gs://external-cxr-dataset/padchest/checkpoints/padchest/scm_padchest_tpu_v6e1/trainlog.txt.",
+  "remote_mutation_performed": false,
+  "safe_prerequisite": "Grant the publishing principal serviceusage.services.use and storage.objects.create on the exact gs://external-cxr-dataset/padchest/checkpoints/padchest/scm_padchest_tpu_v6e1/ prefix, or rerun/sync with artifacts.remote_root intentionally empty for local-only delivery. Do not overwrite remote data; sync only missing immutable artifacts after permission is verified."
+}

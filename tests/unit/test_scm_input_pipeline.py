@@ -3,7 +3,7 @@ import csv
 import numpy as np
 import pytest
 
-from data.padchest import PAD_CHEST_SCHEMA, PadChestDataset
+from data.padchest import PAD_CHEST_SCHEMA, PadChestDataset, padchest_split_summary
 from training.scm import epoch_batches
 
 
@@ -81,6 +81,25 @@ def _write_padchest_metadata(path):
                     "ViewPosition_DICOM": "POSTEROANTERIOR",
                 }
             )
+
+
+def test_padchest_split_summary_is_patient_level_and_deterministic(tmp_path):
+    metadata_path = tmp_path / "padchest.csv"
+    _write_padchest_metadata(metadata_path)
+
+    summary = padchest_split_summary(str(metadata_path), seed=7)
+    repeat = padchest_split_summary(str(metadata_path), seed=7)
+
+    assert summary == repeat
+    assert summary["seed"] == 7
+    assert summary["total_patients"] == 10
+    assert summary["total_rows_with_image_id"] == 10
+    assert {split: values["patients"] for split, values in summary["splits"].items()} == {
+        "train": 8,
+        "valid": 1,
+        "test": 1,
+    }
+    assert all("patient_sha256" in values and len(values["patient_sha256"]) == 64 for values in summary["splits"].values())
 
 
 def test_padchest_scm_batches_skip_remote_png_loading(tmp_path, monkeypatch):

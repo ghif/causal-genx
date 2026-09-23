@@ -1,0 +1,442 @@
+{
+  "checkpoint": {
+    "best_loss": 6.793773543390678,
+    "ema_initted": true,
+    "ema_param_tree_compatible": true,
+    "ema_step": 200500,
+    "epoch": 100,
+    "format_version": 2,
+    "keys": [
+      "best_loss",
+      "ema_initted",
+      "ema_params",
+      "ema_step",
+      "epoch",
+      "format_version",
+      "hparams",
+      "model_params",
+      "opt_state",
+      "params",
+      "step"
+    ],
+    "model_param_tree_compatible": true,
+    "params_param_tree_compatible": true,
+    "requested": "/mnt/data/firstmate/projects/causal-genx/checkpoints/padchest/scm_padchest_tpu_v6e1/checkpoints/200500",
+    "resolved": "/mnt/data/firstmate/projects/causal-genx/checkpoints/padchest/scm_padchest_tpu_v6e1/checkpoints/200500",
+    "step": 200500
+  },
+  "created_unix": 1790178717,
+  "environment": {
+    "jax": "0.11.1",
+    "jax_backend": "tpu",
+    "jax_devices": [
+      "TPU_0(process=0,(0,0,0,0))"
+    ],
+    "python": "3.13.15"
+  },
+  "limitations": [
+    "Diagnostics use metadata-derived labels only and do not establish clinical validity.",
+    "Model marginal samples are stochastic and use the final EMA checkpoint with a fixed PRNG key.",
+    "If metadata_source_used_for_validation is a local cache, remote URI equality is represented by the recorded local SHA-256 and not freshly proven by GCS."
+  ],
+  "per_variable": {
+    "age_at_study": {
+      "data_support_violations": 0,
+      "mean_abs_difference_normalized": 0.020121368785857213,
+      "model_support_violations": 0,
+      "normalized_data": {
+        "count": 16221,
+        "max": 0.8909091949462891,
+        "mean": 0.0665602582934517,
+        "min": -1.0,
+        "p01": -0.9454545378684998,
+        "p50": 0.1272728443145752,
+        "p99": 0.6363637447357178,
+        "std": 0.3592203627818462
+      },
+      "normalized_model": {
+        "count": 16221,
+        "max": 0.9800896644592285,
+        "mean": 0.08668162707930892,
+        "min": -0.9753158092498779,
+        "p01": -0.7970622062683106,
+        "p50": 0.1388334035873413,
+        "p99": 0.687685084342956,
+        "std": 0.33882428941033327
+      },
+      "raw_data": {
+        "count": 16221,
+        "max": 104.0000057220459,
+        "mean": 58.66081420613985,
+        "min": 0.0,
+        "p01": 3.0000004172325134,
+        "p50": 62.000006437301636,
+        "p99": 90.00000596046448,
+        "std": 19.757119953001542
+      },
+      "raw_model": {
+        "count": 16221,
+        "max": 108.90493154525757,
+        "mean": 59.76748948936199,
+        "min": 1.3576304912567139,
+        "p01": 11.16157865524292,
+        "p50": 62.63583719730377,
+        "p99": 92.82267963886258,
+        "std": 18.63533591756833
+      }
+    },
+    "pediatric": {
+      "data_counts": [
+        16221,
+        0
+      ],
+      "data_positive_rate": 0.0,
+      "data_probabilities": [
+        1.0,
+        0.0
+      ],
+      "data_zero_support_categories": [
+        1
+      ],
+      "labels": [
+        "0",
+        "1"
+      ],
+      "model_counts": [
+        16208,
+        13
+      ],
+      "model_positive_rate": 0.0008014302447444671,
+      "model_probabilities": [
+        0.9991985697552556,
+        0.0008014302447444671
+      ],
+      "model_zero_support_categories": [],
+      "total_variation_distance": 0.0008014302447444529
+    },
+    "projection": {
+      "data_counts": [
+        10667,
+        449,
+        0,
+        5024,
+        81
+      ],
+      "data_onehot_row_sum_max_abs_error": 0.0,
+      "data_probabilities": [
+        0.6576043400530177,
+        0.027680167683866594,
+        0.0,
+        0.309721965353554,
+        0.004993526909561679
+      ],
+      "data_zero_support_categories": [
+        2
+      ],
+      "labels": [
+        "PA",
+        "AP",
+        "AP_horizontal",
+        "L",
+        "COSTAL"
+      ],
+      "model_counts": [
+        10622,
+        541,
+        0,
+        4935,
+        123
+      ],
+      "model_probabilities": [
+        0.6548301584365945,
+        0.03335182787744282,
+        0.0,
+        0.3042352506010727,
+        0.007582763084889957
+      ],
+      "model_zero_support_categories": [
+        2
+      ],
+      "total_variation_distance": 0.008260896368904492
+    },
+    "sex": {
+      "data_counts": [
+        8283,
+        7938
+      ],
+      "data_onehot_row_sum_max_abs_error": 0.0,
+      "data_probabilities": [
+        0.5106343628629554,
+        0.48936563713704456
+      ],
+      "data_zero_support_categories": [],
+      "labels": [
+        "not_M_or_unknown",
+        "M"
+      ],
+      "model_counts": [
+        8055,
+        8166
+      ],
+      "model_probabilities": [
+        0.4965785093397448,
+        0.5034214906602552
+      ],
+      "model_zero_support_categories": [],
+      "total_variation_distance": 0.01405585352321062
+    },
+    "study_year": {
+      "data_support_violations": 0,
+      "mean_abs_difference_normalized": 0.04112638930608294,
+      "model_support_violations": 0,
+      "normalized_data": {
+        "count": 16221,
+        "max": 1.0,
+        "mean": 0.04252513404413125,
+        "min": -1.0,
+        "p01": -0.6000000238418579,
+        "p50": 0.0,
+        "p99": 1.0,
+        "std": 0.46243421797448975
+      },
+      "normalized_model": {
+        "count": 16221,
+        "max": 0.9633525609970093,
+        "mean": 0.001398744738048311,
+        "min": -0.9483206868171692,
+        "p01": -0.7951836824417114,
+        "p50": -8.958578109741211e-05,
+        "p99": 0.8008996963500976,
+        "std": 0.4415580739168826
+      },
+      "raw_data": {
+        "count": 16221,
+        "max": 2017.0,
+        "mean": 2012.2126256702206,
+        "min": 2007.0,
+        "p01": 2008.9999998807907,
+        "p50": 2012.0,
+        "p99": 2017.0,
+        "std": 2.312171089872449
+      },
+      "raw_model": {
+        "count": 16221,
+        "max": 2016.816762804985,
+        "mean": 2012.0069937236901,
+        "min": 2007.2583965659142,
+        "p01": 2008.0240815877914,
+        "p50": 2011.9995520710945,
+        "p99": 2016.0044984817505,
+        "std": 2.2077903695844134
+      }
+    },
+    "tb_status": {
+      "data_counts": [
+        16072,
+        149
+      ],
+      "data_positive_rate": 0.009185623574378892,
+      "data_probabilities": [
+        0.9908143764256211,
+        0.009185623574378892
+      ],
+      "data_zero_support_categories": [],
+      "labels": [
+        "0",
+        "1"
+      ],
+      "model_counts": [
+        16092,
+        129
+      ],
+      "model_positive_rate": 0.007952653967079712,
+      "model_probabilities": [
+        0.9920473460329203,
+        0.007952653967079712
+      ],
+      "model_zero_support_categories": [],
+      "total_variation_distance": 0.0012329696072992096
+    },
+    "view_position": {
+      "data_counts": [
+        5558,
+        37,
+        2500,
+        17,
+        831,
+        7278
+      ],
+      "data_onehot_row_sum_max_abs_error": 0.0,
+      "data_probabilities": [
+        0.34264225386844216,
+        0.0022809937735034833,
+        0.1541212009123975,
+        0.001048024166204303,
+        0.051229887183280934,
+        0.4486776400961716
+      ],
+      "data_zero_support_categories": [],
+      "labels": [
+        "POSTEROANTERIOR",
+        "ANTEROPOSTERIOR",
+        "LATERAL",
+        "AP",
+        "PA",
+        "OTHER"
+      ],
+      "model_counts": [
+        5558,
+        91,
+        2437,
+        32,
+        966,
+        7137
+      ],
+      "model_probabilities": [
+        0.34264225386844216,
+        0.005610011713211269,
+        0.15023734664940508,
+        0.0019727513716786883,
+        0.059552432032550395,
+        0.4399852043647124
+      ],
+      "model_zero_support_categories": [],
+      "total_variation_distance": 0.012576289994451642
+    }
+  },
+  "split_counts": {
+    "test": {
+      "rows": 16221
+    },
+    "train": {
+      "rows": 128343
+    },
+    "valid": {
+      "rows": 16297
+    }
+  },
+  "tb_calibration_on_test": {
+    "bins": [
+      {
+        "count": 16221,
+        "mean_predicted": 0.008300649104736919,
+        "observed_rate": 0.009185623574378892,
+        "range": [
+          0.0,
+          0.1
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.1,
+          0.2
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.2,
+          0.30000000000000004
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.30000000000000004,
+          0.4
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.4,
+          0.5
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.5,
+          0.6000000000000001
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.6000000000000001,
+          0.7000000000000001
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.7000000000000001,
+          0.8
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.8,
+          0.9
+        ]
+      },
+      {
+        "count": 0,
+        "range": [
+          0.9,
+          1.0
+        ]
+      }
+    ],
+    "brier_score": 0.009099344722926617,
+    "ece_10_uniform_bins": 0.0008849744696419731,
+    "mean_predicted_probability": 0.00830064993351698,
+    "observed_positive_rate": 0.00918562337756157
+  },
+  "tb_support_by_test_group": {
+    "age_0_17": {
+      "count": 691,
+      "tb_positive_rate": 0.0028943559154868126
+    },
+    "age_18_39": {
+      "count": 1965,
+      "tb_positive_rate": 0.014249363914132118
+    },
+    "age_40_64": {
+      "count": 6231,
+      "tb_positive_rate": 0.006740490905940533
+    },
+    "age_65_plus": {
+      "count": 7334,
+      "tb_positive_rate": 0.010499045252799988
+    },
+    "pediatric_0": {
+      "count": 16221,
+      "tb_positive_rate": 0.00918562337756157
+    },
+    "pediatric_1": {
+      "count": 0,
+      "tb_positive_rate": null
+    },
+    "sex_0_not_M_or_unknown": {
+      "count": 8283,
+      "tb_positive_rate": 0.00845104455947876
+    },
+    "sex_1_M": {
+      "count": 7938,
+      "tb_positive_rate": 0.009952128864824772
+    }
+  },
+  "test_likelihood": {
+    "logp(age_at_study)": -0.6749261902216572,
+    "logp(pediatric)": -0.00048029801109805703,
+    "logp(projection)": -0.7653243301513126,
+    "logp(sex)": -0.6933306715071154,
+    "logp(study_year)": -3.1810354412164226,
+    "logp(tb_status)": -0.052229518208095356,
+    "logp(view_position)": -1.1898132131099848,
+    "loss": 6.557139657243051
+  }
+}

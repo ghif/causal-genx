@@ -32,8 +32,16 @@ PAD_CHEST_SCHEMA = CausalGraphSpec(
     edges=(("age_at_study", "tb_status"), ("sex", "tb_status"), ("pediatric", "tb_status")),
 )
 
-_PROJECTIONS = ("PA", "AP", "AP_horizontal", "L", "COSTAL")
-_VIEWS = ("POSTEROANTERIOR", "ANTEROPOSTERIOR", "LATERAL", "AP", "PA", "OTHER")
+AGE_AT_STUDY_MIN = 0.0
+AGE_AT_STUDY_MAX = 110.0
+STUDY_YEAR_MIN = 2007.0
+STUDY_YEAR_MAX = 2017.0
+PROJECTIONS = ("PA", "AP", "AP_horizontal", "L", "COSTAL")
+VIEW_POSITIONS = ("POSTEROANTERIOR", "ANTEROPOSTERIOR", "LATERAL", "AP", "PA", "OTHER")
+
+# Backwards-compatible private aliases used by existing derivation code.
+_PROJECTIONS = PROJECTIONS
+_VIEWS = VIEW_POSITIONS
 
 
 def _open_binary(path: str):
@@ -73,13 +81,60 @@ def _derive(row: Mapping[str, str], tb_label_mode: str) -> dict[str, Any]:
         tb = bool(labels.intersection({"tuberculosis", "tuberculosis sequelae"}))
     sex = 1 if str(row.get("PatientSex_DICOM", "")).upper() == "M" else 0
     return {
-        "age_at_study": normalize(np.asarray([age], dtype=np.float32), x_min=0.0, x_max=110.0)[0],
+        "age_at_study": normalize(np.asarray([age], dtype=np.float32), x_min=AGE_AT_STUDY_MIN, x_max=AGE_AT_STUDY_MAX)[0],
         "sex": np.eye(2, dtype=np.float32)[sex],
         "pediatric": np.asarray([1.0 if str(row.get("Pediatric", "")).lower() == "yes" else 0.0], dtype=np.float32),
         "tb_status": np.asarray([1.0 if tb else 0.0], dtype=np.float32),
         "projection": np.eye(len(_PROJECTIONS), dtype=np.float32)[_category(row.get("Projection", ""), _PROJECTIONS, "PA")],
         "view_position": np.eye(len(_VIEWS), dtype=np.float32)[_category(row.get("ViewPosition_DICOM", ""), _VIEWS, "OTHER")],
-        "study_year": normalize(np.asarray([year], dtype=np.float32), x_min=2007.0, x_max=2017.0)[0],
+        "study_year": normalize(np.asarray([year], dtype=np.float32), x_min=STUDY_YEAR_MIN, x_max=STUDY_YEAR_MAX)[0],
+    }
+
+
+def _split_patients(patients: Sequence[str], seed: int) -> dict[str, list[str]]:
+    shuffled = sorted(patients)
+    random.Random(seed).shuffle(shuffled)
+    n_train, n_valid = int(len(shuffled) * 0.8), int(len(shuffled) * 0.1)
+    return {
+        "train": shuffled[:n_train],
+        "valid": shuffled[n_train:n_train + n_valid],
+        "test": shuffled[n_train + n_valid:],
+    }
+
+
+def _patient_digest(patient_ids: Sequence[str]) -> str:
+    payload = "\n".join(sorted(patient_ids)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def padchest_split_summary(metadata: str, seed: int = 7) -> dict[str, Any]:
+    """Return patient-level split counts and privacy-preserving fingerprints.
+
+    The PadChest provider splits by shuffled patient IDs, then keeps rows that
+    have an ``ImageID``.  This summary is the durable, non-PHI fingerprint used
+    by post-training validation reports to prove downstream stages are aligned
+    to the same split algorithm and seed without checking patient identifiers
+    into source control.
+    """
+    rows = _read_rows(metadata)
+    groups: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        groups.setdefault(row.get("PatientID", row.get("ImageID", "")), []).append(row)
+    split_patients = _split_patients(tuple(groups), seed)
+    split_counts = {}
+    for split, patients in split_patients.items():
+        row_count = sum(1 for patient in patients for row in groups[patient] if row.get("ImageID"))
+        split_counts[split] = {
+            "patients": len(patients),
+            "rows_with_image_id": row_count,
+            "patient_sha256": _patient_digest(patients),
+        }
+    return {
+        "seed": seed,
+        "total_patients": len(groups),
+        "total_rows": len(rows),
+        "total_rows_with_image_id": sum(1 for row in rows if row.get("ImageID")),
+        "splits": split_counts,
     }
 
 
@@ -89,10 +144,7 @@ class PadChestDataset:
         groups: dict[str, list[dict[str, str]]] = {}
         for row in rows:
             groups.setdefault(row.get("PatientID", row.get("ImageID", "")), []).append(row)
-        patients = sorted(groups)
-        random.Random(seed).shuffle(patients)
-        n_train, n_valid = int(len(patients) * 0.8), int(len(patients) * 0.1)
-        selected = {"train": patients[:n_train], "valid": patients[n_train:n_train + n_valid], "test": patients[n_train + n_valid:]}[split]
+        selected = _split_patients(tuple(groups), seed)[split]
         self.rows = [row for patient in selected for row in groups[patient] if row.get("ImageID")]
         self.root, self.image_prefix, self.input_res, self.tb_label_mode = root, image_prefix, input_res, tb_label_mode
         self._metadata = [_derive(row, tb_label_mode) for row in self.rows]
