@@ -41,3 +41,18 @@ def test_predictor_run_arguments_keep_dataset_path_defaults_empty():
 
     assert args.metadata == ""
     assert args.image_prefix == ""
+    assert args.excluded_sources == []
+
+
+def test_predictor_run_arguments_carry_padchest_exclusions():
+    excluded_sources = [
+        {
+            "source": "gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/missing.png",
+            "reason": "confirmed absent source object",
+        }
+    ]
+    config = _predictor_config({"excluded_sources": excluded_sources})
+
+    args = _run_arguments(config)
+
+    assert args.excluded_sources == excluded_sources

@@ -1,10 +1,12 @@
 import csv
+import importlib
 import json
 from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
 
+padchest_module = importlib.import_module("data.padchest")
 from data.padchest import PadChestProvider, stage_padchest_images
 
 
@@ -100,6 +102,41 @@ def test_padchest_exclusion_exact_match_and_manifest_reporting(tmp_path):
     assert excluded_entries == [excluded]
     item_sources = {entry.get("source") for entry in entries if entry.get("kind") == "item"}
     assert excluded["source"] not in item_sources
+
+
+def test_configured_gcs_exclusion_is_not_transferred_and_is_manifested(tmp_path, monkeypatch):
+    settings = _settings(
+        tmp_path,
+        _all_image_ids(),
+        excluded_sources=[{"source": MISSING_SOURCE, "reason": "confirmed absent source object"}],
+    )
+    settings.image_prefix = MISSING_SOURCE.rsplit("/", 1)[0]
+    transferred_sources = []
+
+    def fake_bulk_copy(records, _stage_root, _workers):
+        transferred_sources.extend(record["source"] for record in records)
+        for record in records:
+            record["bytes"] = 10
+        return list(records), len(records), 0
+
+    monkeypatch.setattr(padchest_module, "_source_size", lambda _source: 10)
+    monkeypatch.setattr(padchest_module, "_run_gcloud_bulk_copy", fake_bulk_copy)
+
+    summary = stage_padchest_images(settings, execute=True)
+
+    assert summary["excluded_items"] == 1
+    excluded = summary["excluded"][0]
+    assert excluded["kind"] == "excluded"
+    assert excluded["image_id"] == MISSING_IMAGE
+    assert excluded["source"] == MISSING_SOURCE
+    assert excluded["reason"] == "confirmed absent source object"
+    assert excluded["split"] in {"train", "valid", "test"}
+    assert isinstance(excluded["row_index"], int)
+    assert MISSING_SOURCE not in transferred_sources
+    assert len(transferred_sources) == summary["required_items"] == 9
+    entries = [json.loads(line) for line in (tmp_path / "stage" / "manifest.jsonl").read_text().splitlines()]
+    assert [entry for entry in entries if entry.get("kind") == "excluded"] == summary["excluded"]
+    assert MISSING_SOURCE not in {entry.get("source") for entry in entries if entry.get("kind") == "item"}
 
 
 def test_padchest_dataset_excludes_same_row_from_predictor_splits(tmp_path):
