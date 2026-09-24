@@ -90,6 +90,7 @@ class PredictorTrainingConfig(BaseModel):
     epochs: PositiveInt = 1000
     speed_log_freq: PositiveInt = 50
     checkpoint_freq: PositiveInt = 1
+    benchmark_steps: int = 0
     execution_mode: Literal["auto", "single_device", "replicated"] = "auto"
     drop_remainder: bool = True
     freeze_backbone: bool = True
@@ -107,6 +108,13 @@ class PredictorTrainingConfig(BaseModel):
     input_cache_max_items: int = 2048
     input_prefetch_workers: int = 8
     input_prefetch_batches: int = 2
+    input_stage_mode: Literal["auto", "off", "require"] = "auto"
+    input_stage_dir: str = ""
+    input_stage_manifest: str = ""
+    input_stage_max_items: int = 0
+    input_stage_max_bytes: int = 0
+    input_stage_size_sample_items: int = 256
+    input_stage_workers: int = 16
 
 
 class ImageModelTrainingConfig(BaseModel):

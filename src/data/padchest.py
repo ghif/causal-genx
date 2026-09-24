@@ -6,10 +6,17 @@ import ast
 import csv
 import hashlib
 import io
+import json
 import os
 import random
+import shutil
+import subprocess
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, BinaryIO, Iterator, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
@@ -44,11 +51,104 @@ _PROJECTIONS = PROJECTIONS
 _VIEWS = VIEW_POSITIONS
 
 
-def _open_binary(path: str):
-    if path.startswith("gs://"):
-        import fsspec
-        return fsspec.open(path, mode="rb").open()
-    return open(path, "rb")
+@contextmanager
+def _open_binary(path: str) -> Iterator[BinaryIO]:
+    if not path.startswith("gs://"):
+        with open(path, "rb") as handle:
+            yield handle
+        return
+    if shutil.which("gsutil"):
+        # gcsfs can fail under user ADC on requester-pays/org-policy buckets while
+        # the project-local gsutil installation succeeds. Prefer gsutil so
+        # training and staging reuse the same authenticated tooling researchers
+        # use at the shell.
+        completed = subprocess.run(
+            ["gsutil", "cat", path],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        yield io.BytesIO(completed.stdout)
+        return
+    import fsspec
+    with fsspec.open(path, mode="rb").open() as handle:
+        yield handle
+
+
+def _default_stage_manifest(stage_dir: str | os.PathLike[str]) -> str:
+    return str(Path(stage_dir) / "padchest-stage-manifest.jsonl")
+
+
+def _safe_stage_relative(source: str, image_id: str) -> str:
+    suffix = Path(image_id).suffix or Path(source).suffix or ".png"
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    return str(Path("images") / digest[:2] / f"{digest}{suffix}")
+
+
+def _load_stage_manifest(manifest: str, stage_dir: str, expected_sources: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Load a JSONL ImageID -> local file map without requiring credentials."""
+    if not manifest or not Path(manifest).is_file():
+        return {}
+    root = Path(stage_dir)
+    mapping: dict[str, str] = {}
+    with Path(manifest).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if record.get("kind") not in {None, "item"}:
+                continue
+            image_id = str(record.get("image_id", ""))
+            source = str(record.get("source", ""))
+            local_path = record.get("local_path") or record.get("relative_path")
+            if not image_id or not local_path:
+                continue
+            if expected_sources is not None and source and source != expected_sources.get(image_id):
+                continue
+            path = Path(str(local_path))
+            if not path.is_absolute():
+                path = root / path
+            mapping[image_id] = str(path)
+    return mapping
+
+
+def _source_size(path: str) -> int | None:
+    try:
+        if path.startswith("gs://"):
+            if shutil.which("gsutil"):
+                completed = subprocess.run(
+                    ["gsutil", "du", path],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                return int(completed.stdout.split()[0])
+            import fsspec
+            fs, fs_path = fsspec.core.url_to_fs(path)
+            return int(fs.size(fs_path))
+        return int(Path(path).stat().st_size)
+    except Exception:
+        return None
+
+
+def _remote_tree_size(prefix: str) -> int | None:
+    try:
+        if not prefix.startswith("gs://"):
+            return None
+        if shutil.which("gsutil"):
+            completed = subprocess.run(
+                ["gsutil", "du", "-s", prefix.rstrip("/")],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return int(completed.stdout.split()[0])
+    except Exception:
+        return None
+    return None
 
 
 def _as_list(value: str) -> list[str]:
@@ -139,7 +239,20 @@ def padchest_split_summary(metadata: str, seed: int = 7) -> dict[str, Any]:
 
 
 class PadChestDataset:
-    def __init__(self, root: str, metadata: str, image_prefix: str, split: str, input_res: int, tb_label_mode: str, seed: int = 7):
+    def __init__(
+        self,
+        root: str,
+        metadata: str,
+        image_prefix: str,
+        split: str,
+        input_res: int,
+        tb_label_mode: str,
+        seed: int = 7,
+        *,
+        stage_dir: str = "",
+        stage_manifest: str = "",
+        stage_mode: str = "auto",
+    ):
         rows = _read_rows(metadata)
         groups: dict[str, list[dict[str, str]]] = {}
         for row in rows:
@@ -147,6 +260,20 @@ class PadChestDataset:
         selected = _split_patients(tuple(groups), seed)[split]
         self.rows = [row for patient in selected for row in groups[patient] if row.get("ImageID")]
         self.root, self.image_prefix, self.input_res, self.tb_label_mode = root, image_prefix, input_res, tb_label_mode
+        self.stage_dir = stage_dir
+        self.stage_manifest = stage_manifest or (_default_stage_manifest(stage_dir) if stage_dir else "")
+        self.stage_mode = stage_mode
+        expected_sources = {row["ImageID"]: self._source_image_path(row) for row in self.rows}
+        self._staged_images = _load_stage_manifest(self.stage_manifest, stage_dir, expected_sources) if stage_dir and stage_mode != "off" else {}
+        if stage_mode == "require":
+            missing = [row["ImageID"] for row in self.rows if not Path(self._staged_images.get(row["ImageID"], "")).is_file()]
+            if missing:
+                raise RuntimeError(
+                    "input_stage_mode=require but PadChest local staging is incomplete: "
+                    f"split={split} missing={len(missing)}/{len(self.rows)} manifest={self.stage_manifest!r} "
+                    "Run `python scripts/stage_padchest_inputs.py --config <config> --execute` "
+                    "or relax workflow.input_stage_mode."
+                )
         self._metadata = [_derive(row, tb_label_mode) for row in self.rows]
         self.samples = {
             spec.name: (
@@ -164,12 +291,26 @@ class PadChestDataset:
     def __len__(self):
         return len(self.rows)
 
-    def _image_path(self, row: Mapping[str, str]) -> str:
+    def _source_image_path(self, row: Mapping[str, str]) -> str:
         image_id = row["ImageID"]
         prefix = self.image_prefix.rstrip("/")
         if prefix:
             return f"{prefix}/{image_id}"
         return os.path.join(self.root, image_id)
+
+    def _image_path(self, row: Mapping[str, str]) -> str:
+        image_id = row["ImageID"]
+        staged = self._staged_images.get(image_id)
+        if staged and Path(staged).is_file():
+            return staged
+        if self.stage_mode == "require":
+            raise FileNotFoundError(
+                f"PadChest staged image is missing for ImageID={image_id!r}; manifest={self.stage_manifest!r}"
+            )
+        return self._source_image_path(row)
+
+    def image_records(self) -> list[dict[str, str]]:
+        return [{"image_id": row["ImageID"], "source": self._source_image_path(row)} for row in self.rows]
 
     def _get_image(self, index: int) -> np.ndarray:
         with _open_binary(self._image_path(self.rows[index])) as handle:
@@ -190,18 +331,44 @@ class PadChestDataset:
 class PadChestProvider:
     schema = PAD_CHEST_SCHEMA
 
-    def __init__(self, root: str, input_res: int = 128, pad: int = 0, context_norm: str = "[-1,1]", metadata: str = "", image_prefix: str = "", tb_label_mode: str = "tb_or_sequelae", seed: int = 7):
+    def __init__(
+        self,
+        root: str,
+        input_res: int = 128,
+        pad: int = 0,
+        context_norm: str = "[-1,1]",
+        metadata: str = "",
+        image_prefix: str = "",
+        tb_label_mode: str = "tb_or_sequelae",
+        seed: int = 7,
+        *,
+        stage_dir: str = "",
+        stage_manifest: str = "",
+        stage_mode: str = "auto",
+    ):
         self.root, self.input_res, self.pad, self.context_norm = root, input_res, pad, context_norm
         self.metadata = metadata or f"{root.rstrip('/')}/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv"
         self.image_prefix = image_prefix or f"{root.rstrip('/')}/images-224"
         self.tb_label_mode, self.seed = tb_label_mode, seed
+        self.stage_dir, self.stage_manifest, self.stage_mode = stage_dir, stage_manifest, stage_mode
 
     @property
     def spec(self) -> DatasetSpec:
         return DatasetSpec("padchest", self.root, ImageSpec(1, self.input_res, self.input_res), {"train": "train", "valid": "valid", "test": "test"}, self.metadata)
 
     def load_split(self, split: str) -> PadChestDataset:
-        return PadChestDataset(self.root, self.metadata, self.image_prefix, split, self.input_res, self.tb_label_mode, self.seed)
+        return PadChestDataset(
+            self.root,
+            self.metadata,
+            self.image_prefix,
+            split,
+            self.input_res,
+            self.tb_label_mode,
+            self.seed,
+            stage_dir=self.stage_dir,
+            stage_manifest=self.stage_manifest,
+            stage_mode=self.stage_mode,
+        )
 
     def make_batch(self, split: str, indices: Sequence[int], *, rng=None, training: bool = False) -> Batch:
         raw = self.load_split(split).make_batch(indices, rng=rng, training=training)
@@ -212,6 +379,195 @@ class PadChestProvider:
         return hashlib.sha256(value.encode()).hexdigest()[:16]
 
 
+def stage_padchest_images(
+    settings: Any,
+    *,
+    splits: Sequence[str] = ("train", "valid", "test"),
+    execute: bool = False,
+    limit: int = 0,
+) -> dict[str, Any]:
+    """Plan or populate a bounded local PadChest image stage.
+
+    The manifest is append-only and existing staged files are reused.  Budget
+    checks happen before copying so an accidental full-dataset stage requires an
+    explicit item/byte policy in the workflow config.
+    """
+    stage_dir = str(getattr(settings, "input_stage_dir", "") or "")
+    if not stage_dir:
+        raise ValueError("workflow.input_stage_dir is required for PadChest staging")
+    stage_manifest = str(getattr(settings, "input_stage_manifest", "") or _default_stage_manifest(stage_dir))
+    max_items = int(getattr(settings, "input_stage_max_items", 0) or 0)
+    max_bytes = int(getattr(settings, "input_stage_max_bytes", 0) or 0)
+    size_sample_items = max(0, int(getattr(settings, "input_stage_size_sample_items", 256) or 0))
+    workers = max(1, int(getattr(settings, "input_stage_workers", 8) or 1))
+
+    provider = PadChestProvider(
+        settings.data_dir,
+        settings.input_res,
+        settings.pad,
+        getattr(settings, "context_norm", "[-1,1]"),
+        getattr(settings, "metadata", ""),
+        getattr(settings, "image_prefix", ""),
+        getattr(settings, "tb_label_mode", "tb_or_sequelae"),
+        settings.seed,
+        stage_mode="off",
+    )
+    unique: dict[str, dict[str, Any]] = {}
+    split_counts: dict[str, int] = {}
+    for split in splits:
+        dataset = provider.load_split(split)
+        split_counts[split] = len(dataset)
+        for record in dataset.image_records():
+            source = record["source"]
+            if source not in unique:
+                unique[source] = {
+                    "kind": "item",
+                    "image_id": record["image_id"],
+                    "source": source,
+                    "relative_path": _safe_stage_relative(source, record["image_id"]),
+                    "split": split,
+                }
+    records = list(unique.values())
+    if limit > 0:
+        records = records[:limit]
+
+    existing_map = _load_stage_manifest(stage_manifest, stage_dir)
+    total_bytes = 0
+    unknown_sizes = 0
+    size_basis = "per_item"
+    sample_count = len(records)
+    if len(records) > 1024 and size_sample_items > 0:
+        sample_count = min(len(records), size_sample_items)
+        size_basis = f"sampled_{sample_count}_items"
+    prefix = provider.image_prefix.rstrip("/")
+    if len(records) > 1024 and size_sample_items <= 0 and prefix.startswith("gs://"):
+        prefix_bytes = _remote_tree_size(prefix)
+        if prefix_bytes is not None:
+            sample_count = 0
+            total_bytes = int(prefix_bytes)
+            size_basis = "source_prefix_upper_bound"
+    records_to_size = records[:sample_count]
+
+    def record_size(record: dict[str, Any]) -> int | None:
+        local_path = Path(stage_dir) / record["relative_path"]
+        if local_path.is_file():
+            return local_path.stat().st_size
+        staged = existing_map.get(record["image_id"])
+        if staged and Path(staged).is_file():
+            return Path(staged).stat().st_size
+        return _source_size(record["source"])
+
+    if records_to_size:
+        with ThreadPoolExecutor(max_workers=min(workers, len(records_to_size))) as executor:
+            sizes = list(executor.map(record_size, records_to_size))
+        known_sizes = [int(size) for size in sizes if size is not None]
+        unknown_sizes = len(sizes) - len(known_sizes)
+        for record, size in zip(records_to_size, sizes):
+            record["bytes"] = size
+        for record in records[sample_count:]:
+            record["bytes"] = None
+        if size_basis.startswith("sampled_") and known_sizes:
+            total_bytes = int((sum(known_sizes) / len(known_sizes)) * len(records))
+            unknown_sizes = 0
+        else:
+            total_bytes = sum(known_sizes)
+
+    refusal = ""
+    if max_items > 0 and len(records) > max_items:
+        refusal = f"required_items={len(records)} exceeds input_stage_max_items={max_items}"
+    elif max_bytes > 0 and unknown_sizes:
+        refusal = f"cannot enforce input_stage_max_bytes={max_bytes} with {unknown_sizes} unknown object sizes"
+    elif max_bytes > 0 and total_bytes > max_bytes:
+        refusal = f"estimated_bytes={total_bytes} exceeds input_stage_max_bytes={max_bytes}"
+
+    summary = {
+        "stage_dir": stage_dir,
+        "stage_manifest": stage_manifest,
+        "splits": list(splits),
+        "split_rows": split_counts,
+        "required_items": len(records),
+        "estimated_bytes": total_bytes,
+        "unknown_sizes": unknown_sizes,
+        "size_basis": size_basis,
+        "max_items": max_items,
+        "max_bytes": max_bytes,
+        "size_sample_items": size_sample_items,
+        "execute": execute,
+        "refusal": refusal,
+        "copied": 0,
+        "reused": 0,
+    }
+    if refusal:
+        if execute:
+            raise RuntimeError(f"PadChest staging refused: {refusal}")
+        return summary
+    if not execute:
+        return summary
+
+    stage_root = Path(stage_dir)
+    stage_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(stage_manifest)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if not manifest_path.exists():
+        with manifest_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "kind": "header",
+                "version": 1,
+                "created_at": int(time.time()),
+                "metadata": provider.metadata,
+                "image_prefix": provider.image_prefix,
+                "max_items": max_items,
+                "max_bytes": max_bytes,
+            }, sort_keys=True) + "\n")
+
+    def copy_one(record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        destination = stage_root / record["relative_path"]
+        if destination.is_file():
+            record["bytes"] = destination.stat().st_size
+            return record, False
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=destination.name, suffix=".tmp", dir=str(destination.parent))
+        os.close(fd)
+        try:
+            with _open_binary(record["source"]) as source, open(tmp, "wb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+            os.replace(tmp, destination)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        record["bytes"] = destination.stat().st_size
+        return record, True
+
+    copied_records: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(records)))) as executor:
+        for record, copied in executor.map(copy_one, records):
+            summary["copied" if copied else "reused"] += 1
+            copied_records.append(record)
+    with manifest_path.open("a", encoding="utf-8") as handle:
+        for record in copied_records:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    summary["estimated_bytes"] = sum(int(record.get("bytes") or 0) for record in copied_records)
+    return summary
+
+
+def _stage_settings(settings: Any) -> dict[str, str]:
+    return {
+        "stage_dir": str(getattr(settings, "input_stage_dir", "") or ""),
+        "stage_manifest": str(getattr(settings, "input_stage_manifest", "") or ""),
+        "stage_mode": str(getattr(settings, "input_stage_mode", "auto") or "auto"),
+    }
+
+
 def padchest(settings) -> dict[str, PadChestDataset]:
-    provider = PadChestProvider(settings.data_dir, settings.input_res, settings.pad, settings.context_norm, getattr(settings, "metadata", ""), getattr(settings, "image_prefix", ""), getattr(settings, "tb_label_mode", "tb_or_sequelae"), settings.seed)
+    provider = PadChestProvider(
+        settings.data_dir,
+        settings.input_res,
+        settings.pad,
+        settings.context_norm,
+        getattr(settings, "metadata", ""),
+        getattr(settings, "image_prefix", ""),
+        getattr(settings, "tb_label_mode", "tb_or_sequelae"),
+        settings.seed,
+        **_stage_settings(settings),
+    )
     return {split: provider.load_split(split) for split in ("train", "valid", "test")}

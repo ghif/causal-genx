@@ -93,6 +93,13 @@ class PredictorRunArguments:
     input_cache_max_items: int = 2048
     input_prefetch_workers: int = 8
     input_prefetch_batches: int = 2
+    input_stage_mode: str = "auto"
+    input_stage_dir: str = ""
+    input_stage_manifest: str = ""
+    input_stage_max_items: int = 0
+    input_stage_max_bytes: int = 0
+    input_stage_size_sample_items: int = 256
+    input_stage_workers: int = 16
     augment: bool = True
     type: str = "train-predictor"
     save_dir: str = ""
@@ -287,6 +294,7 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         lr=config.optimizer.lr, wd=config.optimizer.weight_decay,
         input_res=config.dataset.input_res, pad=config.dataset.pad,
         checkpoint_freq=workflow.checkpoint_freq, speed_log_freq=workflow.speed_log_freq,
+        benchmark_steps=getattr(workflow, "benchmark_steps", 0),
         execution_mode=workflow.execution_mode, drop_remainder=workflow.drop_remainder,
         widths=[32, 32],
         freeze_backbone=freeze_backbone,
@@ -302,6 +310,13 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         input_cache_max_items=getattr(workflow, "input_cache_max_items", 2048),
         input_prefetch_workers=getattr(workflow, "input_prefetch_workers", 8),
         input_prefetch_batches=getattr(workflow, "input_prefetch_batches", 2),
+        input_stage_mode=getattr(workflow, "input_stage_mode", "auto"),
+        input_stage_dir=getattr(workflow, "input_stage_dir", ""),
+        input_stage_manifest=getattr(workflow, "input_stage_manifest", ""),
+        input_stage_max_items=getattr(workflow, "input_stage_max_items", 0),
+        input_stage_max_bytes=getattr(workflow, "input_stage_max_bytes", 0),
+        input_stage_size_sample_items=getattr(workflow, "input_stage_size_sample_items", 256),
+        input_stage_workers=getattr(workflow, "input_stage_workers", 16),
         augment=augment,
         type=workflow.type,
         predictor_model=workflow.predictor_model,
@@ -918,12 +933,28 @@ def _input_cache_enabled(args: Any) -> bool:
     return str(getattr(args, "dataset", "")) == "padchest"
 
 
+def _staging_active_for_dataset(dataset: Any) -> bool:
+    current = getattr(dataset, "dataset", dataset)
+    return bool(getattr(current, "_staged_images", None))
+
+
 def _prepare_input_pipeline(logger: logging.Logger, datasets: Dict[str, Any], train_dataset: Any, args: Any):
     """Apply bounded, configurable adapters for image-backed predictor input."""
     workers = max(1, int(getattr(args, "input_prefetch_workers", 1)))
     max_items = max(0, int(getattr(args, "input_cache_max_items", 0)))
     cache_dir = str(getattr(args, "input_cache_dir", "") or _default_input_cache_dir(args))
-    if _input_cache_enabled(args) and max_items > 0:
+    staged = _staging_active_for_dataset(train_dataset)
+    if getattr(args, "dataset", "") == "padchest":
+        logger.info(
+            "input_pipeline staging mode=%s dir=%s manifest=%s active=%s max_items=%s max_bytes=%s",
+            getattr(args, "input_stage_mode", "auto"),
+            getattr(args, "input_stage_dir", "") or "<unset>",
+            getattr(args, "input_stage_manifest", "") or "<default>",
+            staged,
+            getattr(args, "input_stage_max_items", 0),
+            getattr(args, "input_stage_max_bytes", 0),
+        )
+    if _input_cache_enabled(args) and max_items > 0 and not staged:
         train_dataset = _CachedItemDataset(train_dataset, cache_dir=cache_dir, max_items=max_items, workers=workers, name="train")
         for split in ("valid", "test"):
             if split in datasets:
@@ -934,8 +965,8 @@ def _prepare_input_pipeline(logger: logging.Logger, datasets: Dict[str, Any], tr
         )
     else:
         logger.info(
-            "input_pipeline cache=off workers=%d prefetch_batches=%d",
-            workers, int(getattr(args, "input_prefetch_batches", 0)),
+            "input_pipeline cache=off reason=%s workers=%d prefetch_batches=%d",
+            "staged" if staged else "disabled_or_unbounded", workers, int(getattr(args, "input_prefetch_batches", 0)),
         )
     return datasets, train_dataset
 
@@ -1139,6 +1170,10 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
         backbone_lr_scale = float(getattr(args, "backbone_lr_scale", 1.0))
         train_step = _make_train_step(graphdef, optimizer, backbone_lr_scale=backbone_lr_scale)
     final_stats: Dict[str, float] = {}
+    benchmark_steps = max(0, int(getattr(args, "benchmark_steps", 0)))
+    benchmark_start_step = step
+    benchmark_start_seen = 0
+    benchmark_t0 = time.perf_counter()
     artifact_writer = BackgroundArtifactWriter()
     metric_artifact_writer = BackgroundArtifactWriter()
     try:
@@ -1202,6 +1237,15 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
                     speed_window_t0 = sync_t0
                     speed_window_step = batch_index
                     speed_window_samples = seen
+                if benchmark_steps and (step - benchmark_start_step) >= benchmark_steps:
+                    elapsed = time.perf_counter() - benchmark_t0
+                    samples = seen - benchmark_start_seen
+                    final_stats = {key: value / max(1, seen) for key, value in totals.items()}
+                    logger.info(
+                        "Benchmark completed after %d training step(s): elapsed=%.3fs samples=%d samples/s=%.3f",
+                        benchmark_steps, elapsed, samples, samples / max(elapsed, 1e-12),
+                    )
+                    return final_stats
             # Evaluate with EMA parameters and EMA BatchNorm statistics, not the live model.
             train_stats = {key: value / max(1, seen) for key, value in totals.items()}
             portable_params, portable_batch_stats, portable_rng_state, portable_ema, portable_opt_state = _portable_training_state(
@@ -1262,6 +1306,8 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
 def run(config: ExperimentConfig) -> str:
     """Run predictor training directly from a typed experiment configuration."""
     run_dir = output_dir(config)
-    _run(_run_arguments(config))
-    validate_artifacts(run_dir)
+    args = _run_arguments(config)
+    _run(args)
+    if int(getattr(args, "benchmark_steps", 0)) <= 0:
+        validate_artifacts(run_dir)
     return str(run_dir)

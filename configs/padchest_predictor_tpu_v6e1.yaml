@@ -37,4 +37,15 @@ workflow:
   execution_mode: single_device
   drop_remainder: true
   checkpoint_freq: 1
+  benchmark_steps: 0
   freeze_backbone: false
+  input_cache: "off"
+  input_prefetch_workers: 8
+  input_prefetch_batches: 4
+  input_stage_mode: require
+  input_stage_dir: /mnt/data/dataset/padchest/input-stage/images-224
+  input_stage_manifest: /mnt/data/dataset/padchest/input-stage/images-224/padchest-stage-manifest.jsonl
+  input_stage_max_items: 200000
+  input_stage_max_bytes: 120000000000
+  input_stage_size_sample_items: 256
+  input_stage_workers: 32
