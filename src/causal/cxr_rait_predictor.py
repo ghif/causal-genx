@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
+from contracts import VariableKind, VariableSpec
 from .image_parent_predictor import (
     CNNEncoder,
     _as_column,
@@ -155,6 +156,243 @@ def _load_torchxrayvision_weights(backbone: TorchXRayVisionDenseNet121, weights_
             assign_bn(transition.norm, f"features.transition{block_index}.norm")
             assign(transition.conv.kernel, f"features.transition{block_index}.conv.weight")
     assign_bn(backbone.norm5, "features.norm5")
+
+
+def _kind_value(kind) -> str:
+    return getattr(kind, "value", str(kind))
+
+
+def _categorical_target(target: jax.Array, encoded_dim: int) -> jax.Array:
+    target = jnp.asarray(target, dtype=jnp.float32)
+    if target.ndim > 0 and target.shape[-1] == encoded_dim:
+        return target
+    return jax.nn.one_hot(jnp.asarray(target).squeeze(-1).astype(jnp.int32), encoded_dim).astype(jnp.float32)
+
+
+def _binary_target(target: jax.Array) -> jax.Array:
+    target = _as_column(jnp.asarray(target, dtype=jnp.float32))
+    if target.shape[-1] == 2:
+        target = target[..., 1:2]
+    return target
+
+
+def _variable_log_prob(name: str, kind: str, encoded_dim: int, prediction: jax.Array, target: jax.Array, std_fixed: float, label_smoothing: float = 0.0) -> jax.Array:
+    if kind == VariableKind.CONTINUOUS.value:
+        loc, logscale = jnp.split(prediction, 2, axis=-1)
+        loc, logscale = jnp.tanh(loc.astype(jnp.float32)), logscale.astype(jnp.float32)
+        scale = _positive_scale(logscale, std_fixed)
+        value = _as_column(target)
+        return jnp.sum(_normal_log_prob((value - loc) / scale) - jnp.log(scale), axis=-1)
+    if kind == VariableKind.BINARY.value:
+        target_arr = _binary_target(target)
+        if label_smoothing > 0.0:
+            target_arr = target_arr * (1.0 - label_smoothing) + 0.5 * label_smoothing
+        logits = prediction.astype(jnp.float32)
+        return jnp.sum(target_arr * jax.nn.log_sigmoid(logits) + (1.0 - target_arr) * jax.nn.log_sigmoid(-logits), axis=-1)
+    target_arr = _categorical_target(target, encoded_dim)
+    if label_smoothing > 0.0:
+        target_arr = target_arr * (1.0 - label_smoothing) + label_smoothing / float(encoded_dim)
+    return jnp.sum(target_arr * jax.nn.log_softmax(prediction.astype(jnp.float32), axis=-1), axis=-1)
+
+
+def _variable_prediction(kind: str, encoded_dim: int, raw: jax.Array) -> jax.Array:
+    if kind == VariableKind.CONTINUOUS.value:
+        loc, _ = jnp.split(raw, 2, axis=-1)
+        return jnp.tanh(loc.astype(jnp.float32))
+    if kind == VariableKind.BINARY.value:
+        return jax.nn.sigmoid(raw.astype(jnp.float32))
+    return jax.nn.softmax(raw.astype(jnp.float32), axis=-1)
+
+
+def _output_dim(kind: str, encoded_dim: int) -> int:
+    if kind == VariableKind.CONTINUOUS.value:
+        return 2
+    if kind == VariableKind.BINARY.value:
+        return 1
+    return int(encoded_dim)
+
+
+class CxrImageParentPredictor(nnx.Module):
+    """Generic anticausal CXR image parent predictor declared by a dataset schema."""
+
+    def __init__(
+        self,
+        *,
+        variable_specs: tuple[VariableSpec, ...],
+        input_channels: int = 1,
+        input_res: int = 128,
+        width: int = 16,
+        std_fixed: float = 0.0,
+        compute_dtype: jnp.dtype = jnp.float32,
+        rngs: Optional[nnx.Rngs] = None,
+    ):
+        rngs = rngs or nnx.Rngs(0)
+        self.parent_variables = tuple(spec.name for spec in variable_specs)
+        self.variables = {spec.name: _kind_value(spec.kind) for spec in variable_specs}
+        self.encoded_dims = {spec.name: int(spec.encoded_dim) for spec in variable_specs}
+        self.input_channels = int(input_channels)
+        self.input_res = int(input_res)
+        self.width = int(width)
+        self.std_fixed = float(std_fixed)
+        self.compute_dtype = compute_dtype
+        self.encoder_attrs = {}
+        input_shape = (self.input_channels, self.input_res, self.input_res)
+        for index, spec in enumerate(variable_specs):
+            attr = f"encoder_{index}"
+            self.encoder_attrs[spec.name] = attr
+            setattr(
+                self,
+                attr,
+                CNNEncoder(
+                    input_shape,
+                    width=self.width,
+                    num_outputs=_output_dim(_kind_value(spec.kind), int(spec.encoded_dim)),
+                    context_dim=0,
+                    compute_dtype=self.compute_dtype,
+                    rngs=rngs,
+                ),
+            )
+
+    def _raw_prediction(self, name: str, x):
+        return getattr(self, self.encoder_attrs[name])(x)
+
+    def predict(self, *, x, **parents):
+        del parents
+        return {
+            name: _variable_prediction(self.variables[name], self.encoded_dims[name], self._raw_prediction(name, x))
+            for name in self.parent_variables
+        }
+
+    def anticausal_log_probs(self, *, x, **parents):
+        log_probs = {}
+        joint = None
+        for name in self.parent_variables:
+            if name not in parents:
+                raise KeyError(f"Missing parent variable {name!r} for {type(self).__name__}")
+            value = _variable_log_prob(
+                name,
+                self.variables[name],
+                self.encoded_dims[name],
+                self._raw_prediction(name, x),
+                parents[name],
+                self.std_fixed,
+            )
+            log_probs[f"{name}_aux"] = value
+            joint = value if joint is None else joint + value
+        log_probs["joint"] = joint
+        return log_probs
+
+    def model_anticausal(self, **obs):
+        return self.anticausal_log_probs(**obs)
+
+    def svi_model(self, **obs):
+        return self.model_anticausal(**obs)
+
+    def guide_pass(self, **obs):
+        del obs
+        return None
+
+
+class CxrPretrainedImageParentPredictor(nnx.Module):
+    """Generic CXR schema predictor using the TorchXRayVision DenseNet-121 backbone."""
+
+    def __init__(
+        self,
+        *,
+        variable_specs: tuple[VariableSpec, ...],
+        input_channels: int = 1,
+        input_res: int = 224,
+        width: int = 32,
+        std_fixed: float = 0.0,
+        freeze_backbone: bool = True,
+        weights_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz",
+        dropout_rate: float = 0.0,
+        label_smoothing: float = 0.0,
+        compute_dtype: jnp.dtype = jnp.float32,
+        rngs: Optional[nnx.Rngs] = None,
+    ):
+        rngs = rngs or nnx.Rngs(0)
+        if input_channels != 1:
+            raise ValueError("CxrPretrainedImageParentPredictor requires input_channels=1 for TorchXRayVision DenseNet-121")
+        self.parent_variables = tuple(spec.name for spec in variable_specs)
+        self.variables = {spec.name: _kind_value(spec.kind) for spec in variable_specs}
+        self.encoded_dims = {spec.name: int(spec.encoded_dim) for spec in variable_specs}
+        self.input_channels = int(input_channels)
+        self.input_res = int(input_res)
+        self.width = int(width)
+        self.std_fixed = float(std_fixed)
+        self.freeze_backbone = bool(freeze_backbone)
+        self.dropout_rate = float(dropout_rate)
+        self.label_smoothing = float(label_smoothing)
+        self.compute_dtype = compute_dtype
+        self.encoder_shared = TorchXRayVisionDenseNet121(compute_dtype=self.compute_dtype, rngs=rngs)
+        _load_torchxrayvision_weights(self.encoder_shared, weights_path)
+        if self.dropout_rate > 0.0:
+            self.dropout = nnx.Dropout(self.dropout_rate, rngs=rngs)
+        self.head_attrs = {}
+        for index, spec in enumerate(variable_specs):
+            attr = f"head_{index}"
+            self.head_attrs[spec.name] = attr
+            setattr(
+                self,
+                attr,
+                nnx.Linear(
+                    self.encoder_shared.output_features,
+                    _output_dim(_kind_value(spec.kind), int(spec.encoded_dim)),
+                    rngs=rngs,
+                ),
+            )
+
+    def _extract_features(self, x):
+        h = self.encoder_shared(x)
+        if getattr(self, "freeze_backbone", True):
+            h = jax.lax.stop_gradient(h)
+        if hasattr(self, "dropout") and self.dropout_rate > 0.0:
+            h = self.dropout(h)
+        return h
+
+    def _raw_predictions(self, x):
+        h = self._extract_features(x)
+        return {name: getattr(self, self.head_attrs[name])(h) for name in self.parent_variables}
+
+    def predict(self, *, x, **parents):
+        del parents
+        raw = self._raw_predictions(x)
+        return {
+            name: _variable_prediction(self.variables[name], self.encoded_dims[name], raw[name])
+            for name in self.parent_variables
+        }
+
+    def anticausal_log_probs(self, *, x, **parents):
+        raw = self._raw_predictions(x)
+        log_probs = {}
+        joint = None
+        for name in self.parent_variables:
+            if name not in parents:
+                raise KeyError(f"Missing parent variable {name!r} for {type(self).__name__}")
+            value = _variable_log_prob(
+                name,
+                self.variables[name],
+                self.encoded_dims[name],
+                raw[name],
+                parents[name],
+                self.std_fixed,
+                self.label_smoothing,
+            )
+            log_probs[f"{name}_aux"] = value
+            joint = value if joint is None else joint + value
+        log_probs["joint"] = joint
+        return log_probs
+
+    def model_anticausal(self, **obs):
+        return self.anticausal_log_probs(**obs)
+
+    def svi_model(self, **obs):
+        return self.model_anticausal(**obs)
+
+    def guide_pass(self, **obs):
+        del obs
+        return None
 
 
 class CxrRaitSupAuxPredictor(nnx.Module):

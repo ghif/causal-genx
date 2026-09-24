@@ -45,7 +45,7 @@ def _open_binary(path: str):
     return open(path, "rb")
 
 
-def _load_dicom_image(path: str, target_res: int = 128) -> np.ndarray:
+def _load_dicom_image(path: str, target_res: int = 128, torchxray_norm: bool = False) -> np.ndarray:
     """Load DICOM file, handle VOI LUT windowing, MONOCHROME inversion, and resize."""
     import pydicom
     from PIL import Image

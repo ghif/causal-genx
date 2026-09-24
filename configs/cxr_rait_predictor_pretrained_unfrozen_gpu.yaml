@@ -12,6 +12,7 @@ optimizer:
 
 workflow:
   type: finetune-predictor
+  predictor_model: cxr_rait_image_parent_predictor
   epochs: 100
   checkpoint_freq: 1
   execution_mode: auto

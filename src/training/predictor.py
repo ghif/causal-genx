@@ -21,6 +21,7 @@ import numpy as np
 import optax
 from flax import nnx
 
+from contracts import CausalGraphSpec
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
 from config import ExperimentConfig, PredictorTrainingConfig
 from data.morphomnist import morphomnist
@@ -69,6 +70,7 @@ class PredictorRunArguments:
     load_path: str = ""
     deterministic: bool = False
     testing: bool = False
+    predictor_model: str = "morphomnist_image_parent_predictor"
     # Artifact identity only; native code never uses this to select a path.
     setup: str = "sup_aux"
     parents_x: list[str] | None = None
@@ -179,33 +181,35 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         dropout_rate=getattr(workflow, "dropout_rate", 0.0),
         augment=augment,
         type=workflow.type,
+        predictor_model=workflow.predictor_model,
     )
 
 
+def _schema_for_dataset(dataset: str) -> CausalGraphSpec:
+    if dataset == "morphomnist":
+        from data.morphomnist import MORPHOMNIST_SCHEMA
+        return MORPHOMNIST_SCHEMA
+    if dataset == "cxr_rait":
+        from data.cxr_rait import CXR_RAIT_SCHEMA
+        return CXR_RAIT_SCHEMA
+    if dataset == "padchest":
+        from data.padchest import PAD_CHEST_SCHEMA
+        return PAD_CHEST_SCHEMA
+    raise ValueError(
+        "Predictor training currently supports dataset=morphomnist, dataset=cxr_rait, or dataset=padchest"
+    )
+
 
 def _validate_scope(args: PredictorRunArguments) -> None:
-    if args.dataset not in {"morphomnist", "cxr_rait", "padchest"}:
-        raise ValueError("Predictor training currently supports dataset=morphomnist, cxr_rait, or padchest")
+    _schema_for_dataset(args.dataset)
     if args.accelerator == "cpu" and args.precision != "fp32":
         raise ValueError("CPU predictor training requires precision=fp32")
 
 
 def _configure_dataset_args(args: PredictorRunArguments) -> None:
-    if args.dataset == "cxr_rait":
-        from data.cxr_rait import CXR_RAIT_SCHEMA
-        schema = CXR_RAIT_SCHEMA
-    elif args.dataset == "padchest":
-        from data.padchest import PAD_CHEST_SCHEMA
-        schema = PAD_CHEST_SCHEMA
-    else:
-        schema = None
-    if schema is not None:
-        args.parents_x = list(schema.variable_names)
-        args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", schema.encoded_dim, False
-    else:
-        from data.morphomnist import MORPHOMNIST_SCHEMA
-        args.parents_x = list(MORPHOMNIST_SCHEMA.variable_names)
-        args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", MORPHOMNIST_SCHEMA.encoded_dim, False
+    schema = _schema_for_dataset(args.dataset)
+    args.parents_x = list(schema.variable_names)
+    args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", schema.encoded_dim, False
 
 
 def _build_datasets(args: PredictorRunArguments):
@@ -314,9 +318,37 @@ def _use_tpu_replication(args: PredictorRunArguments) -> bool:
     return multi_tpu_available and requested_mode != "single_device"
 
 
-def _merge(graphdef: Any, params: Any, batch_stats: Any, rng_state: Any):
-    """Reconstruct a predictor, including mutable NNX Dropout RNG state."""
+def _merge(graphdef: Any, params: Any, batch_stats: Any, rng_state: Any | None = None):
+    """Reconstruct a predictor, including mutable NNX Dropout RNG state when present."""
+    if rng_state is None:
+        return nnx.merge(graphdef, params, batch_stats)
     return nnx.merge(graphdef, params, batch_stats, rng_state)
+
+
+def _model_parent_variables(model: Any) -> tuple[str, ...]:
+    parents = getattr(model, "parent_variables", None)
+    if parents is not None:
+        return tuple(parents)
+    return tuple(getattr(model, "variables", {}).keys())
+
+
+def _batch_for_model(model: Any, batch: Dict[str, jax.Array]) -> Dict[str, jax.Array]:
+    """Return exactly the image and parent variables required by a predictor."""
+    required = ("x",) + _model_parent_variables(model)
+    missing = [key for key in required if key not in batch]
+    if missing:
+        available = sorted(batch.keys())
+        raise KeyError(
+            f"Predictor {type(model).__name__} requires batch keys {missing}; available={available}"
+        )
+    variables = getattr(model, "variables", {})
+    result = {"x": batch["x"]}
+    for key in required[1:]:
+        value = batch[key]
+        if variables.get(key) == "continuous" and getattr(value, "ndim", None) == 1:
+            value = value[:, None]
+        result[key] = value
+    return result
 
 
 def _loss_and_state(
@@ -324,20 +356,28 @@ def _loss_and_state(
     params: Any,
     batch_stats: Any,
     rng_state: Any,
-    batch: Dict[str, jax.Array],
+    batch: Dict[str, jax.Array] | None = None,
     *,
     training: bool,
 ):
+    legacy_call = batch is None
+    if legacy_call:
+        batch = rng_state
+        rng_state = None
     model = _merge(graphdef, params, batch_stats, rng_state)
     model.train() if training else model.eval()
-    log_probs = model.model_anticausal(**batch)
+    log_probs = model.model_anticausal(**_batch_for_model(model, batch))
     loss = -jnp.mean(log_probs["joint"])
     metrics = {"loss": loss, **{f"logp({key})": jnp.mean(value) for key, value in log_probs.items() if key != "joint"}}
+    updated_params = nnx.state(model, nnx.Param).to_pure_dict()
+    updated_batch_stats = nnx.state(model, nnx.BatchStat).to_pure_dict()
+    if legacy_call:
+        return loss, metrics, updated_params, updated_batch_stats
     return (
         loss,
         metrics,
-        nnx.state(model, nnx.Param).to_pure_dict(),
-        nnx.state(model, nnx.BatchStat).to_pure_dict(),
+        updated_params,
+        updated_batch_stats,
         nnx.state(model, nnx.RngState).to_pure_dict(),
     )
 
@@ -355,17 +395,33 @@ def _scale_backbone_grads(grads: Any, scale: float) -> Any:
 def _make_train_step(graphdef: Any, optimizer: optax.GradientTransformation, backbone_lr_scale: float = 1.0):
     """Compile one predictor update, including BatchNorm state evolution."""
     @jax.jit
-    def train_step(params, batch_stats, rng_state, opt_state, batch):
+    def train_step(params, batch_stats, *step_args):
+        legacy_call = len(step_args) == 2
+        if legacy_call:
+            rng_state = None
+            opt_state, batch = step_args
+        else:
+            rng_state, opt_state, batch = step_args
+
         def loss_fn(current_params):
+            if legacy_call:
+                loss, metrics, new_params, new_batch_stats = _loss_and_state(
+                    graphdef, current_params, batch_stats, batch, training=True
+                )
+                return loss, (metrics, new_params, new_batch_stats, None)
             loss, metrics, new_params, new_batch_stats, new_rng_state = _loss_and_state(
                 graphdef, current_params, batch_stats, rng_state, batch, training=True
             )
             return loss, (metrics, new_params, new_batch_stats, new_rng_state)
+
         (_, (metrics, _new_params, new_batch_stats, new_rng_state)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = _scale_backbone_grads(grads, backbone_lr_scale)
         grad_norm = optax.global_norm(grads)
         updates, opt_state = optimizer.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), new_batch_stats, new_rng_state, opt_state, metrics, grad_norm
+        updated_params = optax.apply_updates(params, updates)
+        if legacy_call:
+            return updated_params, new_batch_stats, opt_state, metrics, grad_norm
+        return updated_params, new_batch_stats, new_rng_state, opt_state, metrics, grad_norm
     return train_step
 
 
@@ -435,10 +491,18 @@ def _portable_training_state(
     )
 
 
-def _eval_epoch(graphdef: Any, params: Any, batch_stats: Any, rng_state: Any, dataset: Any, batch_size: int, rng: np.random.Generator) -> Dict[str, float]:
+def _eval_epoch(graphdef: Any, params: Any, batch_stats: Any, rng_state: Any, dataset: Any | None = None, batch_size: int | None = None, rng: np.random.Generator | None = None) -> Dict[str, float]:
+    if rng is None:
+        rng = batch_size
+        batch_size = dataset
+        dataset = rng_state
+        rng_state = None
     totals: Dict[str, float] = {}; count = 0
     for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
-        _, metrics, _, _, _ = _loss_and_state(graphdef, params, batch_stats, rng_state, batch, training=False)
+        if rng_state is None:
+            _, metrics, _, _ = _loss_and_state(graphdef, params, batch_stats, batch, training=False)
+        else:
+            _, metrics, _, _, _ = _loss_and_state(graphdef, params, batch_stats, rng_state, batch, training=False)
         size = int(next(iter(batch.values())).shape[0])
 
         for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
@@ -590,20 +654,25 @@ def _log_epoch_summary(
 def _prediction_metrics(args: PredictorRunArguments, model: Any, dataset: Any, batch_size: int, rng: np.random.Generator) -> Dict[str, float]:
     model.eval(); predictions = {key: [] for key in model.variables}; targets = {key: [] for key in model.variables}
     for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
-        for key in targets: targets[key].extend(np.asarray(batch[key]))
-        for key, value in model.predict(**batch).items(): predictions[key].extend(np.asarray(value))
+        model_batch = _batch_for_model(model, batch)
+        for key in targets: targets[key].extend(np.asarray(model_batch[key]))
+        for key, value in model.predict(**model_batch).items(): predictions[key].extend(np.asarray(value))
     stats: Dict[str, float] = {}
     for key, var_kind in getattr(model, "variables", {}).items():
+        target_arr = np.asarray(targets[key])
+        prediction_arr = np.asarray(predictions[key])
         if var_kind == "categorical" or key == "digit":
-            stats[f"{key}_acc"] = float((np.asarray(targets[key]).argmax(-1) == np.asarray(predictions[key]).argmax(-1)).mean())
+            stats[f"{key}_acc"] = float((target_arr.argmax(-1) == prediction_arr.argmax(-1)).mean())
+        elif var_kind == "binary":
+            stats[f"{key}_acc"] = float(((prediction_arr.squeeze(-1) >= 0.5) == (target_arr.squeeze(-1) >= 0.5)).mean())
         else:
             if hasattr(dataset, "min_max") and key in dataset.min_max:
                 low, high = dataset.min_max[key]
-                prediction = ((np.asarray(predictions[key]).squeeze(-1) + 1.0) / 2.0) * (high - low) + low
-                target = ((np.asarray(targets[key]).squeeze(-1) + 1.0) / 2.0) * (high - low) + low
+                prediction = ((prediction_arr.squeeze(-1) + 1.0) / 2.0) * (high - low) + low
+                target = ((target_arr.squeeze(-1) + 1.0) / 2.0) * (high - low) + low
             else:
-                prediction = np.asarray(predictions[key]).squeeze(-1)
-                target = np.asarray(targets[key]).squeeze(-1)
+                prediction = prediction_arr.squeeze(-1)
+                target = target_arr.squeeze(-1)
             stats[f"{key}_mae"] = float(np.mean(np.abs(target - prediction)))
     return stats
 
@@ -631,6 +700,85 @@ def _setup_logging(args: PredictorRunArguments) -> logging.Logger:
     logging.getLogger("orbax").setLevel(logging.WARNING)
     logging.getLogger("absl").setLevel(logging.WARNING)
     return logging.getLogger(args.exp_name or f"{args.dataset}-predictor")
+
+
+def _predictor_model_family(args: PredictorRunArguments) -> str:
+    requested = (getattr(args, "predictor_model", "") or "").strip()
+    if requested in {"", "auto"}:
+        return "morphomnist" if args.dataset == "morphomnist" else "cxr"
+    if requested == "morphomnist_image_parent_predictor" and args.dataset != "morphomnist":
+        # Several legacy CXR configs predate the predictor_model key and therefore carry
+        # the Pydantic default.  Resolve those by dataset rather than instantiating the
+        # MorphoMNIST-only loss contract for CXR parent variables.
+        return "cxr"
+    if requested in {"morphomnist_image_parent_predictor", "morphomnist_sup_aux_predictor"}:
+        return "morphomnist"
+    if requested in {"cxr_rait_image_parent_predictor", "cxr_image_parent_predictor", "padchest_image_parent_predictor"}:
+        return "cxr"
+    raise ValueError(f"Unknown predictor_model={requested!r}")
+
+
+def _build_predictor_model(args: PredictorRunArguments, dtype: jnp.dtype, logger: logging.Logger | None = None):
+    family = _predictor_model_family(args)
+    schema = _schema_for_dataset(args.dataset)
+    if family == "morphomnist":
+        if args.dataset != "morphomnist":
+            raise ValueError("The MorphoMNIST predictor can only be used with dataset=morphomnist")
+        return MorphoMNISTSupAuxPredictor(
+            input_channels=args.input_channels,
+            input_res=args.input_res,
+            width=8,
+            std_fixed=args.std_fixed,
+            compute_dtype=dtype,
+            rngs=nnx.Rngs(args.seed),
+        )
+
+    use_pretrained = args.type == "finetune-predictor" or getattr(args, "pretrained", False)
+    legacy_cxr_rait = args.dataset == "cxr_rait" and tuple(schema.variable_names) == ("age", "gender", "tb_status")
+    if use_pretrained:
+        from causal.cxr_rait_predictor import CxrPretrainedImageParentPredictor, CxrRaitPretrainedPredictor
+        local_weights_path = _materialize_pretrained_weights(args.pretrained_weights_path)
+        if logger is not None:
+            logger.info(
+                "pretrained_weights_source=%s local_cache=%s",
+                args.pretrained_weights_path,
+                local_weights_path,
+            )
+        model_cls = CxrRaitPretrainedPredictor if legacy_cxr_rait else CxrPretrainedImageParentPredictor
+        kwargs = {} if legacy_cxr_rait else {"variable_specs": schema.variables}
+        return model_cls(
+            **kwargs,
+            input_channels=args.input_channels,
+            input_res=args.input_res,
+            width=32,
+            std_fixed=args.std_fixed,
+            freeze_backbone=getattr(args, "freeze_backbone", True),
+            weights_path=local_weights_path,
+            dropout_rate=getattr(args, "dropout_rate", 0.0),
+            label_smoothing=getattr(args, "label_smoothing", 0.0),
+            compute_dtype=dtype,
+            rngs=nnx.Rngs(args.seed),
+        )
+
+    from causal.cxr_rait_predictor import CxrImageParentPredictor, CxrRaitSupAuxPredictor
+    if legacy_cxr_rait:
+        return CxrRaitSupAuxPredictor(
+            input_channels=args.input_channels,
+            input_res=args.input_res,
+            width=16,
+            std_fixed=args.std_fixed,
+            compute_dtype=dtype,
+            rngs=nnx.Rngs(args.seed),
+        )
+    return CxrImageParentPredictor(
+        variable_specs=schema.variables,
+        input_channels=args.input_channels,
+        input_res=args.input_res,
+        width=16,
+        std_fixed=args.std_fixed,
+        compute_dtype=dtype,
+        rngs=nnx.Rngs(args.seed),
+    )
 
 
 
@@ -702,40 +850,7 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
     logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets, train_dataset = _build_datasets(args); valid_dataset = datasets["valid"]
     _log_input_normalization(logger, datasets["train"], train_dataset, args)
-    if args.dataset == "cxr_rait":
-        if args.type == "finetune-predictor" or getattr(args, "freeze_backbone", False) or getattr(args, "pretrained", False):
-            from causal.cxr_rait_predictor import CxrRaitPretrainedPredictor
-            local_weights_path = _materialize_pretrained_weights(args.pretrained_weights_path)
-            logger.info(
-                "pretrained_weights_source=%s local_cache=%s",
-                args.pretrained_weights_path,
-                local_weights_path,
-            )
-            model = CxrRaitPretrainedPredictor(
-                input_channels=args.input_channels,
-                input_res=args.input_res,
-                width=32,
-                std_fixed=args.std_fixed,
-                freeze_backbone=getattr(args, "freeze_backbone", True),
-                weights_path=local_weights_path,
-                dropout_rate=getattr(args, "dropout_rate", 0.0),
-                label_smoothing=getattr(args, "label_smoothing", 0.0),
-                compute_dtype=dtype,
-                rngs=nnx.Rngs(args.seed),
-            )
-
-        else:
-            from causal.cxr_rait_predictor import CxrRaitSupAuxPredictor
-            model = CxrRaitSupAuxPredictor(
-                input_channels=args.input_channels,
-                input_res=args.input_res,
-                width=16,
-                std_fixed=args.std_fixed,
-                compute_dtype=dtype,
-                rngs=nnx.Rngs(args.seed),
-            )
-    else:
-        model = MorphoMNISTSupAuxPredictor(input_channels=args.input_channels, input_res=args.input_res, width=8, std_fixed=args.std_fixed, compute_dtype=dtype, rngs=nnx.Rngs(args.seed))
+    model = _build_predictor_model(args, dtype, logger)
 
     graphdef, params_state, batch_stats_state, rng_state = nnx.split(
         model, nnx.Param, nnx.BatchStat, nnx.RngState
