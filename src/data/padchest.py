@@ -156,6 +156,10 @@ class PadChestDataset:
             )
             for spec in PAD_CHEST_SCHEMA.variables
         }
+        self.min_max = {"age_at_study": (AGE_AT_STUDY_MIN, AGE_AT_STUDY_MAX), "study_year": (STUDY_YEAR_MIN, STUDY_YEAR_MAX)}
+        self.cache_fingerprint = hashlib.sha256(
+            f"padchest|{root}|{metadata}|{image_prefix}|{split}|{input_res}|{tb_label_mode}|{seed}".encode()
+        ).hexdigest()[:16]
 
     def __len__(self):
         return len(self.rows)
@@ -171,6 +175,10 @@ class PadChestDataset:
         with _open_binary(self._image_path(self.rows[index])) as handle:
             image = Image.open(handle).convert("L").resize((self.input_res, self.input_res), Image.Resampling.BILINEAR)
         return np.asarray(image, dtype=np.float32)[None] / 255.0
+
+    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
+        batch = self.make_batch([int(index)])
+        return {key: np.asarray(value[0]) for key, value in batch.items()}
 
     def make_batch(self, indices: Sequence[int], **_: Any) -> dict[str, np.ndarray]:
         batch_indices = np.asarray(indices, dtype=np.int64)

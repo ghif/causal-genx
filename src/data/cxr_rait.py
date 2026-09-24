@@ -5,6 +5,7 @@ import io
 import os
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import jax.numpy as jnp
@@ -240,6 +241,9 @@ class CxrRaitDataset:
         augment: bool = False,
         torchxray_preprocessing: bool = False,
         seed: int = 7,
+        cache_dir: str | None = None,
+        cache_max_items: int = 2048,
+        preload_images: bool = False,
     ):
         self.root_dir = root_dir
         self.split = split
@@ -250,7 +254,7 @@ class CxrRaitDataset:
         self.input_res = input_res
         self.augment = augment
         self.torchxray_preprocessing = torchxray_preprocessing
-
+        self.cache_max_items = max(0, int(cache_max_items))
 
         metadata_path = os.path.join(root_dir, "data_demography.xlsx")
         meta_dict = _load_cxr_rait_metadata(metadata_path)
@@ -340,9 +344,12 @@ class CxrRaitDataset:
         cache_suffix = f"_{self.input_res}"
         if self.torchxray_preprocessing:
             cache_suffix += "_torchxray"
-        self.cache_dir = os.path.expanduser(f"~/.cache/cxr_rait{cache_suffix}")
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self._preload_images()
+        self.cache_dir = os.path.expanduser(cache_dir or f"~/.cache/cxr_rait{cache_suffix}") if self.cache_max_items else ""
+        if self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        self.cache_fingerprint = hashlib.sha256(f"cxr_rait|{root_dir}|{split}|{self.input_res}|{self.torchxray_preprocessing}".encode()).hexdigest()[:16]
+        if preload_images:
+            self._preload_images()
 
     def _preload_images(self, max_workers: int = 16):
         from concurrent.futures import ThreadPoolExecutor
@@ -361,8 +368,8 @@ class CxrRaitDataset:
             return self._image_cache[idx]
 
         pid, _ = self.samples_meta[idx]
-        disk_cache_file = os.path.join(self.cache_dir, f"{pid}.npy")
-        if os.path.exists(disk_cache_file):
+        disk_cache_file = os.path.join(self.cache_dir, f"{pid}.npy") if self.cache_dir else ""
+        if disk_cache_file and os.path.exists(disk_cache_file):
             try:
                 res = np.load(disk_cache_file)
                 self._image_cache[idx] = res
@@ -380,10 +387,23 @@ class CxrRaitDataset:
         res = img[None, ...]  # 1 x H x W
         self._image_cache[idx] = res
         try:
-            np.save(disk_cache_file, res)
+            if disk_cache_file:
+                np.save(disk_cache_file, res)
+                self._evict_cache_files()
         except Exception:
             pass
         return res
+
+    def _evict_cache_files(self) -> None:
+        if not self.cache_dir or self.cache_max_items <= 0:
+            return
+        try:
+            files = sorted(Path(self.cache_dir).glob("*.npy"), key=lambda p: p.stat().st_mtime)
+            overflow = len(files) - self.cache_max_items
+            for victim in files[:max(0, overflow)]:
+                victim.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
         img = self._get_image(idx)
@@ -499,6 +519,9 @@ def cxr_rait(settings) -> Dict[str, CxrRaitDataset]:
             input_res=settings.input_res,
             augment=(should_augment if split == "train" else False),
             torchxray_preprocessing=getattr(settings, "torchxray_preprocessing", False),
+            cache_dir=getattr(settings, "input_cache_dir", "") or None,
+            cache_max_items=getattr(settings, "input_cache_max_items", 2048),
+            preload_images=False,
         )
     return datasets
 

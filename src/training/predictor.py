@@ -7,13 +7,16 @@ counterfactual constraint used by Stage 4.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
+import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +35,7 @@ from utils import (
     open_file, seed_all, sync_file, tree_copy,
 )
 
-from .common import epoch_batches, stage_run_dir
+from .common import epoch_batches, stage_run_dir, to_jax_batch
 
 
 @dataclass
@@ -84,6 +87,12 @@ class PredictorRunArguments:
     label_smoothing: float = 0.0
     torchxray_preprocessing: bool = False
     dropout_rate: float = 0.0
+    normalization_sample_size: int = 0
+    input_cache: str = "auto"
+    input_cache_dir: str = ""
+    input_cache_max_items: int = 2048
+    input_prefetch_workers: int = 8
+    input_prefetch_batches: int = 2
     augment: bool = True
     type: str = "train-predictor"
     save_dir: str = ""
@@ -98,6 +107,7 @@ class _IndexedDataset:
         self.indices = np.asarray(indices, dtype=np.int64)
         self.min_max = getattr(dataset, "min_max", {})
         self.samples = getattr(dataset, "samples", {})
+        self.cache_fingerprint = f"{getattr(dataset, 'cache_fingerprint', type(dataset).__name__)}-indexed-{_hash_array(self.indices)}"
 
     def __len__(self) -> int:
         return int(self.indices.shape[0])
@@ -107,6 +117,113 @@ class _IndexedDataset:
 
     def make_batch(self, indices: Any, rng=None, shuffle: bool = False):
         return self.dataset.make_batch(self.indices[np.asarray(indices, dtype=np.int64)], rng=rng, shuffle=shuffle)
+
+
+def _hash_array(values: np.ndarray) -> str:
+    digest = hashlib.sha256(np.asarray(values, dtype=np.int64).tobytes()).hexdigest()
+    return digest[:16]
+
+
+class _CachedItemDataset:
+    """Bounded item-level cache/prefetch adapter for image-backed datasets.
+
+    The adapter is intentionally opt-in/auto-selected for known remote image
+    datasets. It preserves the generic ``__getitem__`` contract and never embeds
+    source paths or credentials in cache filenames.
+    """
+
+    def __init__(
+        self,
+        dataset: Any,
+        *,
+        cache_dir: str,
+        max_items: int,
+        workers: int,
+        name: str,
+    ):
+        self.dataset = dataset
+        self.min_max = getattr(dataset, "min_max", {})
+        self.samples = getattr(dataset, "samples", {})
+        self.workers = max(1, int(workers))
+        self.max_items = max(0, int(max_items))
+        self.cache_dir = Path(cache_dir).expanduser() if cache_dir and self.max_items else None
+        self.name = name
+        fingerprint = getattr(dataset, "cache_fingerprint", None) or getattr(dataset, "fingerprint", None)
+        if callable(fingerprint):
+            fingerprint = fingerprint()
+        self.fingerprint = hashlib.sha256(f"{name}|{fingerprint or type(dataset).__name__}|{len(dataset)}".encode()).hexdigest()[:16]
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        return self._get_item(int(index))
+
+    def _cache_path(self, index: int) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / self.fingerprint / f"{index:012d}.npz"
+
+    def _load_cached(self, path: Path) -> Dict[str, np.ndarray] | None:
+        try:
+            if not path.is_file():
+                return None
+            with np.load(path, allow_pickle=False) as data:
+                sample = {key: np.asarray(data[key]) for key in data.files}
+            os.utime(path, None)
+            return sample
+        except Exception:
+            return None
+
+    def _save_cached(self, path: Path, sample: Dict[str, np.ndarray]) -> None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=str(path.parent))
+            os.close(fd)
+            try:
+                with open(tmp, "wb") as handle:
+                    np.savez_compressed(handle, **{key: np.asarray(value) for key, value in sample.items()})
+                os.replace(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            self._evict_if_needed(path.parent)
+        except Exception:
+            return
+
+    def _evict_if_needed(self, directory: Path) -> None:
+        if self.max_items <= 0:
+            return
+        files = sorted(directory.glob("*.npz"), key=lambda p: p.stat().st_mtime)
+        overflow = len(files) - self.max_items
+        for victim in files[:max(0, overflow)]:
+            try:
+                victim.unlink()
+            except OSError:
+                pass
+
+    def _get_item(self, index: int) -> Dict[str, np.ndarray]:
+        path = self._cache_path(index)
+        if path is not None:
+            cached = self._load_cached(path)
+            if cached is not None:
+                return cached
+        sample = {key: np.asarray(value) for key, value in self.dataset[index].items()}
+        if path is not None:
+            self._save_cached(path, sample)
+        return sample
+
+    def make_batch(self, indices: Any, rng=None, shuffle: bool = False):
+        del rng, shuffle
+        batch_indices = np.asarray(indices, dtype=np.int64)
+        if self.workers > 1 and batch_indices.size > 1:
+            with ThreadPoolExecutor(max_workers=min(self.workers, int(batch_indices.size))) as executor:
+                samples = list(executor.map(lambda i: self._get_item(int(i)), batch_indices))
+        else:
+            samples = [self._get_item(int(i)) for i in batch_indices]
+        return {key: np.stack([np.asarray(sample[key]) for sample in samples], axis=0) for key in samples[0]}
 
 
 @dataclass
@@ -179,6 +296,12 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         label_smoothing=getattr(workflow, "label_smoothing", 0.0),
         torchxray_preprocessing=getattr(workflow, "torchxray_preprocessing", False),
         dropout_rate=getattr(workflow, "dropout_rate", 0.0),
+        normalization_sample_size=getattr(workflow, "normalization_sample_size", 0),
+        input_cache=getattr(workflow, "input_cache", "auto"),
+        input_cache_dir=getattr(workflow, "input_cache_dir", ""),
+        input_cache_max_items=getattr(workflow, "input_cache_max_items", 2048),
+        input_prefetch_workers=getattr(workflow, "input_prefetch_workers", 8),
+        input_prefetch_batches=getattr(workflow, "input_prefetch_batches", 2),
         augment=augment,
         type=workflow.type,
         predictor_model=workflow.predictor_model,
@@ -782,6 +905,107 @@ def _build_predictor_model(args: PredictorRunArguments, dtype: jnp.dtype, logger
 
 
 
+def _default_input_cache_dir(args: Any) -> str:
+    return os.path.join(tempfile.gettempdir(), "causal-genx-input-cache", str(getattr(args, "dataset", "dataset")))
+
+
+def _input_cache_enabled(args: Any) -> bool:
+    mode = str(getattr(args, "input_cache", "auto"))
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return str(getattr(args, "dataset", "")) == "padchest"
+
+
+def _prepare_input_pipeline(logger: logging.Logger, datasets: Dict[str, Any], train_dataset: Any, args: Any):
+    """Apply bounded, configurable adapters for image-backed predictor input."""
+    workers = max(1, int(getattr(args, "input_prefetch_workers", 1)))
+    max_items = max(0, int(getattr(args, "input_cache_max_items", 0)))
+    cache_dir = str(getattr(args, "input_cache_dir", "") or _default_input_cache_dir(args))
+    if _input_cache_enabled(args) and max_items > 0:
+        train_dataset = _CachedItemDataset(train_dataset, cache_dir=cache_dir, max_items=max_items, workers=workers, name="train")
+        for split in ("valid", "test"):
+            if split in datasets:
+                datasets[split] = _CachedItemDataset(datasets[split], cache_dir=cache_dir, max_items=max_items, workers=workers, name=split)
+        logger.info(
+            "input_pipeline cache=on cache_dir=%s max_items_per_split=%d workers=%d prefetch_batches=%d",
+            cache_dir, max_items, workers, int(getattr(args, "input_prefetch_batches", 0)),
+        )
+    else:
+        logger.info(
+            "input_pipeline cache=off workers=%d prefetch_batches=%d",
+            workers, int(getattr(args, "input_prefetch_batches", 0)),
+        )
+    return datasets, train_dataset
+
+
+def _batch_indices_for_epoch(dataset: Any, batch_size: int, *, shuffle: bool, drop_last: bool, rng: np.random.Generator) -> list[np.ndarray]:
+    indices = np.arange(len(dataset), dtype=np.int64)
+    if shuffle:
+        rng.shuffle(indices)
+    batches = []
+    for start in range(0, len(indices), batch_size):
+        batch_indices = indices[start : start + batch_size]
+        if drop_last and batch_indices.size < batch_size:
+            continue
+        batches.append(batch_indices)
+    return batches
+
+
+def _load_predictor_batch(dataset: Any, batch_indices: np.ndarray, *, rng: np.random.Generator, shuffle: bool) -> Dict[str, Any]:
+    if hasattr(dataset, "make_batch"):
+        return dataset.make_batch(batch_indices, rng=rng, shuffle=shuffle)
+    return {
+        key: np.stack([np.asarray(dataset[int(index)][key]) for index in batch_indices])
+        for key in dataset[0]
+    }
+
+
+def _predictor_epoch_batches(
+    dataset: Any,
+    batch_size: int,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    rng: np.random.Generator,
+    prefetch_batches: int = 0,
+) -> Iterator[Dict[str, jax.Array]]:
+    """Yield deterministic batches with optional bounded background prefetch."""
+    prefetch = max(0, int(prefetch_batches))
+    if prefetch <= 0:
+        yield from epoch_batches(dataset, batch_size, shuffle=shuffle, drop_last=drop_last, rng=rng)
+        return
+    batches = _batch_indices_for_epoch(dataset, batch_size, shuffle=shuffle, drop_last=drop_last, rng=rng)
+
+    def submit(executor: ThreadPoolExecutor, batch_indices: np.ndarray) -> Future:
+        # Derive seeds sequentially before the asynchronous load to keep sampling deterministic.
+        seed = int(rng.integers(0, np.iinfo(np.uint32).max))
+        return executor.submit(
+            _load_predictor_batch,
+            dataset,
+            batch_indices,
+            rng=np.random.default_rng(seed),
+            shuffle=shuffle,
+        )
+
+    with ThreadPoolExecutor(max_workers=prefetch) as executor:
+        in_flight: list[Future] = []
+        iterator = iter(batches)
+        for _ in range(prefetch):
+            try:
+                in_flight.append(submit(executor, next(iterator)))
+            except StopIteration:
+                break
+        while in_flight:
+            future = in_flight.pop(0)
+            try:
+                in_flight.append(submit(executor, next(iterator)))
+            except StopIteration:
+                pass
+            yield to_jax_batch(future.result())
+
+
 def _log_input_normalization(
     logger: logging.Logger,
     dataset: Any,
@@ -794,16 +1018,20 @@ def _log_input_normalization(
         args.dataset, getattr(args, "context_norm", "N/A"), args.input_res, args.pad,
     )
 
-    try:
-        sample_batch = train_dataset.make_batch(np.arange(min(len(train_dataset), 8)))
-        if "x" in sample_batch:
-            x = sample_batch["x"]
-            logger.info(
-                "  Image 'x': shape=%s, min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
-                tuple(x.shape[1:]), float(np.min(x)), float(np.max(x)), float(np.mean(x)), float(np.std(x)),
-            )
-    except Exception as err:
-        logger.warning("  Image 'x': could not compute sample stats (%s)", err)
+    sample_size = max(0, int(getattr(args, "normalization_sample_size", 0)))
+    if sample_size:
+        try:
+            sample_batch = train_dataset.make_batch(np.arange(min(len(train_dataset), sample_size)))
+            if "x" in sample_batch:
+                x = sample_batch["x"]
+                logger.info(
+                    "  Image 'x': shape=%s, min=%.4f, max=%.4f, mean=%.4f, std=%.4f",
+                    tuple(x.shape[1:]), float(np.min(x)), float(np.max(x)), float(np.mean(x)), float(np.std(x)),
+                )
+        except Exception as err:
+            logger.warning("  Image 'x': could not compute bounded sample stats (%s)", err)
+    else:
+        logger.info("  Image 'x': sample stats skipped (normalization_sample_size=0)")
 
     min_max = getattr(dataset, "min_max", {})
     samples = getattr(dataset, "samples", {})
@@ -848,7 +1076,9 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     args.checkpoint_dir = checkpoint_root_dir(args.save_dir); args.remote_save_dir = experiment_run_dir(args.remote_ckpt_dir, args.dataset, args.exp_name, "pgm")
 
     ensure_dir(args.save_dir); ensure_dir(args.checkpoint_dir)
-    logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets, train_dataset = _build_datasets(args); valid_dataset = datasets["valid"]
+    logger = _setup_logging(args); writer = SummaryWriter(args.save_dir); datasets, train_dataset = _build_datasets(args)
+    datasets, train_dataset = _prepare_input_pipeline(logger, datasets, train_dataset, args)
+    valid_dataset = datasets["valid"]
     _log_input_normalization(logger, datasets["train"], train_dataset, args)
     model = _build_predictor_model(args, dtype, logger)
 
@@ -919,8 +1149,16 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             epoch_t0 = epoch_step_t0 = speed_window_t0 = time.perf_counter()
             speed_window_step = 0
             speed_window_samples = 0
+            prefetch_batches = int(getattr(args, "input_prefetch_batches", 0)) if _input_cache_enabled(args) else 0
             for batch_index, batch in enumerate(
-                epoch_batches(train_dataset, args.bs, shuffle=True, drop_last=drop_remainder, rng=rng), start=1
+                _predictor_epoch_batches(
+                    train_dataset,
+                    args.bs,
+                    shuffle=True,
+                    drop_last=drop_remainder,
+                    rng=rng,
+                    prefetch_batches=prefetch_batches,
+                ), start=1
             ):
                 if use_tpu_pmap:
                     batch = _shard_batch(batch, devices)

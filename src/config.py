@@ -99,7 +99,14 @@ class PredictorTrainingConfig(BaseModel):
     label_smoothing: float = 0.0
     torchxray_preprocessing: bool = False
     dropout_rate: float = 0.0
-
+    # Predictor input pipeline controls for remote image datasets. Defaults keep
+    # startup diagnostics image-free and enable only bounded, opt-in/auto caches.
+    normalization_sample_size: int = 0
+    input_cache: Literal["auto", "off", "on"] = "auto"
+    input_cache_dir: str = ""
+    input_cache_max_items: int = 2048
+    input_prefetch_workers: int = 8
+    input_prefetch_batches: int = 2
 
 
 class ImageModelTrainingConfig(BaseModel):
