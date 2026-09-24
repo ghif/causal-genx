@@ -100,6 +100,7 @@ class PredictorRunArguments:
     input_stage_max_bytes: int = 0
     input_stage_size_sample_items: int = 256
     input_stage_workers: int = 16
+    excluded_sources: list[dict[str, str]] | None = None
     augment: bool = True
     type: str = "train-predictor"
     save_dir: str = ""
@@ -317,6 +318,7 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         input_stage_max_bytes=getattr(workflow, "input_stage_max_bytes", 0),
         input_stage_size_sample_items=getattr(workflow, "input_stage_size_sample_items", 256),
         input_stage_workers=getattr(workflow, "input_stage_workers", 16),
+        excluded_sources=list(getattr(config.dataset, "excluded_sources", []) or []),
         augment=augment,
         type=workflow.type,
         predictor_model=workflow.predictor_model,

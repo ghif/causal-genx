@@ -51,6 +51,23 @@ _PROJECTIONS = PROJECTIONS
 _VIEWS = VIEW_POSITIONS
 
 
+def _configured_exclusions(excluded_sources: Sequence[Mapping[str, str] | str] | None) -> dict[str, str]:
+    """Return an exact source URI/path -> reason map for PadChest-only exclusions."""
+    exclusions: dict[str, str] = {}
+    for entry in excluded_sources or []:
+        if isinstance(entry, str):
+            source, reason = entry, "configured PadChest source exclusion"
+        else:
+            source = str(entry.get("source", ""))
+            reason = str(entry.get("reason", "configured PadChest source exclusion"))
+        if not source:
+            raise ValueError("PadChest excluded_sources entries must include a non-empty source")
+        previous = exclusions.setdefault(source, reason)
+        if previous != reason:
+            raise ValueError(f"PadChest source exclusion {source!r} was configured with multiple reasons")
+    return exclusions
+
+
 @contextmanager
 def _open_binary(path: str) -> Iterator[BinaryIO]:
     if not path.startswith("gs://"):
@@ -364,17 +381,34 @@ class PadChestDataset:
         stage_dir: str = "",
         stage_manifest: str = "",
         stage_mode: str = "auto",
+        excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
     ):
         rows = _read_rows(metadata)
-        groups: dict[str, list[dict[str, str]]] = {}
-        for row in rows:
-            groups.setdefault(row.get("PatientID", row.get("ImageID", "")), []).append(row)
+        groups: dict[str, list[tuple[int, dict[str, str]]]] = {}
+        for row_index, row in enumerate(rows):
+            groups.setdefault(row.get("PatientID", row.get("ImageID", "")), []).append((row_index, row))
         selected = _split_patients(tuple(groups), seed)[split]
-        self.rows = [row for patient in selected for row in groups[patient] if row.get("ImageID")]
+        selected_rows = [(row_index, row) for patient in selected for row_index, row in groups[patient] if row.get("ImageID")]
         self.root, self.image_prefix, self.input_res, self.tb_label_mode = root, image_prefix, input_res, tb_label_mode
         self.stage_dir = stage_dir
         self.stage_manifest = stage_manifest or (_default_stage_manifest(stage_dir) if stage_dir else "")
         self.stage_mode = stage_mode
+        exclusions = _configured_exclusions(excluded_sources)
+        self.excluded_records: list[dict[str, Any]] = []
+        self.rows: list[dict[str, str]] = []
+        for row_index, row in selected_rows:
+            source = self._source_image_path(row)
+            if source in exclusions:
+                self.excluded_records.append({
+                    "kind": "excluded",
+                    "image_id": row["ImageID"],
+                    "source": source,
+                    "reason": exclusions[source],
+                    "split": split,
+                    "row_index": row_index,
+                })
+                continue
+            self.rows.append(row)
         expected_sources = {row["ImageID"]: self._source_image_path(row) for row in self.rows}
         self._staged_images = _load_stage_manifest(self.stage_manifest, stage_dir, expected_sources) if stage_dir and stage_mode != "off" else {}
         if stage_mode == "require":
@@ -397,7 +431,7 @@ class PadChestDataset:
         }
         self.min_max = {"age_at_study": (AGE_AT_STUDY_MIN, AGE_AT_STUDY_MAX), "study_year": (STUDY_YEAR_MIN, STUDY_YEAR_MAX)}
         self.cache_fingerprint = hashlib.sha256(
-            f"padchest|{root}|{metadata}|{image_prefix}|{split}|{input_res}|{tb_label_mode}|{seed}".encode()
+            f"padchest|{root}|{metadata}|{image_prefix}|{split}|{input_res}|{tb_label_mode}|{seed}|{json.dumps(exclusions, sort_keys=True)}".encode()
         ).hexdigest()[:16]
 
     def __len__(self):
@@ -457,12 +491,14 @@ class PadChestProvider:
         stage_dir: str = "",
         stage_manifest: str = "",
         stage_mode: str = "auto",
+        excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
     ):
         self.root, self.input_res, self.pad, self.context_norm = root, input_res, pad, context_norm
         self.metadata = metadata or f"{root.rstrip('/')}/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv"
         self.image_prefix = image_prefix or f"{root.rstrip('/')}/images-224"
         self.tb_label_mode, self.seed = tb_label_mode, seed
         self.stage_dir, self.stage_manifest, self.stage_mode = stage_dir, stage_manifest, stage_mode
+        self.excluded_sources = excluded_sources or []
 
     @property
     def spec(self) -> DatasetSpec:
@@ -480,6 +516,7 @@ class PadChestProvider:
             stage_dir=self.stage_dir,
             stage_manifest=self.stage_manifest,
             stage_mode=self.stage_mode,
+            excluded_sources=self.excluded_sources,
         )
 
     def make_batch(self, split: str, indices: Sequence[int], *, rng=None, training: bool = False) -> Batch:
@@ -487,7 +524,8 @@ class PadChestProvider:
         return Batch(raw.pop("x"), raw)
 
     def fingerprint(self) -> str:
-        value = f"{self.root}|{self.metadata}|{self.image_prefix}|{self.input_res}|{self.tb_label_mode}|{self.schema.version}"
+        exclusions = _configured_exclusions(self.excluded_sources)
+        value = f"{self.root}|{self.metadata}|{self.image_prefix}|{self.input_res}|{self.tb_label_mode}|{self.schema.version}|{json.dumps(exclusions, sort_keys=True)}"
         return hashlib.sha256(value.encode()).hexdigest()[:16]
 
 
@@ -523,12 +561,17 @@ def stage_padchest_images(
         getattr(settings, "tb_label_mode", "tb_or_sequelae"),
         settings.seed,
         stage_mode="off",
+        excluded_sources=getattr(settings, "excluded_sources", None) or getattr(settings, "input_stage_exclusions", None) or [],
     )
     unique: dict[str, dict[str, Any]] = {}
     split_counts: dict[str, int] = {}
+    excluded_split_counts: dict[str, int] = {}
+    excluded_records: list[dict[str, Any]] = []
     for split in splits:
         dataset = provider.load_split(split)
         split_counts[split] = len(dataset)
+        excluded_split_counts[split] = len(dataset.excluded_records)
+        excluded_records.extend(dataset.excluded_records)
         for record in dataset.image_records():
             source = record["source"]
             if source not in unique:
@@ -554,6 +597,21 @@ def stage_padchest_images(
         )
 
     existing_map = _load_stage_manifest(stage_manifest, stage_dir)
+    if execute and not all_gcs_sources:
+        missing_sources = []
+        for record in records:
+            source = str(record["source"])
+            staged = existing_map.get(str(record["image_id"]))
+            destination = Path(stage_dir) / str(record["relative_path"])
+            if source.startswith("gs://") or Path(source).is_file() or destination.is_file() or (staged and Path(staged).is_file()):
+                continue
+            missing_sources.append(source)
+        if missing_sources:
+            preview = "; ".join(missing_sources[:5])
+            raise RuntimeError(
+                "Unexpected missing PadChest source object: "
+                f"missing={len(missing_sources)} examples={preview}"
+            )
     total_bytes = 0
     unknown_sizes = 0
     size_basis = "per_item"
@@ -619,7 +677,10 @@ def stage_padchest_images(
         "stage_manifest": stage_manifest,
         "splits": list(splits),
         "split_rows": split_counts,
+        "excluded_split_rows": excluded_split_counts,
         "required_items": len(records),
+        "excluded_items": len(excluded_records),
+        "excluded": excluded_records,
         "estimated_bytes": total_bytes,
         "unknown_sizes": unknown_sizes,
         "size_basis": size_basis,
@@ -655,6 +716,11 @@ def stage_padchest_images(
                 "created_at": int(time.time()),
                 "metadata": provider.metadata,
                 "image_prefix": provider.image_prefix,
+                "splits": list(splits),
+                "split_rows": split_counts,
+                "excluded_split_rows": excluded_split_counts,
+                "excluded_items": len(excluded_records),
+                "required_items": len(records),
                 "max_items": max_items,
                 "max_bytes": max_bytes,
             }, sort_keys=True) + "\n")
@@ -690,6 +756,8 @@ def stage_padchest_images(
                 copied_records.append(record)
     elapsed_seconds = max(time.monotonic() - started_at, 0.0)
     with manifest_path.open("a", encoding="utf-8") as handle:
+        for record in excluded_records:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
         for record in copied_records:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
     staged_bytes = sum(int(record.get("bytes") or 0) for record in copied_records)
@@ -700,11 +768,12 @@ def stage_padchest_images(
     return summary
 
 
-def _stage_settings(settings: Any) -> dict[str, str]:
+def _stage_settings(settings: Any) -> dict[str, Any]:
     return {
         "stage_dir": str(getattr(settings, "input_stage_dir", "") or ""),
         "stage_manifest": str(getattr(settings, "input_stage_manifest", "") or ""),
         "stage_mode": str(getattr(settings, "input_stage_mode", "auto") or "auto"),
+        "excluded_sources": getattr(settings, "excluded_sources", None) or getattr(settings, "input_stage_exclusions", None) or [],
     }
 
 

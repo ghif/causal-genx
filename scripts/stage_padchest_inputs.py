@@ -50,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  stage_dir:       {summary['stage_dir']}")
     print(f"  manifest:        {summary['stage_manifest']}")
     print(f"  splits:          {','.join(summary['splits'])} rows={summary['split_rows']}")
+    print(f"  excluded:        {summary.get('excluded_items', 0)} rows={summary.get('excluded_split_rows', {})}")
     print(f"  required_items:  {summary['required_items']} (max {summary['max_items'] or 'unbounded'})")
     print(f"  estimated_bytes: {summary['estimated_bytes']} (max {summary['max_bytes'] or 'unbounded'}, unknown {summary['unknown_sizes']}, basis {summary.get('size_basis', 'n/a')})")
     print(f"  transfer:        {summary.get('transfer_method', 'python-copy')}")

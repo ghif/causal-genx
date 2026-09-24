@@ -19,6 +19,7 @@ class DatasetConfig(BaseModel):
     split_manifest: str = ""
     tb_label_mode: Literal["any_tb", "tb_only", "tb_or_sequelae"] = "tb_or_sequelae"
     min_category_count: PositiveInt = 1
+    excluded_sources: list[dict[str, str]] = Field(default_factory=list)
     input_res: PositiveInt = 32
     pad: int = 4
     hflip: float = 0.5
