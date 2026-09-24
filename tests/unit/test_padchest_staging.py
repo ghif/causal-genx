@@ -1,11 +1,15 @@
 import csv
+import importlib
 import logging
 import shutil
+import subprocess
+from pathlib import PurePosixPath
 from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
 
+padchest_module = importlib.import_module("data.padchest")
 from data.padchest import PadChestDataset, stage_padchest_images
 from training.predictor import _CachedItemDataset, _prepare_input_pipeline
 
@@ -49,6 +53,7 @@ def _write_pngs(image_dir, count=10):
 
 
 def _settings(tmp_path, *, max_items=100, max_bytes=1_000_000):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     metadata = tmp_path / "padchest.csv"
     images = tmp_path / "source-images"
     _write_metadata(metadata)
@@ -103,6 +108,91 @@ def test_padchest_stage_policy_refuses_over_item_budget(tmp_path):
 
     assert summary["required_items"] > 1
     assert "input_stage_max_items" in summary["refusal"]
+
+
+def test_padchest_stage_policy_refuses_unbounded_budgets(tmp_path):
+    settings = _settings(tmp_path, max_items=0, max_bytes=1_000_000)
+    summary = stage_padchest_images(settings, splits=("train",), execute=False)
+    assert "input_stage_max_items" in summary["refusal"]
+
+    settings = _settings(tmp_path / "bytes", max_items=100, max_bytes=0)
+    summary = stage_padchest_images(settings, splits=("train",), execute=False)
+    assert "input_stage_max_bytes" in summary["refusal"]
+
+
+def test_padchest_gcloud_bulk_refuses_colliding_basenames():
+    records = [
+        {"image_id": "dir-a/case.png", "source": "gs://bucket/dir-a/case.png"},
+        {"image_id": "dir-b/case.png", "source": "gs://bucket/dir-b/case.png"},
+    ]
+    for record in records:
+        record["relative_path"] = padchest_module._bulk_stage_relative(record["source"], record["image_id"])
+
+    refusal = padchest_module._validate_bulk_destinations(records)
+
+    assert "multiple sources" in refusal
+    assert "gcloud-bulk" in refusal
+
+
+def test_padchest_gcloud_execute_reports_missing_cli(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    settings.image_prefix = "gs://example-bucket/padchest/images-224"
+    monkeypatch.setattr(padchest_module, "_source_size", lambda _source: 100)
+    monkeypatch.setattr(padchest_module.shutil, "which", lambda _name: None)
+
+    try:
+        stage_padchest_images(settings, splits=("train",), execute=True)
+    except RuntimeError as err:
+        assert "Google Cloud CLI" in str(err)
+        assert "falling back" in str(err)
+    else:
+        raise AssertionError("missing gcloud CLI should be reported before slow fallback")
+
+
+def test_padchest_gcloud_bulk_stage_writes_manifest_mapping(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    local_images = settings.image_prefix
+    settings.image_prefix = "gs://example-bucket/padchest/images-224"
+    monkeypatch.setattr(padchest_module, "_source_size", lambda _source: 100)
+    monkeypatch.setattr(padchest_module, "_require_gcloud_storage", lambda: "/fake/gcloud")
+
+    calls = []
+
+    def fake_run(command, *, input, stdout, stderr, text, env, check):
+        calls.append((command, input, env))
+        assert command[:4] == ["/fake/gcloud", "--quiet", "storage", "cp"]
+        assert "--read-paths-from-stdin" in command
+        destination = command[-1]
+        for source in input.strip().splitlines():
+            name = PurePosixPath(source).name
+            shutil.copyfile(str(PurePosixPath(local_images) / name), str(PurePosixPath(destination) / name))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(padchest_module.subprocess, "run", fake_run)
+
+    summary = stage_padchest_images(settings, splits=("train",), execute=True)
+
+    assert summary["transfer_method"] == "gcloud-storage-cp"
+    assert summary["copied"] == summary["required_items"]
+    assert calls and "gs://example-bucket/padchest/images-224/" in calls[0][1]
+
+    dataset = PadChestDataset(
+        root=settings.data_dir,
+        metadata=settings.metadata,
+        image_prefix=settings.image_prefix,
+        split="train",
+        input_res=8,
+        tb_label_mode="tb_or_sequelae",
+        seed=7,
+        stage_dir=settings.input_stage_dir,
+        stage_manifest=settings.input_stage_manifest,
+        stage_mode="require",
+    )
+    assert dataset.make_batch([0])["x"].shape == (1, 1, 8, 8)
+
+    item_lines = [line for line in (tmp_path / "stage" / "manifest.jsonl").read_text().splitlines() if '"kind": "item"' in line]
+    assert item_lines
+    assert all('"relative_path": "gcloud-bulk/' in line for line in item_lines)
 
 
 def test_padchest_require_refuses_missing_manifest(tmp_path):

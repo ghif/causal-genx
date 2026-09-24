@@ -3,7 +3,7 @@ seed: 7
 dataset:
   name: padchest
   root: gs://external-cxr-dataset/padchest/unpacked/images-224
-  metadata: gs://external-cxr-dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv
+  metadata: /mnt/data/dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv
   image_prefix: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224
   input_res: 128
   pad: 0

@@ -15,7 +15,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterator, Mapping, Sequence
 
 import numpy as np
@@ -83,6 +83,118 @@ def _safe_stage_relative(source: str, image_id: str) -> str:
     suffix = Path(image_id).suffix or Path(source).suffix or ".png"
     digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
     return str(Path("images") / digest[:2] / f"{digest}{suffix}")
+
+
+def _bulk_stage_relative(source: str, image_id: str) -> str:
+    """Deterministic basename path used by gcloud's multi-object directory copy."""
+    name = PurePosixPath(str(image_id)).name or PurePosixPath(source.split("gs://", 1)[-1]).name
+    if not name or name in {".", ".."}:
+        name = hashlib.sha256(source.encode("utf-8")).hexdigest() + ".png"
+    return str(Path("gcloud-bulk") / name)
+
+
+def _require_gcloud_storage() -> str:
+    gcloud = shutil.which("gcloud")
+    if not gcloud:
+        raise RuntimeError(
+            "PadChest GCS bulk staging requires the Google Cloud CLI (`gcloud`) with `gcloud storage cp`; "
+            "install/authenticate gcloud and rerun instead of falling back to per-object downloads."
+        )
+    return gcloud
+
+
+def _validate_bulk_destinations(records: Sequence[Mapping[str, Any]]) -> str:
+    seen_paths: dict[str, str] = {}
+    seen_images: dict[str, str] = {}
+    for record in records:
+        image_id = str(record["image_id"])
+        relative_path = str(record["relative_path"])
+        source = str(record["source"])
+        previous_path_source = seen_paths.setdefault(relative_path, source)
+        if previous_path_source != source:
+            return (
+                "gcloud bulk staging would map multiple sources to "
+                f"{relative_path!r}; choose a non-colliding staging layout before executing"
+            )
+        previous_image_source = seen_images.setdefault(image_id, source)
+        if previous_image_source != source:
+            return (
+                "PadChest staging would map ImageID "
+                f"{image_id!r} to multiple sources; refusing ambiguous manifest"
+            )
+    return ""
+
+
+def _run_gcloud_bulk_copy(records: Sequence[dict[str, Any]], stage_root: Path, workers: int) -> tuple[list[dict[str, Any]], int, int]:
+    """Copy GCS records with one parallel gcloud invocation and verify deterministic outputs."""
+    gcloud = _require_gcloud_storage()
+    bulk_root = stage_root / "gcloud-bulk"
+    bulk_root.mkdir(parents=True, exist_ok=True)
+    to_copy: list[dict[str, Any]] = []
+    copied_records: list[dict[str, Any]] = []
+    reused = 0
+    for record in records:
+        destination = stage_root / str(record["relative_path"])
+        if destination.is_file():
+            record["bytes"] = destination.stat().st_size
+            reused += 1
+        else:
+            to_copy.append(record)
+        copied_records.append(record)
+
+    if to_copy:
+        shard_count = max(1, min(8, workers, len(to_copy)))
+        thread_count = max(1, workers // shard_count)
+        command = [
+            gcloud,
+            "--quiet",
+            "storage",
+            "cp",
+            "--read-paths-from-stdin",
+            "--continue-on-error",
+            str(bulk_root),
+        ]
+
+        def run_shard(shard: Sequence[dict[str, Any]]) -> subprocess.CompletedProcess[str]:
+            env = os.environ.copy()
+            env["CLOUDSDK_STORAGE_PARALLEL_THREAD_COUNT"] = str(thread_count)
+            return subprocess.run(
+                command,
+                input="\n".join(str(record["source"]) for record in shard) + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                check=False,
+            )
+
+        shards = [to_copy[index::shard_count] for index in range(shard_count)]
+        with ThreadPoolExecutor(max_workers=shard_count) as executor:
+            completed_shards = list(executor.map(run_shard, shards))
+        failures = [completed for completed in completed_shards if completed.returncode != 0]
+        if failures:
+            failure = failures[0]
+            stderr = (failure.stderr or failure.stdout or "").strip().splitlines()[-8:]
+            raise RuntimeError(
+                "gcloud storage cp failed during PadChest bulk staging; source objects may be missing/inaccessible "
+                "or Google Cloud CLI authentication may need configuration. "
+                f"command={' '.join(command)!r} exit={failure.returncode} output={' | '.join(stderr)}"
+            )
+
+    missing: list[str] = []
+    for record in to_copy:
+        destination = stage_root / str(record["relative_path"])
+        if not destination.is_file():
+            missing.append(f"{record['source']} -> {destination}")
+        else:
+            record["bytes"] = destination.stat().st_size
+    if missing:
+        preview = "; ".join(missing[:5])
+        raise RuntimeError(
+            "gcloud storage cp completed but PadChest bulk staging could not verify all expected files: "
+            f"missing={len(missing)} examples={preview}"
+        )
+    return copied_records, len(to_copy), reused
 
 
 def _load_stage_manifest(manifest: str, stage_dir: str, expected_sources: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -424,12 +536,22 @@ def stage_padchest_images(
                     "kind": "item",
                     "image_id": record["image_id"],
                     "source": source,
-                    "relative_path": _safe_stage_relative(source, record["image_id"]),
                     "split": split,
                 }
     records = list(unique.values())
     if limit > 0:
         records = records[:limit]
+
+    gcs_sources = [record for record in records if str(record["source"]).startswith("gs://")]
+    all_gcs_sources = bool(records) and len(gcs_sources) == len(records)
+    transfer_method = "gcloud-storage-cp" if all_gcs_sources else "python-copy"
+    for record in records:
+        source = str(record["source"])
+        record["relative_path"] = (
+            _bulk_stage_relative(source, str(record["image_id"]))
+            if all_gcs_sources
+            else _safe_stage_relative(source, str(record["image_id"]))
+        )
 
     existing_map = _load_stage_manifest(stage_manifest, stage_dir)
     total_bytes = 0
@@ -473,12 +595,24 @@ def stage_padchest_images(
             total_bytes = sum(known_sizes)
 
     refusal = ""
-    if max_items > 0 and len(records) > max_items:
+    if max_items <= 0:
+        refusal = "workflow.input_stage_max_items must be set to a positive bounded value"
+    elif max_bytes <= 0:
+        refusal = "workflow.input_stage_max_bytes must be set to a positive bounded value"
+    elif gcs_sources and not all_gcs_sources:
+        refusal = "PadChest staging refuses mixed local and gs:// image sources"
+    elif all_gcs_sources:
+        refusal = _validate_bulk_destinations(records)
+    if not refusal and max_items > 0 and len(records) > max_items:
         refusal = f"required_items={len(records)} exceeds input_stage_max_items={max_items}"
-    elif max_bytes > 0 and unknown_sizes:
+    elif not refusal and max_bytes > 0 and unknown_sizes:
         refusal = f"cannot enforce input_stage_max_bytes={max_bytes} with {unknown_sizes} unknown object sizes"
-    elif max_bytes > 0 and total_bytes > max_bytes:
+    elif not refusal and max_bytes > 0 and total_bytes > max_bytes:
         refusal = f"estimated_bytes={total_bytes} exceeds input_stage_max_bytes={max_bytes}"
+
+    transfer_prerequisite = ""
+    if all_gcs_sources:
+        transfer_prerequisite = "Google Cloud CLI with authenticated `gcloud storage cp --read-paths-from-stdin`"
 
     summary = {
         "stage_dir": stage_dir,
@@ -492,10 +626,15 @@ def stage_padchest_images(
         "max_items": max_items,
         "max_bytes": max_bytes,
         "size_sample_items": size_sample_items,
+        "transfer_method": transfer_method,
+        "transfer_prerequisite": transfer_prerequisite,
         "execute": execute,
         "refusal": refusal,
         "copied": 0,
         "reused": 0,
+        "elapsed_seconds": 0.0,
+        "items_per_second": 0.0,
+        "bytes_per_second": 0.0,
     }
     if refusal:
         if execute:
@@ -538,15 +677,26 @@ def stage_padchest_images(
         record["bytes"] = destination.stat().st_size
         return record, True
 
-    copied_records: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(workers, max(1, len(records)))) as executor:
-        for record, copied in executor.map(copy_one, records):
-            summary["copied" if copied else "reused"] += 1
-            copied_records.append(record)
+    started_at = time.monotonic()
+    if all_gcs_sources:
+        copied_records, copied, reused = _run_gcloud_bulk_copy(records, stage_root, workers)
+        summary["copied"] = copied
+        summary["reused"] = reused
+    else:
+        copied_records = []
+        with ThreadPoolExecutor(max_workers=min(workers, max(1, len(records)))) as executor:
+            for record, copied in executor.map(copy_one, records):
+                summary["copied" if copied else "reused"] += 1
+                copied_records.append(record)
+    elapsed_seconds = max(time.monotonic() - started_at, 0.0)
     with manifest_path.open("a", encoding="utf-8") as handle:
         for record in copied_records:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
-    summary["estimated_bytes"] = sum(int(record.get("bytes") or 0) for record in copied_records)
+    staged_bytes = sum(int(record.get("bytes") or 0) for record in copied_records)
+    summary["estimated_bytes"] = staged_bytes
+    summary["elapsed_seconds"] = elapsed_seconds
+    summary["items_per_second"] = (summary["copied"] / elapsed_seconds) if elapsed_seconds > 0 else 0.0
+    summary["bytes_per_second"] = (staged_bytes / elapsed_seconds) if elapsed_seconds > 0 else 0.0
     return summary
 
 

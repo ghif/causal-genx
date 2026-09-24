@@ -52,6 +52,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  splits:          {','.join(summary['splits'])} rows={summary['split_rows']}")
     print(f"  required_items:  {summary['required_items']} (max {summary['max_items'] or 'unbounded'})")
     print(f"  estimated_bytes: {summary['estimated_bytes']} (max {summary['max_bytes'] or 'unbounded'}, unknown {summary['unknown_sizes']}, basis {summary.get('size_basis', 'n/a')})")
+    print(f"  transfer:        {summary.get('transfer_method', 'python-copy')}")
+    if summary.get("transfer_prerequisite"):
+        print(f"  prerequisite:    {summary['transfer_prerequisite']}")
     if summary.get("refusal"):
         print(f"  REFUSED:         {summary['refusal']}")
         print("Adjust workflow.input_stage_max_items/input_stage_max_bytes or choose fewer splits before using --execute.")
@@ -59,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.execute:
         print(f"  copied:          {summary['copied']}")
         print(f"  reused:          {summary['reused']}")
+        print(f"  throughput:      {summary.get('items_per_second', 0.0):.2f} items/s, {summary.get('bytes_per_second', 0.0):.0f} bytes/s")
     else:
         print("  next:            rerun with --execute to populate the local stage")
     return 0
