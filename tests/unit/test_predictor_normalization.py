@@ -17,6 +17,9 @@ class DummyDataset:
             "digit": np.eye(10, dtype=np.float32)[[0, 1, 2]],
         }
 
+    def __len__(self):
+        return len(self.samples["thickness"])
+
     def make_batch(self, indices, rng=None, shuffle=False):
         self.batch_calls += 1
         return {"x": np.ones((len(indices), 1, 32, 32), dtype=np.float32) * 128.0}

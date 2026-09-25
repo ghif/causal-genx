@@ -154,6 +154,7 @@ class CounterfactualTrainingConfig(BaseModel):
     epochs: PositiveInt = 5000
     speed_log_freq: PositiveInt = 50
     checkpoint_freq: PositiveInt = 1
+    eval_freq: PositiveInt = 1
     execution_mode: Literal["auto", "single_device", "replicated"] = "auto"
     drop_remainder: bool = False
     alpha: float = 0.1
@@ -165,6 +166,7 @@ class CounterfactualTrainingConfig(BaseModel):
     elbo_constraint: float = 1.841216802597046
     ema_rate: float = 0.999
     model_validation_batches: int = 1
+    final_eval_full: bool = False
     trust_incomplete_checkpoint: bool = False
     resume_checkpoint: str = ""
     testing: bool = False

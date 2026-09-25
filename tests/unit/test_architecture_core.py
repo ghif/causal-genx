@@ -356,8 +356,8 @@ def test_native_counterfactual_arguments_match_profile():
     assert str(counterfactual.output_dir(config)).endswith(
         f"checkpoints/morphomnist/{config.artifacts.run_name}/cf"
     )
-    with pytest.raises(ValueError, match="eval_freq"):
-        load_experiment("configs/morphomnist_counterfactual.yaml", ["workflow.eval_freq=1"])
+    loaded_eval = load_experiment("configs/morphomnist_counterfactual.yaml", ["workflow.eval_freq=2"])
+    assert loaded_eval.workflow.eval_freq == 2
     with pytest.raises(ValueError, match="plot_freq"):
         load_experiment("configs/morphomnist_counterfactual.yaml", ["workflow.plot_freq=10"])
 

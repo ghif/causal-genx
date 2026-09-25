@@ -15,6 +15,7 @@ def test_each_standalone_config_validates_with_runner():
         ("train-scm", "morphomnist_scm.yaml"),
         ("train-predictor", "morphomnist_predictor.yaml"),
         ("finetune-counterfactual", "morphomnist_counterfactual.yaml"),
+        ("finetune-counterfactual", "padchest_counterfactual_tpu_v6e1.yaml"),
         ("infer", "morphomnist_inference.yaml"),
     ):
         result = subprocess.run(

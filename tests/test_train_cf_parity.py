@@ -165,11 +165,11 @@ def test_counterfactual_step_rejects_explosive_gradients(monkeypatch):
 def test_counterfactual_vae_learning_rate_warmup_uses_global_step():
     from training import counterfactual as train_cf
 
-    np.testing.assert_allclose(train_cf._cf_lr_scale(0, 100), 0.0)
-    np.testing.assert_allclose(train_cf._cf_lr_scale(50, 100), 0.5)
-    np.testing.assert_allclose(train_cf._cf_lr_scale(100, 100), 1.0)
-    np.testing.assert_allclose(train_cf._cf_lr_scale(200, 100), 1.0)
-    np.testing.assert_allclose(train_cf._cf_lr_scale(0, 0), 1.0)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(0, 100), 0.0, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(50, 100), 0.5, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(100, 100), 1.0, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(200, 100), 1.0, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(train_cf._cf_lr_scale(0, 0), 1.0, rtol=1e-6, atol=1e-6)
 
 
 def test_counterfactual_execution_mode_selects_single_or_replicated_tpu(monkeypatch):

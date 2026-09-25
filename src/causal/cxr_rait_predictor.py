@@ -308,6 +308,7 @@ class CxrPretrainedImageParentPredictor(nnx.Module):
         weights_path: str = "checkpoints/pretrained/torchxrayvision_densenet121_flax.npz",
         dropout_rate: float = 0.0,
         label_smoothing: float = 0.0,
+        load_pretrained_weights: bool = True,
         compute_dtype: jnp.dtype = jnp.float32,
         rngs: Optional[nnx.Rngs] = None,
     ):
@@ -324,9 +325,11 @@ class CxrPretrainedImageParentPredictor(nnx.Module):
         self.freeze_backbone = bool(freeze_backbone)
         self.dropout_rate = float(dropout_rate)
         self.label_smoothing = float(label_smoothing)
+        self.load_pretrained_weights = bool(load_pretrained_weights)
         self.compute_dtype = compute_dtype
         self.encoder_shared = TorchXRayVisionDenseNet121(compute_dtype=self.compute_dtype, rngs=rngs)
-        _load_torchxrayvision_weights(self.encoder_shared, weights_path)
+        if self.load_pretrained_weights:
+            _load_torchxrayvision_weights(self.encoder_shared, weights_path)
         if self.dropout_rate > 0.0:
             self.dropout = nnx.Dropout(self.dropout_rate, rngs=rngs)
         self.head_attrs = {}
@@ -535,6 +538,7 @@ class CxrRaitPretrainedPredictor(nnx.Module):
 
         dropout_rate: float = 0.0,
         label_smoothing: float = 0.0,
+        load_pretrained_weights: bool = True,
         compute_dtype: jnp.dtype = jnp.float32,
         rngs: Optional[nnx.Rngs] = None,
     ):
@@ -548,12 +552,14 @@ class CxrRaitPretrainedPredictor(nnx.Module):
         self.freeze_backbone = bool(freeze_backbone)
         self.dropout_rate = float(dropout_rate)
         self.label_smoothing = float(label_smoothing)
+        self.load_pretrained_weights = bool(load_pretrained_weights)
         self.compute_dtype = compute_dtype
         # Base feature extractor mirrors torchxrayvision.models.DenseNet
         # (DenseNet-121: growth_rate=32, block_config=(6, 12, 24, 16)).
         # Its converted state-dict archive is loaded immediately and strictly.
         self.encoder_shared = TorchXRayVisionDenseNet121(compute_dtype=self.compute_dtype, rngs=rngs)
-        _load_torchxrayvision_weights(self.encoder_shared, weights_path)
+        if self.load_pretrained_weights:
+            _load_torchxrayvision_weights(self.encoder_shared, weights_path)
 
         if self.dropout_rate > 0.0:
             self.dropout = nnx.Dropout(self.dropout_rate, rngs=rngs)

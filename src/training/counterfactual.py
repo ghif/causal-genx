@@ -25,8 +25,10 @@ import optax
 from flax import nnx
 
 from config import CounterfactualTrainingConfig, ExperimentConfig
-from data.morphomnist import morphomnist
-from data.padchest import padchest
+from contracts import CausalGraphSpec, VariableKind
+from data.cxr_rait import CXR_RAIT_SCHEMA, cxr_rait
+from data.morphomnist import MORPHOMNIST_SCHEMA, morphomnist
+from data.padchest import PAD_CHEST_SCHEMA, padchest
 from models.image_vae import HVAE
 from .counterfactual_support import (
     clip_counterfactual_grads,
@@ -37,6 +39,13 @@ from .counterfactual_support import (
     inherit_image_training_config,
     set_module_training_mode,
 )
+from causal.cxr_rait_predictor import (
+    CxrImageParentPredictor,
+    CxrPretrainedImageParentPredictor,
+    CxrRaitPretrainedPredictor,
+    CxrRaitSupAuxPredictor,
+)
+from causal.cxr_rait_scm import CxrRaitPGM, PadChestPGM
 from causal.flow_scm import MorphoMNISTPGM
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
 from training.image_loop import _first_local_replica, _replicate, _shard_batch, _unreplicate, init_state, preprocess_batch
@@ -142,6 +151,133 @@ def log_run_summary(logger: Any, args, keys: List[str]) -> None:
 
 def log_checkpoint_summary(logger: Any, args) -> None:
     logger.info(format_checkpoint_summary(args))
+
+
+_SCHEMAS: dict[str, CausalGraphSpec] = {
+    MORPHOMNIST_SCHEMA.dataset_id: MORPHOMNIST_SCHEMA,
+    CXR_RAIT_SCHEMA.dataset_id: CXR_RAIT_SCHEMA,
+    PAD_CHEST_SCHEMA.dataset_id: PAD_CHEST_SCHEMA,
+}
+
+
+def _schema_for_dataset(dataset: str) -> CausalGraphSpec:
+    try:
+        return _SCHEMAS[dataset]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported counterfactual dataset {dataset!r}; available={sorted(_SCHEMAS)}") from exc
+
+
+def _schema_for_args(args) -> CausalGraphSpec:
+    return _schema_for_dataset(getattr(args, "dataset", getattr(args, "dataset_id", "morphomnist")))
+
+
+def _parent_slices(args) -> dict[str, slice]:
+    schema = _schema_for_args(args)
+    dims = {variable.name: variable.encoded_dim for variable in schema.variables}
+    out: dict[str, slice] = {}
+    offset = 0
+    for name in getattr(args, "parents_x", list(schema.variable_names)):
+        width = int(dims[name])
+        out[name] = slice(offset, offset + width)
+        offset += width
+    return out
+
+
+def _split_parent_vector(args, pa: jax.Array) -> dict[str, jax.Array]:
+    return {name: pa[:, slc] for name, slc in _parent_slices(args).items()}
+
+
+def _dag_variables(args) -> list[str]:
+    return list(_schema_for_args(args).variable_names)
+
+
+def _build_datasets(args):
+    if args.dataset == "cxr_rait":
+        return cxr_rait(args)
+    if args.dataset == "padchest":
+        return padchest(args)
+    if args.dataset == "morphomnist":
+        return morphomnist(args)
+    raise ValueError(f"Counterfactual finetuning does not support dataset={args.dataset!r}")
+
+
+def _build_pgm_model(args, hparams: Dict[str, Any]):
+    rngs = nnx.Rngs(args.seed)
+    widths = hparams.get("widths", [32, 32])
+    if args.dataset == "cxr_rait":
+        return CxrRaitPGM(widths=widths, rngs=rngs)
+    if args.dataset == "padchest":
+        return PadChestPGM(widths=widths, rngs=rngs)
+    if args.dataset == "morphomnist":
+        return MorphoMNISTPGM(widths=widths, rngs=rngs)
+    raise ValueError(f"Counterfactual SCM restore does not support dataset={args.dataset!r}")
+
+
+def _build_predictor_model(args, hparams: Dict[str, Any], *, load_pretrained_weights: bool = False):
+    rngs = nnx.Rngs(args.seed)
+    if args.dataset == "cxr_rait":
+        uses_pretrained_backbone = bool(
+            hparams.get("freeze_backbone", False)
+            or hparams.get("type") == "finetune-predictor"
+            or hparams.get("pretrained", False)
+        )
+        if uses_pretrained_backbone:
+            return CxrRaitPretrainedPredictor(
+                input_channels=hparams.get("input_channels", args.input_channels),
+                input_res=hparams.get("input_res", args.input_res),
+                width=hparams.get("width", 32),
+                std_fixed=hparams.get("std_fixed", 0.0),
+                freeze_backbone=hparams.get("freeze_backbone", True),
+                weights_path=hparams.get("pretrained_weights_path", ""),
+                dropout_rate=hparams.get("dropout_rate", 0.0),
+                label_smoothing=hparams.get("label_smoothing", 0.0),
+                load_pretrained_weights=load_pretrained_weights,
+                rngs=rngs,
+            )
+        return CxrRaitSupAuxPredictor(
+            input_channels=hparams.get("input_channels", args.input_channels),
+            input_res=hparams.get("input_res", args.input_res),
+            width=hparams.get("width", 16),
+            std_fixed=hparams.get("std_fixed", 0.0),
+            rngs=rngs,
+        )
+    if args.dataset == "padchest":
+        uses_pretrained_backbone = bool(
+            hparams.get("freeze_backbone", False)
+            or hparams.get("type") == "finetune-predictor"
+            or hparams.get("pretrained", False)
+        )
+        if uses_pretrained_backbone:
+            return CxrPretrainedImageParentPredictor(
+                variable_specs=PAD_CHEST_SCHEMA.variables,
+                input_channels=hparams.get("input_channels", args.input_channels),
+                input_res=hparams.get("input_res", args.input_res),
+                width=hparams.get("width", 32),
+                std_fixed=hparams.get("std_fixed", 0.0),
+                freeze_backbone=hparams.get("freeze_backbone", True),
+                weights_path=hparams.get("pretrained_weights_path", ""),
+                dropout_rate=hparams.get("dropout_rate", 0.0),
+                label_smoothing=hparams.get("label_smoothing", 0.0),
+                load_pretrained_weights=load_pretrained_weights,
+                rngs=rngs,
+            )
+        return CxrImageParentPredictor(
+            variable_specs=PAD_CHEST_SCHEMA.variables,
+            input_channels=hparams.get("input_channels", args.input_channels),
+            input_res=hparams.get("input_res", args.input_res),
+            width=hparams.get("width", 16),
+            std_fixed=hparams.get("std_fixed", 0.0),
+            rngs=rngs,
+        )
+    if args.dataset == "morphomnist":
+        return MorphoMNISTSupAuxPredictor(
+            input_channels=hparams.get("input_channels", args.input_channels),
+            input_res=hparams.get("input_res", args.input_res),
+            width=hparams.get("width", 8),
+            std_fixed=hparams.get("std_fixed", 0.0),
+            rngs=rngs,
+        )
+    raise ValueError(f"Counterfactual predictor restore does not support dataset={args.dataset!r}")
 
 
 @jax.tree_util.register_pytree_node_class
@@ -287,13 +423,10 @@ def _batch_parent(args, batch: Dict[str, jax.Array], name: str) -> jax.Array:
         return value[:, None] if value.ndim == 1 else value
 
     pa = batch["pa"]
-    offset = 0
-    for parent_name in args.parents_x:
-        width = 10 if parent_name == "digit" else 1
-        if parent_name == name:
-            return pa[:, offset : offset + width]
-        offset += width
-    raise KeyError(f"Parent {name!r} is not present in batch or --parents_x={args.parents_x}")
+    slices = _parent_slices(args)
+    if name in slices:
+        return pa[:, slices[name]]
+    raise KeyError(f"Parent {name!r} is not present in batch or schema for args: {args.dataset}")
 
 
 def _make_intervention(
@@ -368,9 +501,8 @@ def _load_vae_bundle(args):
 
 def _load_pgm_bundle(args):
     """Restore only the SCM EMA inference leaves onto the active device."""
-    rngs = nnx.Rngs(args.seed)
     pgm_hparams = _load_checkpoint_hparams(args.pgm_path)
-    pgm = MorphoMNISTPGM(widths=pgm_hparams.get("widths", [32, 32]), rngs=rngs)
+    pgm = _build_pgm_model(args, pgm_hparams)
     params = nnx.state(pgm, nnx.Param).to_pure_dict()
     # The configured PGM can have been trained on a different accelerator.
     # A narrow target template restores only the frozen inference state onto
@@ -394,15 +526,8 @@ def _load_pgm_bundle(args):
 
 def _load_predictor_bundle(args):
     """Restore predictor EMA parameters plus BatchNorm statistics for evaluation mode."""
-    rngs = nnx.Rngs(args.seed)
     predictor_hparams = _load_checkpoint_hparams(args.predictor_path)
-    predictor = MorphoMNISTSupAuxPredictor(
-        input_channels=predictor_hparams.get("input_channels", args.input_channels),
-        input_res=predictor_hparams.get("input_res", args.input_res),
-        width=predictor_hparams.get("width", 8),
-        std_fixed=predictor_hparams.get("std_fixed", 0.0),
-        rngs=rngs,
-    )
+    predictor = _build_predictor_model(args, predictor_hparams, load_pretrained_weights=False)
     graphdef, params_state, batch_stats_state = nnx.split(
         predictor, nnx.Param, nnx.BatchStat
     )
@@ -425,27 +550,41 @@ def _load_predictor_bundle(args):
             "Retrain it with the clean train-predictor stage before running counterfactual finetuning."
         )
     params = predictor_ckpt["ema_params"]
-    batch_stats = predictor_ckpt["ema_batch_stats"]
+    batch_stats = predictor_ckpt.get("ema_batch_stats", batch_stats)
     _assert_tree_compatible(
         "predictor", predictor_ckpt, params_state.to_pure_dict(), "ema_params"
     )
-    _assert_tree_compatible(
-        "predictor", predictor_ckpt, batch_stats_state.to_pure_dict(), "ema_batch_stats"
-    )
+    if "ema_batch_stats" in predictor_ckpt and predictor_ckpt["ema_batch_stats"]:
+        _assert_tree_compatible(
+            "predictor", predictor_ckpt, batch_stats_state.to_pure_dict(), "ema_batch_stats"
+        )
     return predictor_ckpt, Bundle(graphdef, params, batch_stats)
 
 
 def _predictor_metrics(args, dataset, preds, targets):
+    schema = _schema_for_args(args)
+    var_specs = {spec.name: spec for spec in schema.variables}
     stats: Dict[str, float] = {}
     for k in preds.keys():
+        if k not in var_specs:
+            continue
+        spec = var_specs[k]
         pred = np.asarray(preds[k])
         target = np.asarray(targets[k])
-        if k == "digit":
-            stats["digit_acc"] = float((target.argmax(-1) == pred.argmax(-1)).mean())
+        if spec.kind == VariableKind.CATEGORICAL or k == "digit":
+            stats[f"{k}_acc"] = float((target.argmax(-1) == pred.argmax(-1)).mean())
+        elif spec.kind == VariableKind.BINARY:
+            target_bin = (target.squeeze(-1) > 0.5).astype(np.float32) if target.ndim > 1 else (target > 0.5).astype(np.float32)
+            pred_bin = (pred.squeeze(-1) > 0.5).astype(np.float32) if pred.ndim > 1 else (pred > 0.5).astype(np.float32)
+            stats[f"{k}_acc"] = float((target_bin == pred_bin).mean())
         else:
-            min_val, max_val = dataset.min_max[k]
-            pred = ((pred.squeeze(-1) + 1.0) / 2.0) * (max_val - min_val) + min_val
-            target = ((target.squeeze(-1) + 1.0) / 2.0) * (max_val - min_val) + min_val
+            if hasattr(dataset, "min_max") and k in dataset.min_max:
+                min_val, max_val = dataset.min_max[k]
+                pred = ((pred.squeeze(-1) + 1.0) / 2.0) * (max_val - min_val) + min_val
+                target = ((target.squeeze(-1) + 1.0) / 2.0) * (max_val - min_val) + min_val
+            else:
+                pred = pred.squeeze(-1)
+                target = target.squeeze(-1)
             stats[f"{k}_mae"] = float(np.mean(np.abs(target - pred)))
     return stats
 
@@ -473,8 +612,8 @@ def _cf_lr_scale(step: jax.Array, warmup_steps: int) -> jax.Array:
     if warmup_steps <= 0:
         return jnp.asarray(1.0, dtype=jnp.float32)
     return jnp.minimum(
-        1.0,
-        jnp.asarray(step, dtype=jnp.float32) / float(warmup_steps),
+        jnp.asarray(1.0, dtype=jnp.float32),
+        jnp.asarray(step, dtype=jnp.float32) / jnp.asarray(warmup_steps, dtype=jnp.float32),
     )
 
 
@@ -508,11 +647,7 @@ def _cf_forward(
     vae_rng, counterfactual_rng = jax.random.split(rng)
     vae_out = vae(x, pa_maps, beta=beta, rng=vae_rng, training=training)
 
-    obs_pgm = {
-        "thickness": pa[:, 0],
-        "intensity": pa[:, 1],
-        "digit": pa[:, 2:],
-    }
+    obs_pgm = _split_parent_vector(args, pa)
 
     if cf_particles > 1:
         cfs = {"x": jnp.zeros_like(batch["x"]), "x2": jnp.zeros_like(batch["x"])}
@@ -574,7 +709,6 @@ def _make_losses(args, vae_bundle, pgm_bundle, predictor_bundle):
             training=True,
         )
         return out["loss"], out
-
     return loss_fn
 
 
@@ -770,18 +904,22 @@ def _eval_split(
     eval_step,
     train_samples,
     rng,
+    *,
+    max_batches: int | None = None,
 ):
-    dag_vars = list(MorphoMNISTPGM.variables.keys())
+    dag_vars = _dag_variables(args)
     dataset = datasets[split]
     stats = {k: 0.0 for k in ["loss", "aux_loss", "elbo", "nll", "kl", "n"]}
-    preds = {k: [] for k in ["thickness", "intensity", "digit"]}
-    targets = {k: [] for k in ["thickness", "intensity", "digit"]}
+    preds = {k: [] for k in dag_vars}
+    targets = {k: [] for k in dag_vars}
     grad_norm = 0.0
     predictor = predictor_bundle.materialize()
     predictor.eval()
     for i, raw_batch in enumerate(
         _epoch_batches(dataset, args.bs, shuffle=(split == "train"), drop_last=(split == "train"), rng=rng)
     ):
+        if max_batches is not None and i >= max_batches:
+            break
         batch = preprocess_batch(args, raw_batch, compact_pa=True)
         do_k = _choose_intervention(args, dag_vars)
         do = _make_intervention(args, batch, do_k, train_samples, train=(split == "train"))
@@ -804,7 +942,8 @@ def _eval_split(
         if split != "train":
             preds_cf = predictor.predict(**out["cfs"])
             for k, v in preds_cf.items():
-                preds[k].append(np.asarray(v))
+                if k in preds:
+                    preds[k].append(np.asarray(v))
             for k in targets.keys():
                 t_k = do[k] if k in do else out["cfs"][k]
                 targets[k].append(np.asarray(t_k))
@@ -812,8 +951,8 @@ def _eval_split(
     if split == "train":
         return mean_stats, None
 
-    preds = {k: np.concatenate(v, axis=0) if len(v) > 1 else np.asarray(v[0]) for k, v in preds.items()}
-    targets = {k: np.concatenate(v, axis=0) if len(v) > 1 else np.asarray(v[0]) for k, v in targets.items()}
+    preds = {k: np.concatenate(v, axis=0) if len(v) > 1 else np.asarray(v[0]) for k, v in preds.items() if v}
+    targets = {k: np.concatenate(v, axis=0) if len(v) > 1 else np.asarray(v[0]) for k, v in targets.items() if v}
     return mean_stats, _predictor_metrics(args, dataset, preds, targets)
 
 
@@ -867,9 +1006,10 @@ def _validated_means(name: str, path: str, totals: Dict[str, float], count: int)
 def _print_dataset_normalization(datasets: Dict[str, Any]) -> None:
     for split in ("train", "valid", "test"):
         dataset = datasets[split]
-        norm = dataset.norm
-        for variable in ("thickness", "intensity"):
-            min_value, max_value = dataset.min_max[variable]
+        norm = getattr(dataset, "norm", getattr(dataset, "context_norm", "N/A"))
+        min_max = getattr(dataset, "min_max", {})
+        for variable, bounds in min_max.items():
+            min_value, max_value = bounds
             print(f"{variable} normalization: {norm}")
             print(f"max: {max_value}, min: {min_value}")
         print(f"#samples: {len(dataset)}")
@@ -907,31 +1047,26 @@ def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
 def _validate_pgm_checkpoint(args, bundle: Bundle, dataset) -> None:
     model = bundle.materialize()
     model.eval()
-    totals = {
-        "loss": 0.0,
-        "logp(digit)": 0.0,
-        "logp(thickness)": 0.0,
-        "logp(intensity)": 0.0,
-    }
+    totals: Dict[str, float] = {}
     count = 0
     for batch in _full_model_validation_batches(args, dataset):
         pa = batch["pa"]
-        outputs = model.log_prob(pa[:, 0], pa[:, 1], pa[:, 2:])
+        obs = _split_parent_vector(args, pa)
+        outputs = model.log_prob(**obs)
         batch_means = {
             "loss": float(-jnp.mean(outputs["joint"])),
-            "logp(digit)": float(jnp.mean(outputs["digit"])),
-            "logp(thickness)": float(jnp.mean(outputs["thickness"])),
-            "logp(intensity)": float(jnp.mean(outputs["intensity"])),
+            **{f"logp({k})": float(jnp.mean(v)) for k, v in outputs.items() if k != "joint"}
         }
         size = int(batch["x"].shape[0])
         for key, value in batch_means.items():
-            totals[key] += value * size
+            totals[key] = totals.get(key, 0.0) + value * size
         count += size
     means = _validated_means("PGM", args.resolved_pgm_path, totals, count)
+    extra_keys = tuple(k for k in sorted(means.keys()) if k != "loss")
     print(
         format_checkpoint_validation_summary(
             means,
-            extra_keys=("logp(digit)", "logp(thickness)", "logp(intensity)"),
+            extra_keys=extra_keys,
         )
     )
 
@@ -939,28 +1074,19 @@ def _validate_pgm_checkpoint(args, bundle: Bundle, dataset) -> None:
 def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
     model = bundle.materialize()
     model.eval()
-    totals = {
-        "loss": 0.0,
-        "logp(thickness_aux)": 0.0,
-        "logp(intensity_aux)": 0.0,
-        "logp(digit_aux)": 0.0,
-    }
+    totals: Dict[str, float] = {}
     count = 0
-    preds = {k: [] for k in ["thickness", "intensity", "digit"]}
-    targets = {k: [] for k in ["thickness", "intensity", "digit"]}
+    dag_vars = _dag_variables(args)
+    preds = {k: [] for k in dag_vars}
+    targets = {k: [] for k in dag_vars}
     for batch_index, batch in enumerate(_full_model_validation_batches(args, dataset)):
         pa = batch["pa"]
-        outputs = model.model_anticausal(
-            x=batch["x"],
-            thickness=pa[:, 0:1],
-            intensity=pa[:, 1:2],
-            digit=pa[:, 2:],
-        )
+        parents = _split_parent_vector(args, pa)
+        outputs = model.model_anticausal(x=batch["x"], **parents)
         batch_stats = {
             "loss": float(-jnp.mean(outputs["joint"])),
-            "logp(thickness_aux)": float(jnp.mean(outputs["thickness_aux"])),
-            "logp(intensity_aux)": float(jnp.mean(outputs["intensity_aux"])),
-            "logp(digit_aux)": float(jnp.mean(outputs["digit_aux"])),
+            **{f"logp({k})": float(jnp.mean(v)) for k, v in outputs.items() if k != "joint" and k.endswith("_aux")},
+            **{f"logp({k}_aux)": float(jnp.mean(v)) for k, v in outputs.items() if k != "joint" and not k.endswith("_aux")},
         }
         _require_finite(
             batch_stats,
@@ -968,24 +1094,21 @@ def _validate_predictor_checkpoint(args, bundle: Bundle, dataset) -> None:
         )
         size = int(batch["x"].shape[0])
         for key, value in batch_stats.items():
-            totals[key] += value * size
+            totals[key] = totals.get(key, 0.0) + value * size
         count += size
-        pred_batch = model.predict(
-            x=batch["x"],
-            thickness=pa[:, 0:1],
-            intensity=pa[:, 1:2],
-            digit=pa[:, 2:],
-        )
+        pred_batch = model.predict(x=batch["x"], **parents)
         for key, value in pred_batch.items():
-            preds[key].append(np.asarray(value))
-        for key in targets.keys():
-            targets[key].append(np.asarray(pa[:, 0:1] if key == "thickness" else pa[:, 1:2] if key == "intensity" else pa[:, 2:]))
+            if key in preds:
+                preds[key].append(np.asarray(value))
+        for key, value in parents.items():
+            if key in targets:
+                targets[key].append(np.asarray(value))
     _validated_means("predictor", args.resolved_predictor_path, totals, count)
     metrics = _predictor_metrics(
         args,
         dataset,
-        {k: np.concatenate(v, axis=0) for k, v in preds.items()},
-        {k: np.concatenate(v, axis=0) for k, v in targets.items()},
+        {k: np.concatenate(v, axis=0) for k, v in preds.items() if v},
+        {k: np.concatenate(v, axis=0) for k, v in targets.items() if v},
     )
     print("test | " + " - ".join(f"{k}: {v:.4f}" for k, v in metrics.items()))
 
@@ -1045,6 +1168,18 @@ def _checkpoint_due(epoch: int, checkpoint_freq: int) -> bool:
     return epoch % max(1, checkpoint_freq) == 0
 
 
+def _eval_due(epoch: int, eval_freq: int) -> bool:
+    return eval_freq > 0 and epoch % eval_freq == 0
+
+
+def _bounded_validation_batches(args) -> int | None:
+    raw = getattr(args, "model_validation_batches", 0)
+    if raw is None:
+        return None
+    max_batches = int(raw)
+    return max_batches if max_batches > 0 else None
+
+
 def _intervention_tag(variable: str | None) -> str:
     return "observational" if variable is None else f"do_{variable}"
 
@@ -1083,13 +1218,14 @@ def _write_epoch_summary(
             writer.add_scalar(f"valid/{intervention}/{key}", value, step)
         for key, value in metrics.items():
             writer.add_scalar(f"valid/{intervention}/{key}", value, step)
-    observational_stats, observational_metrics = validation["observational"]
-    for key, value in observational_stats.items():
-        writer.add_scalar(f"valid/{key}", value, step)
-    for key, value in observational_metrics.items():
-        writer.add_scalar(f"valid/{key}", value, step)
-    writer.add_scalar("loss/valid", observational_stats["loss"], step)
-    writer.add_scalar("aux_loss/valid", observational_stats["aux_loss"], step)
+    if "observational" in validation:
+        observational_stats, observational_metrics = validation["observational"]
+        for key, value in observational_stats.items():
+            writer.add_scalar(f"valid/{key}", value, step)
+        for key, value in observational_metrics.items():
+            writer.add_scalar(f"valid/{key}", value, step)
+        writer.add_scalar("loss/valid", observational_stats["loss"], step)
+        writer.add_scalar("aux_loss/valid", observational_stats["aux_loss"], step)
 
 
 def _log_epoch_summary(
@@ -1123,6 +1259,44 @@ def _log_epoch_summary(
     )
 
 
+def _evaluate_interventions(
+    args,
+    datasets,
+    eval_state,
+    vae_bundle,
+    pgm_bundle,
+    predictor_bundle,
+    eval_step,
+    train_samples,
+    rng,
+    dag_vars: list[str],
+    *,
+    max_batches: int | None,
+) -> Dict[str, tuple[Dict[str, float], Dict[str, float]]]:
+    validation: Dict[str, tuple[Dict[str, float], Dict[str, float]]] = {}
+    copy_do_pa = copy.deepcopy(args.do_pa)
+    try:
+        for pa_k in dag_vars + [None]:
+            args.do_pa = pa_k
+            valid_stats, valid_metrics = _eval_split(
+                args,
+                "valid",
+                datasets,
+                eval_state,
+                vae_bundle,
+                pgm_bundle,
+                predictor_bundle,
+                eval_step,
+                train_samples,
+                rng,
+                max_batches=max_batches,
+            )
+            validation[_intervention_tag(pa_k)] = (valid_stats, valid_metrics)
+    finally:
+        args.do_pa = copy_do_pa
+    return validation
+
+
 def main(args):
     """Run artifact validation, frozen-model preflight, and counterfactual fine-tuning."""
     _validate_runtime_device(args)
@@ -1130,8 +1304,7 @@ def main(args):
     seed_all(args.seed, args.deterministic)
     if args.do_pa in {"None", "none", "null", ""}:
         args.do_pa = None
-    if args.dataset not in {"morphomnist", "cxr_rait", "padchest"}:
-        raise ValueError("JAX counterfactual finetuning currently supports dataset morphomnist, cxr_rait, or padchest")
+    _schema_for_args(args)
 
     if not hasattr(args, "elbo_constraint") or args.elbo_constraint is None:
         args.elbo_constraint = 1.841216802597046
@@ -1139,13 +1312,7 @@ def main(args):
     # Load and validate each upstream component independently. This fails early
     # if a checkpoint has the wrong architecture, schema, or device topology.
     vae_ckpt, vae_bundle = _load_vae_bundle(args)
-    if args.dataset == "cxr_rait":
-        from data.cxr_rait import cxr_rait
-        datasets = cxr_rait(args)
-    elif args.dataset == "padchest":
-        datasets = padchest(args)
-    else:
-        datasets = morphomnist(args)
+    datasets = _build_datasets(args)
 
     _print_dataset_normalization(datasets)
     _validate_vae_checkpoint(args, vae_bundle, datasets["test"])
@@ -1242,6 +1409,9 @@ def main(args):
             "do_pa",
             "speed_log_freq",
             "checkpoint_freq",
+            "eval_freq",
+            "model_validation_batches",
+            "final_eval_full",
             "cf_particles",
             "load_path",
             "pgm_path",
@@ -1257,7 +1427,7 @@ def main(args):
     single_train_step = _make_train_step(
         args, vae_bundle, pgm_bundle, predictor_bundle, optimizer, lambda_optimizer
     )
-    dag_vars = list(MorphoMNISTPGM.variables.keys())
+    dag_vars = _dag_variables(args)
     rng = np.random.default_rng(args.seed)
 
     if args.testing:
@@ -1422,27 +1592,23 @@ def main(args):
         train_stats = {k: v / max(1, seen) for k, v in totals.items()}
         train_time = time.perf_counter() - epoch_step_t0
         checkpoint_due = _checkpoint_due(epoch + 1, args.checkpoint_freq)
+        validation_due = _eval_due(epoch + 1, int(getattr(args, "eval_freq", args.checkpoint_freq)))
         validation: Dict[str, tuple[Dict[str, float], Dict[str, float]]] | None = None
-        if checkpoint_due:
+        if validation_due:
             eval_state = _portable_cf_state(state, replicated=use_tpu_pmap)
-            validation = {}
-            copy_do_pa = copy.deepcopy(args.do_pa)
-            for pa_k in dag_vars + [None]:
-                args.do_pa = pa_k
-                valid_stats, valid_metrics = _eval_split(
-                    args,
-                    "valid",
-                    datasets,
-                    eval_state,
-                    vae_bundle,
-                    pgm_bundle,
-                    predictor_bundle,
-                    eval_step,
-                    train_samples,
-                    rng,
-                )
-                validation[_intervention_tag(pa_k)] = (valid_stats, valid_metrics)
-            args.do_pa = copy_do_pa
+            validation = _evaluate_interventions(
+                args,
+                datasets,
+                eval_state,
+                vae_bundle,
+                pgm_bundle,
+                predictor_bundle,
+                eval_step,
+                train_samples,
+                rng,
+                dag_vars,
+                max_batches=_bounded_validation_batches(args),
+            )
         epoch_iter_per_sec = steps_per_epoch / max(train_time, 1e-12)
         epoch_sample_per_sec = seen / max(train_time, 1e-12)
         total_time = time.perf_counter() - epoch_t0
@@ -1460,7 +1626,7 @@ def main(args):
             iter_per_sec=epoch_iter_per_sec, sample_per_sec=epoch_sample_per_sec,
             validation=validation,
         )
-        if checkpoint_due and validation is not None:
+        if checkpoint_due and validation is not None and "observational" in validation:
             observational_stats, _ = validation["observational"]
             if observational_stats["loss"] < state["best_loss"]:
                 state["best_loss"] = observational_stats["loss"]
@@ -1473,6 +1639,26 @@ def main(args):
         if checkpoint_due and getattr(args, "remote_save_dir", ""):
             metric_artifact_writer.submit(_sync_metric_artifacts, args)
             logger.info("metric_artifacts_enqueued epoch=%d step=%d queue=%s", epoch + 1, state["step"], metric_artifact_writer.stats)
+      if getattr(args, "final_eval_full", False) and not benchmark_done:
+        logger.info("final_full_validation=started split=valid")
+        final_validation = _evaluate_interventions(
+            args,
+            datasets,
+            _portable_cf_state(state, replicated=use_tpu_pmap),
+            vae_bundle,
+            pgm_bundle,
+            predictor_bundle,
+            eval_step,
+            train_samples,
+            rng,
+            dag_vars,
+            max_batches=None,
+        )
+        for intervention, (stats, metrics) in final_validation.items():
+            description = " - ".join(
+                f"{key}: {value:.4f}" for key, value in {**stats, **metrics}.items()
+            )
+            logger.info("=> final valid %s | %s - steps: %d", intervention, description, state["step"])
     finally:
       try:
         artifact_writer.close()
