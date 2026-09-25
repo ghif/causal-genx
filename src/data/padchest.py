@@ -214,12 +214,55 @@ def _run_gcloud_bulk_copy(records: Sequence[dict[str, Any]], stage_root: Path, w
     return copied_records, len(to_copy), reused
 
 
-def _load_stage_manifest(manifest: str, stage_dir: str, expected_sources: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Load a JSONL ImageID -> local file map without requiring credentials."""
+import functools
+
+@functools.lru_cache(maxsize=8)
+def _load_manifest_exclusions(manifest: str) -> dict[str, str]:
+    if not manifest or not Path(manifest).is_file():
+        return {}
+    try:
+        mtime = Path(manifest).stat().st_mtime
+    except OSError:
+        return {}
+    return _load_manifest_exclusions_mtime_cached(manifest, mtime)
+
+
+@functools.lru_cache(maxsize=8)
+def _load_manifest_exclusions_mtime_cached(manifest: str, mtime: float) -> dict[str, str]:
+    if not manifest or not Path(manifest).is_file():
+        return {}
+    exclusions = {}
+    with Path(manifest).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if record.get("kind") == "excluded":
+                source = str(record.get("source", ""))
+                reason = str(record.get("reason", "manifest-recorded exclusion"))
+                if source:
+                    exclusions[source] = reason
+    return exclusions
+
+
+def _load_stage_manifest_cached(manifest: str, stage_dir: str) -> dict[str, tuple[str, str]]:
+    if not manifest or not Path(manifest).is_file():
+        return {}
+    try:
+        mtime = Path(manifest).stat().st_mtime
+    except OSError:
+        return {}
+    return _load_stage_manifest_mtime_cached(manifest, stage_dir, mtime)
+
+
+@functools.lru_cache(maxsize=8)
+def _load_stage_manifest_mtime_cached(manifest: str, stage_dir: str, mtime: float) -> dict[str, tuple[str, str]]:
+    """Load a JSONL ImageID -> (source, local file) map without requiring credentials."""
     if not manifest or not Path(manifest).is_file():
         return {}
     root = Path(stage_dir)
-    mapping: dict[str, str] = {}
+    mapping: dict[str, tuple[str, str]] = {}
     with Path(manifest).open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -233,12 +276,23 @@ def _load_stage_manifest(manifest: str, stage_dir: str, expected_sources: Mappin
             local_path = record.get("local_path") or record.get("relative_path")
             if not image_id or not local_path:
                 continue
-            if expected_sources is not None and source and source != expected_sources.get(image_id):
-                continue
             path = Path(str(local_path))
             if not path.is_absolute():
                 path = root / path
-            mapping[image_id] = str(path)
+            mapping[image_id] = (source, str(path))
+    return mapping
+
+
+def _load_stage_manifest(manifest: str, stage_dir: str, expected_sources: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Load a JSONL ImageID -> local file map with optional source validation."""
+    cached = _load_stage_manifest_cached(manifest, stage_dir)
+    if expected_sources is None:
+        return {k: v[1] for k, v in cached.items()}
+    mapping: dict[str, str] = {}
+    for image_id, (source, local_path) in cached.items():
+        if source and source != expected_sources.get(image_id):
+            continue
+        mapping[image_id] = local_path
     return mapping
 
 
@@ -293,6 +347,7 @@ def _category(value: str, choices: tuple[str, ...], fallback: str) -> int:
     return choices.index(value) if value in choices else choices.index(fallback)
 
 
+@functools.lru_cache(maxsize=4)
 def _read_rows(metadata: str) -> list[dict[str, str]]:
     with _open_binary(metadata) as handle:
         return list(csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline="")))
@@ -382,6 +437,7 @@ class PadChestDataset:
         stage_manifest: str = "",
         stage_mode: str = "auto",
         excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
+        concat_pa: bool = True,
     ):
         rows = _read_rows(metadata)
         groups: dict[str, list[tuple[int, dict[str, str]]]] = {}
@@ -393,7 +449,12 @@ class PadChestDataset:
         self.stage_dir = stage_dir
         self.stage_manifest = stage_manifest or (_default_stage_manifest(stage_dir) if stage_dir else "")
         self.stage_mode = stage_mode
+        self.concat_pa = concat_pa
         exclusions = _configured_exclusions(excluded_sources)
+        if self.stage_manifest and self.stage_mode != "off":
+            manifest_exclusions = _load_manifest_exclusions(self.stage_manifest)
+            for src, reason in manifest_exclusions.items():
+                exclusions.setdefault(src, reason)
         self.excluded_records: list[dict[str, Any]] = []
         self.rows: list[dict[str, str]] = []
         for row_index, row in selected_rows:
@@ -412,7 +473,7 @@ class PadChestDataset:
         expected_sources = {row["ImageID"]: self._source_image_path(row) for row in self.rows}
         self._staged_images = _load_stage_manifest(self.stage_manifest, stage_dir, expected_sources) if stage_dir and stage_mode != "off" else {}
         if stage_mode == "require":
-            missing = [row["ImageID"] for row in self.rows if not Path(self._staged_images.get(row["ImageID"], "")).is_file()]
+            missing = [row["ImageID"] for row in self.rows if row["ImageID"] not in self._staged_images]
             if missing:
                 raise RuntimeError(
                     "input_stage_mode=require but PadChest local staging is incomplete: "
@@ -420,6 +481,12 @@ class PadChestDataset:
                     "Run `python scripts/stage_padchest_inputs.py --config <config> --execute` "
                     "or relax workflow.input_stage_mode."
                 )
+            if self._staged_images and self.rows:
+                first_staged = self._staged_images.get(self.rows[0]["ImageID"])
+                if first_staged and not Path(first_staged).is_file():
+                    raise RuntimeError(
+                        f"input_stage_mode=require but staged image path {first_staged!r} is not a valid file on disk."
+                    )
         self._metadata = [_derive(row, tb_label_mode) for row in self.rows]
         self.samples = {
             spec.name: (
@@ -471,7 +538,16 @@ class PadChestDataset:
         batch_indices = np.asarray(indices, dtype=np.int64)
         images = np.stack([self._get_image(int(index)) for index in batch_indices])
         variables = {name: np.asarray(values[batch_indices], dtype=np.float32) for name, values in self.samples.items()}
-        return {"x": images, **variables}
+        sample = {"x": images, **variables}
+        if self.concat_pa:
+            parts = []
+            for spec in PAD_CHEST_SCHEMA.variables:
+                v = variables[spec.name]
+                if v.ndim == 1:
+                    v = v[:, None]
+                parts.append(v)
+            sample["pa"] = np.concatenate(parts, axis=1).astype(np.float32)
+        return sample
 
 
 class PadChestProvider:
@@ -492,6 +568,7 @@ class PadChestProvider:
         stage_manifest: str = "",
         stage_mode: str = "auto",
         excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
+        concat_pa: bool = True,
     ):
         self.root, self.input_res, self.pad, self.context_norm = root, input_res, pad, context_norm
         self.metadata = metadata or f"{root.rstrip('/')}/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv"
@@ -499,6 +576,7 @@ class PadChestProvider:
         self.tb_label_mode, self.seed = tb_label_mode, seed
         self.stage_dir, self.stage_manifest, self.stage_mode = stage_dir, stage_manifest, stage_mode
         self.excluded_sources = excluded_sources or []
+        self.concat_pa = concat_pa
 
     @property
     def spec(self) -> DatasetSpec:
@@ -517,6 +595,7 @@ class PadChestProvider:
             stage_manifest=self.stage_manifest,
             stage_mode=self.stage_mode,
             excluded_sources=self.excluded_sources,
+            concat_pa=self.concat_pa,
         )
 
     def make_batch(self, split: str, indices: Sequence[int], *, rng=None, training: bool = False) -> Batch:
@@ -787,6 +866,7 @@ def padchest(settings) -> dict[str, PadChestDataset]:
         getattr(settings, "image_prefix", ""),
         getattr(settings, "tb_label_mode", "tb_or_sequelae"),
         settings.seed,
+        concat_pa=getattr(settings, "concat_pa", True),
         **_stage_settings(settings),
     )
     return {split: provider.load_split(split) for split in ("train", "valid", "test")}

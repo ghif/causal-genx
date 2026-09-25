@@ -3,8 +3,11 @@ seed: 7
 dataset:
   name: padchest
   root: gs://external-cxr-dataset/padchest/unpacked/images-224
-  metadata: gs://external-cxr-dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv
+  metadata: /mnt/data/dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv
   image_prefix: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224
+  excluded_sources:
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012558082906712009300162151055_00-078-079.png
+      reason: confirmed absent source object; gcloud storage ls matches no objects
   input_res: 128
   pad: 0
   context_norm: "[-1,1]"
@@ -17,6 +20,8 @@ model:
   name: hierarchical_vae
   context_dim: 22
   cond_prior: true
+  enc_arch: 128b3d2,64b3d4,16b3d4,4b3d4,1b4
+  dec_arch: 1b4,4b4,16b4,64b4,128b4
 optimizer:
   lr: 0.0005
   weight_decay: 0.01
@@ -41,3 +46,9 @@ workflow:
   benchmark_warmup_steps: 10
   execution_mode: single_device
   drop_remainder: true
+  input_stage_mode: require
+  input_stage_dir: /mnt/data/dataset/padchest/input-stage/images-224
+  input_stage_manifest: /mnt/data/dataset/padchest/input-stage/images-224/padchest-stage-manifest.jsonl
+  input_stage_max_items: 200000
+  input_stage_max_bytes: 120000000000
+  input_stage_workers: 32

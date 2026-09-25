@@ -27,13 +27,48 @@ def preprocess_batch(args, batch, expand_pa: bool = False, compact_pa: bool = Fa
     x = np.asarray(batch["x"], dtype=np.float32)
     if x.max() > 1.5:
         x = (x - 127.5) / 127.5
-    pa = np.asarray(batch["pa"], dtype=np.float32)
+    elif x.min() >= 0.0 and x.max() <= 1.5:
+        x = x * 2.0 - 1.0
+
+    if "pa" in batch:
+        pa = np.asarray(batch["pa"], dtype=np.float32)
+    else:
+        schema_vars = getattr(args, "causal_schema_variables", None) or getattr(args, "parents_x", None)
+        if schema_vars:
+            parts = []
+            for name in schema_vars:
+                if name in batch:
+                    v = np.asarray(batch[name], dtype=np.float32)
+                    if v.ndim == 1:
+                        v = v[:, None]
+                    parts.append(v)
+            if parts:
+                pa = np.concatenate(parts, axis=1).astype(np.float32)
+            else:
+                raise KeyError("Batch does not contain 'pa' or schema variable tensors.")
+        else:
+            raise KeyError("Batch does not contain 'pa' and no causal schema variables are configured.")
+
+    if pa.shape[-1] < getattr(args, "context_dim", pa.shape[-1]):
+        target_dim = getattr(args, "context_dim", pa.shape[-1])
+        pad_width = [(0, 0)] * (pa.ndim - 1) + [(0, target_dim - pa.shape[-1])]
+        pa = np.pad(pa, pad_width, mode="constant")
+
     if not compact_pa and (expand_pa or pa.ndim == 2):
         pa = pa[:, :, None, None]
         pa = np.repeat(pa, args.input_res, axis=2)
         pa = np.repeat(pa, args.input_res, axis=3)
-    x = jnp.asarray(x).transpose(0, 2, 3, 1)
-    pa = jnp.asarray(pa).transpose(0, 2, 3, 1) if pa.ndim == 4 else jnp.asarray(pa)
+
+    if x.ndim == 4 and x.shape[1] in (1, 3) and x.shape[1] != x.shape[2]:
+        x = jnp.asarray(x).transpose(0, 2, 3, 1)
+    else:
+        x = jnp.asarray(x)
+
+    if pa.ndim == 4 and pa.shape[1] != pa.shape[2]:
+        pa = jnp.asarray(pa).transpose(0, 2, 3, 1)
+    else:
+        pa = jnp.asarray(pa)
+
     if getattr(args, "precision", "fp32") == "bf16":
         x = x.astype(jnp.bfloat16)
         pa = pa.astype(jnp.bfloat16)

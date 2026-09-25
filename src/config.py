@@ -19,7 +19,7 @@ class DatasetConfig(BaseModel):
     split_manifest: str = ""
     tb_label_mode: Literal["any_tb", "tb_only", "tb_or_sequelae"] = "tb_or_sequelae"
     min_category_count: PositiveInt = 1
-    excluded_sources: list[dict[str, str]] = Field(default_factory=list)
+    excluded_sources: list[dict[str, str] | str] = Field(default_factory=list)
     input_res: PositiveInt = 32
     pad: int = 4
     hflip: float = 0.5
@@ -139,6 +139,13 @@ class ImageModelTrainingConfig(BaseModel):
     benchmark_warmup_steps: int = 20
     execution_mode: Literal["auto", "single_device", "replicated"] = "auto"
     drop_remainder: bool = False
+    input_stage_mode: Literal["auto", "off", "require"] = "auto"
+    input_stage_dir: str = ""
+    input_stage_manifest: str = ""
+    input_stage_max_items: int = 0
+    input_stage_max_bytes: int = 0
+    input_stage_size_sample_items: int = 256
+    input_stage_workers: int = 16
 
 
 class CounterfactualTrainingConfig(BaseModel):
@@ -171,6 +178,13 @@ class CounterfactualTrainingConfig(BaseModel):
     resume_checkpoint: str = ""
     testing: bool = False
     benchmark_steps: int = 0
+    input_stage_mode: Literal["auto", "off", "require"] = "auto"
+    input_stage_dir: str = ""
+    input_stage_manifest: str = ""
+    input_stage_max_items: int = 0
+    input_stage_max_bytes: int = 0
+    input_stage_size_sample_items: int = 256
+    input_stage_workers: int = 16
 
 
 class InferenceConfig(BaseModel):

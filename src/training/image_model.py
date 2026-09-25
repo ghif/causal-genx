@@ -18,6 +18,7 @@ import jax
 from flax import nnx
 
 from config import ExperimentConfig
+from data.cxr_rait import cxr_rait
 from data.morphomnist import morphomnist
 from data.padchest import padchest
 from models.image_vae import HVAE, SimpleVAE
@@ -136,7 +137,12 @@ def _run(args: ImageModelSettings) -> None:
     )
     logger.info("loading datasets")
     writer = SummaryWriter(args.save_dir)
-    datasets = padchest(args) if args.dataset_id == "padchest" else morphomnist(args)
+    if args.dataset_id == "padchest":
+        datasets = padchest(args)
+    elif args.dataset_id == "cxr_rait":
+        datasets = cxr_rait(args)
+    else:
+        datasets = morphomnist(args)
     logger.info("datasets loaded")
     logger.info("building model")
     model = _build_model(args)
