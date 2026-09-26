@@ -22,6 +22,7 @@ from training.counterfactual import (
     _eval_due,
     _make_losses,
     _make_train_step,
+    _epoch_batches,
     _parent_slices,
     _split_parent_vector,
 )
@@ -115,6 +116,29 @@ def test_eval_due_and_bounded_validation_batches():
     assert _bounded_validation_batches(SimpleNamespace(model_validation_batches=0)) is None
 
 
+def test_counterfactual_epoch_prefetch_is_bounded_and_ordered():
+    class Dataset:
+        def __len__(self):
+            return 5
+
+        def make_batch(self, indices, **kwargs):
+            del kwargs
+            return {"x": np.asarray(indices, dtype=np.float32)}
+
+    batches = list(
+        _epoch_batches(
+            Dataset(),
+            2,
+            shuffle=False,
+            drop_last=False,
+            rng=np.random.default_rng(0),
+            prefetch_batches=2,
+            prefetch_workers=2,
+        )
+    )
+    assert [batch["x"].tolist() for batch in batches] == [[0.0, 1.0], [2.0, 3.0], [4.0]]
+
+
 def test_padchest_yaml_config_validation():
     config_path = "configs/padchest_counterfactual_tpu_v6e1.yaml"
     with open(config_path, "r") as f:
@@ -125,12 +149,18 @@ def test_padchest_yaml_config_validation():
     assert exp_cfg.workflow.eval_freq == 5
     assert exp_cfg.workflow.model_validation_batches == 1
     assert exp_cfg.workflow.benchmark_steps == 0
+    assert exp_cfg.workflow.execution_mode == "single_device"
+    assert exp_cfg.workflow.input_prefetch_workers == 8
+    assert exp_cfg.workflow.input_prefetch_batches == 4
+    assert exp_cfg.workflow.input_stage_mode == "require"
     assert exp_cfg.model.context_dim == 22
 
     settings = counterfactual_settings(exp_cfg)
     assert settings.eval_freq == 5
     assert settings.model_validation_batches == 1
     assert settings.benchmark_steps == 0
+    assert settings.input_prefetch_workers == 8
+    assert settings.input_prefetch_batches == 4
     assert settings.context_dim == 22
     assert settings.parents_x == list(PAD_CHEST_SCHEMA.variable_names)
 

@@ -121,6 +121,8 @@ class CounterfactualSettings(ImageModelSettings):
     model_validation_batches: int = 1
     final_eval_full: bool = False
     trust_incomplete_checkpoint: bool = False
+    input_prefetch_workers: int = 1
+    input_prefetch_batches: int = 0
 
 
 def image_model_settings(config: ExperimentConfig) -> ImageModelSettings:
@@ -183,6 +185,8 @@ def counterfactual_settings(config: ExperimentConfig) -> CounterfactualSettings:
         model_validation_batches=workflow.model_validation_batches,
         final_eval_full=workflow.final_eval_full,
         trust_incomplete_checkpoint=workflow.trust_incomplete_checkpoint,
+        input_prefetch_workers=workflow.input_prefetch_workers,
+        input_prefetch_batches=workflow.input_prefetch_batches,
     )
 
 

@@ -37,9 +37,11 @@ artifacts:
   remote_root: gs://external-cxr-dataset/padchest/checkpoints
 workflow:
   type: finetune-counterfactual
-  scm_checkpoint: checkpoints/padchest/scm_padchest_tpu_v6e1/checkpoints/best
-  predictor_checkpoint: checkpoints/padchest/predictor_padchest_tpu_v6e1/checkpoints/best
-  image_model_checkpoint: checkpoints/padchest/image_model_padchest_tpu_v6e1/checkpoints/best
+  # Published prefixes: Stage 4 resolves each to the latest complete Orbax
+  # step and refuses local/stale fallback or incomplete uploads.
+  scm_checkpoint: gs://external-cxr-dataset/padchest/checkpoints/padchest/scm_padchest_tpu_v6e1/checkpoints
+  predictor_checkpoint: gs://external-cxr-dataset/padchest/checkpoints/padchest/predictor_padchest_tpu_v6e1/pgm/checkpoints
+  image_model_checkpoint: gs://external-cxr-dataset/padchest/checkpoints/padchest/image_model_padchest_tpu_v6e1/checkpoints
   epochs: 100
   speed_log_freq: 10
   checkpoint_freq: 5
@@ -52,3 +54,14 @@ workflow:
   elbo_constraint: 1.84
   model_validation_batches: 1
   benchmark_steps: 0
+  execution_mode: single_device
+  drop_remainder: true
+  input_prefetch_workers: 8
+  input_prefetch_batches: 4
+  input_stage_mode: require
+  input_stage_dir: /mnt/data/dataset/padchest/input-stage/images-224
+  input_stage_manifest: /mnt/data/dataset/padchest/input-stage/images-224/padchest-stage-manifest.jsonl
+  input_stage_max_items: 200000
+  input_stage_max_bytes: 120000000000
+  input_stage_size_sample_items: 256
+  input_stage_workers: 32
