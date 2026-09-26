@@ -77,7 +77,13 @@ def _model_from_metadata(metadata: dict[str, Any], seed: int):
 def _input_image(path: str, input_res: int, channels: int) -> jax.Array:
     if not path:
         return jnp.zeros((1, input_res, input_res, channels), dtype=jnp.float32)
-    image = Image.open(path).convert("L").resize((input_res, input_res))
+    raw = Image.open(path)
+    arr = np.array(raw)
+    if arr.dtype == np.uint16 or getattr(raw, "mode", "").startswith("I"):
+        u8 = (arr.astype(np.float32) / 256.0).clip(0, 255).astype(np.uint8)
+        image = Image.fromarray(u8, mode="L").resize((input_res, input_res), Image.Resampling.BILINEAR)
+    else:
+        image = raw.convert("L").resize((input_res, input_res), Image.Resampling.BILINEAR)
     values = np.asarray(image, dtype=np.float32)[None, ..., None]
     return jnp.asarray((values - 127.5) / 127.5)
 

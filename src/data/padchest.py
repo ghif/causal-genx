@@ -527,7 +527,13 @@ class PadChestDataset:
 
     def _get_image(self, index: int) -> np.ndarray:
         with _open_binary(self._image_path(self.rows[index])) as handle:
-            image = Image.open(handle).convert("L").resize((self.input_res, self.input_res), Image.Resampling.BILINEAR)
+            raw = Image.open(handle)
+            arr = np.array(raw)
+            if arr.dtype == np.uint16 or getattr(raw, "mode", "").startswith("I"):
+                u8 = (arr.astype(np.float32) / 256.0).clip(0, 255).astype(np.uint8)
+                image = Image.fromarray(u8, mode="L").resize((self.input_res, self.input_res), Image.Resampling.BILINEAR)
+            else:
+                image = raw.convert("L").resize((self.input_res, self.input_res), Image.Resampling.BILINEAR)
         return np.asarray(image, dtype=np.float32)[None] / 255.0
 
     def __getitem__(self, index: int) -> dict[str, np.ndarray]:
