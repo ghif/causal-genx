@@ -50,6 +50,44 @@ VIEW_POSITIONS = ("POSTEROANTERIOR", "ANTEROPOSTERIOR", "LATERAL", "AP", "PA", "
 _PROJECTIONS = PROJECTIONS
 _VIEWS = VIEW_POSITIONS
 
+# The PadChest SCM and predictor use the 17-dimensional causal encoding above.
+# The authoritative HVAE artifact was trained with five additional, reserved
+# image-context channels.  They are non-causal and were zero for every image
+# batch; keeping them explicit prevents those channels from being confused with
+# new SCM variables or intervention targets.
+PAD_CHEST_SOURCE_CONTEXT_DIM = PAD_CHEST_SCHEMA.encoded_dim
+PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM = 5
+PAD_CHEST_HVAE_CONTEXT_DIM = PAD_CHEST_SOURCE_CONTEXT_DIM + PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM
+
+
+def adapt_padchest_hvae_context(pa: np.ndarray, *, target_dim: int) -> np.ndarray:
+    """Adapt the causal PadChest vector to the trained HVAE context contract.
+
+    Only the known 17 -> 22 PadChest artifact contract is supported.  The
+    extension is deliberately explicit and fixed at zero because those five
+    channels are reserved image-context slots, not SCM variables.  Unknown
+    dimensions fail instead of being silently padded or truncated.
+    """
+    array = np.asarray(pa)
+    if array.ndim not in (2, 4):
+        raise ValueError(f"PadChest context must be [N,C] or [N,H,W,C], got shape {array.shape}")
+    source_dim = int(array.shape[-1])
+    if source_dim != PAD_CHEST_SOURCE_CONTEXT_DIM:
+        raise ValueError(
+            "PadChest causal context must have dimension "
+            f"{PAD_CHEST_SOURCE_CONTEXT_DIM}, got {source_dim}"
+        )
+    if int(target_dim) == PAD_CHEST_SOURCE_CONTEXT_DIM:
+        return array
+    if int(target_dim) != PAD_CHEST_HVAE_CONTEXT_DIM:
+        raise ValueError(
+            "Unsupported PadChest HVAE context dimension: "
+            f"expected {PAD_CHEST_SOURCE_CONTEXT_DIM} or {PAD_CHEST_HVAE_CONTEXT_DIM}, got {target_dim}"
+        )
+    extension_shape = array.shape[:-1] + (PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM,)
+    extension = np.zeros(extension_shape, dtype=array.dtype)
+    return np.concatenate((array, extension), axis=-1)
+
 
 def _configured_exclusions(excluded_sources: Sequence[Mapping[str, str] | str] | None) -> dict[str, str]:
     """Return an exact source URI/path -> reason map for PadChest-only exclusions."""

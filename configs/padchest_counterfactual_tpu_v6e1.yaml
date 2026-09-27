@@ -37,9 +37,9 @@ artifacts:
   remote_root: gs://external-cxr-dataset/padchest/checkpoints
 workflow:
   type: finetune-counterfactual
-  scm_checkpoint: checkpoints/padchest/scm_padchest_tpu_v6e1/checkpoints/best
-  predictor_checkpoint: checkpoints/padchest/predictor_padchest_tpu_v6e1/checkpoints/best
-  image_model_checkpoint: checkpoints/padchest/image_model_padchest_tpu_v6e1/checkpoints/best
+  scm_checkpoint: gs://external-cxr-dataset/padchest/checkpoints/padchest/scm_padchest_tpu_v6e1/checkpoints/200500
+  predictor_checkpoint: gs://external-cxr-dataset/padchest/checkpoints/padchest/predictor_padchest_tpu_v6e1/pgm/checkpoints/46115
+  image_model_checkpoint: gs://external-cxr-dataset/padchest/checkpoints/padchest/image_model_padchest_tpu_v6e1/checkpoints/160400
   epochs: 100
   speed_log_freq: 10
   checkpoint_freq: 5

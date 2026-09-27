@@ -10,15 +10,22 @@ import optax
 from flax import nnx
 
 from causal.cxr_rait_predictor import CxrImageParentPredictor, CxrPretrainedImageParentPredictor
+from models.image_vae import HVAE
 from causal.cxr_rait_scm import PadChestPGM
 from config import CounterfactualTrainingConfig, ExperimentConfig
-from data.padchest import PAD_CHEST_SCHEMA
+from data.padchest import (
+    PAD_CHEST_HVAE_CONTEXT_DIM,
+    PAD_CHEST_SCHEMA,
+    adapt_padchest_hvae_context,
+)
 from training.counterfactual import (
     Bundle,
+    _cf_forward,
     _bounded_validation_batches,
     _build_pgm_model,
     _build_predictor_model,
     _dag_variables,
+    _validate_artifact_contract,
     _eval_due,
     _make_losses,
     _make_train_step,
@@ -62,6 +69,29 @@ def test_padchest_schema_slicing_and_dag_variables():
     assert split["projection"].shape == (1, 5)
     assert split["view_position"].shape == (1, 6)
     assert split["study_year"].shape == (1, 1)
+
+
+def test_padchest_context_adapter_is_explicit_and_shape_safe():
+    source = np.arange(PAD_CHEST_SCHEMA.encoded_dim, dtype=np.float32)[None, :]
+    adapted = adapt_padchest_hvae_context(source, target_dim=PAD_CHEST_HVAE_CONTEXT_DIM)
+    assert adapted.shape == (1, PAD_CHEST_HVAE_CONTEXT_DIM)
+    np.testing.assert_array_equal(adapted[:, : PAD_CHEST_SCHEMA.encoded_dim], source)
+    np.testing.assert_array_equal(adapted[:, PAD_CHEST_SCHEMA.encoded_dim :], 0.0)
+    with pytest.raises(ValueError, match="Unsupported PadChest HVAE context dimension"):
+        adapt_padchest_hvae_context(source, target_dim=21)
+    with pytest.raises(ValueError, match="causal context must have dimension"):
+        adapt_padchest_hvae_context(np.zeros((1, 16), dtype=np.float32), target_dim=22)
+
+
+def test_artifact_context_mismatch_is_rejected_before_restore():
+    args = SimpleNamespace(dataset="padchest", input_res=128)
+    with pytest.raises(ValueError, match="VAE checkpoint context_dim mismatch: expected 22, found 17"):
+        _validate_artifact_contract(
+            args,
+            "VAE",
+            {"dataset": "padchest", "parents_x": list(PAD_CHEST_SCHEMA.variable_names), "context_dim": 17, "input_res": 128},
+            context_dim=22,
+        )
 
 
 def test_padchest_model_builders():
@@ -125,6 +155,9 @@ def test_padchest_yaml_config_validation():
     assert exp_cfg.workflow.eval_freq == 5
     assert exp_cfg.workflow.model_validation_batches == 1
     assert exp_cfg.workflow.benchmark_steps == 0
+    assert exp_cfg.workflow.scm_checkpoint.endswith("/200500")
+    assert exp_cfg.workflow.predictor_checkpoint.endswith("/46115")
+    assert exp_cfg.workflow.image_model_checkpoint.endswith("/160400")
     assert exp_cfg.model.context_dim == 22
 
     settings = counterfactual_settings(exp_cfg)
@@ -157,6 +190,44 @@ class _DummyPadChestVAE(nnx.Module):
         loc = jnp.zeros((batch_size, 32, 32, 1), dtype=jnp.float32)
         scale = jnp.ones((batch_size, 32, 32, 1), dtype=jnp.float32)
         return loc, scale
+
+
+def test_padchest_context_dispatch_rejects_hvae_source_mismatch():
+    args = SimpleNamespace(dataset="padchest")
+    with pytest.raises(ValueError, match="refusing implicit padding or truncation"):
+        _split_parent_vector(args, jnp.zeros((1, PAD_CHEST_HVAE_CONTEXT_DIM)))
+
+
+def test_padchest_context_adapter_reaches_context_22_hvae_without_changing_scm():
+    rngs = nnx.Rngs(0)
+    vae = HVAE(
+        input_channels=1, input_res=16,
+        enc_arch="16b1d2,8b1d2,4b1d2,2b1d2,1b1",
+        dec_arch="1b1,2b1,4b1,8b1,16b1", widths=[4, 8, 16, 32, 64],
+        z_dim=2, context_dim=PAD_CHEST_HVAE_CONTEXT_DIM, cond_prior=True,
+        q_correction=False, bias_max_res=16, rngs=rngs,
+    )
+    pgm = PadChestPGM(widths=(8, 8), rngs=rngs)
+    predictor = CxrImageParentPredictor(
+        variable_specs=PAD_CHEST_SCHEMA.variables, input_channels=1, input_res=16,
+        width=4, rngs=rngs,
+    )
+
+    def bundle(model, *state_types):
+        graphdef, *states = nnx.split(model, nnx.Param, *state_types)
+        return Bundle(graphdef, *(state.to_pure_dict() for state in states))
+
+    args = SimpleNamespace(dataset="padchest", input_res=16, context_dim=PAD_CHEST_HVAE_CONTEXT_DIM,
+                           alpha=0.1, damping=10.0, elbo_constraint=1.0, cf_particles=1)
+    source_pa = jnp.zeros((2, PAD_CHEST_SCHEMA.encoded_dim))
+    out = _cf_forward(
+        args, bundle(vae), bundle(pgm), bundle(predictor, nnx.BatchStat),
+        {"x": jnp.zeros((2, 16, 16, 1)), "pa": source_pa},
+        {"tb_status": jnp.ones((2, 1))}, jax.random.PRNGKey(0),
+        beta=1.0, alpha=0.1, lmbda=jnp.asarray(0.5), cf_particles=1, training=False,
+    )
+    assert jnp.isfinite(out["loss"])
+    assert out["cfs"]["pa"].shape == source_pa.shape
 
 
 def test_padchest_counterfactual_forward_and_loss():
