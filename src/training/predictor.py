@@ -26,7 +26,7 @@ from flax import nnx
 
 from contracts import CausalGraphSpec
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
-from config import ExperimentConfig, PredictorTrainingConfig
+from config import ExperimentConfig, PredictorTrainingConfig, resolve_causal_schema
 from data.morphomnist import morphomnist
 from data.padchest import padchest
 from utils import (
@@ -106,6 +106,7 @@ class PredictorRunArguments:
     save_dir: str = ""
     checkpoint_dir: str = ""
     remote_save_dir: str = ""
+    schema: Any = None
 
 
 
@@ -285,6 +286,16 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         freeze_backbone = False
     backbone_lr_scale = float(getattr(workflow, "backbone_lr_scale", 1.0))
     augment = getattr(config.dataset, "augment", True)
+    if config.dataset.name == "cxr_rait":
+        from data.cxr_rait import CXR_RAIT_SCHEMA
+        fallback_schema = CXR_RAIT_SCHEMA
+    elif config.dataset.name == "padchest":
+        from data.padchest import PAD_CHEST_SCHEMA
+        fallback_schema = PAD_CHEST_SCHEMA
+    else:
+        from data.morphomnist import MORPHOMNIST_SCHEMA
+        fallback_schema = MORPHOMNIST_SCHEMA
+    schema = resolve_causal_schema(config, fallback_schema)
     return PredictorRunArguments(
         accelerator=config.runtime.accelerator, gpu_id=config.runtime.gpu_id,
         precision=config.runtime.precision, exp_name=config.artifacts.run_name,
@@ -322,10 +333,13 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         augment=augment,
         type=workflow.type,
         predictor_model=workflow.predictor_model,
+        schema=schema,
     )
 
 
-def _schema_for_dataset(dataset: str) -> CausalGraphSpec:
+def _schema_for_dataset(dataset: str, configured: CausalGraphSpec | None = None) -> CausalGraphSpec:
+    if configured is not None:
+        return configured
     if dataset == "morphomnist":
         from data.morphomnist import MORPHOMNIST_SCHEMA
         return MORPHOMNIST_SCHEMA
@@ -341,13 +355,14 @@ def _schema_for_dataset(dataset: str) -> CausalGraphSpec:
 
 
 def _validate_scope(args: PredictorRunArguments) -> None:
-    _schema_for_dataset(args.dataset)
+    _schema_for_dataset(args.dataset, getattr(args, "schema", None))
     if args.accelerator == "cpu" and args.precision != "fp32":
         raise ValueError("CPU predictor training requires precision=fp32")
 
 
 def _configure_dataset_args(args: PredictorRunArguments) -> None:
-    schema = _schema_for_dataset(args.dataset)
+    schema = _schema_for_dataset(args.dataset, getattr(args, "schema", None))
+    args.schema = schema
     args.parents_x = list(schema.variable_names)
     args.context_norm, args.context_dim, args.concat_pa = "[-1,1]", schema.encoded_dim, False
 
@@ -860,7 +875,7 @@ def _predictor_model_family(args: PredictorRunArguments) -> str:
 
 def _build_predictor_model(args: PredictorRunArguments, dtype: jnp.dtype, logger: logging.Logger | None = None):
     family = _predictor_model_family(args)
-    schema = _schema_for_dataset(args.dataset)
+    schema = _schema_for_dataset(args.dataset, getattr(args, "schema", None))
     if family == "morphomnist":
         if args.dataset != "morphomnist":
             raise ValueError("The MorphoMNIST predictor can only be used with dataset=morphomnist")

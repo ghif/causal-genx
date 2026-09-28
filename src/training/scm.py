@@ -28,7 +28,7 @@ import optax
 from flax import nnx
 
 from causal.flow_scm import MorphoMNISTPGM
-from config import ExperimentConfig, ScmTrainingConfig
+from config import ExperimentConfig, ScmTrainingConfig, resolve_causal_schema
 from data.morphomnist import morphomnist
 from utils import (
     BackgroundArtifactWriter,
@@ -89,6 +89,7 @@ class ScmRunArguments:
     save_dir: str = ""
     checkpoint_dir: str = ""
     remote_save_dir: str = ""
+    schema: Any = None
 
 
 def output_dir(config: ExperimentConfig) -> Path:
@@ -112,6 +113,16 @@ def validate_artifacts(run_dir: str | Path) -> None:
 def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
     workflow = config.workflow
     assert isinstance(workflow, ScmTrainingConfig)
+    if config.dataset.name == "cxr_rait":
+        from data.cxr_rait import CXR_RAIT_SCHEMA
+        fallback_schema = CXR_RAIT_SCHEMA
+    elif config.dataset.name == "padchest":
+        from data.padchest import PAD_CHEST_SCHEMA
+        fallback_schema = PAD_CHEST_SCHEMA
+    else:
+        from data.morphomnist import MORPHOMNIST_SCHEMA
+        fallback_schema = MORPHOMNIST_SCHEMA
+    schema = resolve_causal_schema(config, fallback_schema)
     return ScmRunArguments(
         accelerator=config.runtime.accelerator,
         gpu_id=config.runtime.gpu_id,
@@ -136,6 +147,7 @@ def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
         plot_samples=workflow.plot_samples,
         widths=list(workflow.widths),
         benchmark_steps=workflow.benchmark_steps,
+        schema=schema,
     )
 
 
@@ -147,7 +159,9 @@ def _validate_scope(args: ScmRunArguments) -> None:
 
 
 def _configure_dataset_args(args: ScmRunArguments) -> None:
-    if args.dataset == "cxr_rait":
+    if getattr(args, "schema", None) is not None:
+        schema = args.schema
+    elif args.dataset == "cxr_rait":
         from data.cxr_rait import CXR_RAIT_SCHEMA
         schema = CXR_RAIT_SCHEMA
     elif args.dataset == "padchest":
@@ -156,6 +170,7 @@ def _configure_dataset_args(args: ScmRunArguments) -> None:
     else:
         schema = None
     if schema is not None:
+        args.schema = schema
         args.parents_x = list(schema.variable_names)
         args.context_norm = "[-1,1]"
         args.context_dim = schema.encoded_dim
@@ -511,7 +526,12 @@ def _log_epoch_summary(
 
 
 def _checkpoint_payload(args: ScmRunArguments, params: Any, ema: PGMEMA, opt_state: Any, epoch: int, step: int, best_loss: float) -> Dict[str, Any]:
-    return {"params": ema.params, "ema_params": ema.params, "model_params": params, "opt_state": opt_state, "epoch": epoch, "step": step, "best_loss": best_loss, "ema_step": ema.step, "ema_initted": ema.initted, "hparams": vars(args), "format_version": 2}
+    hparams = {key: value for key, value in vars(args).items() if key != "schema"}
+    if getattr(args, "schema", None) is not None:
+        hparams["causal_schema_version"] = args.schema.version
+        hparams["causal_schema_variables"] = list(args.schema.variable_names)
+        hparams["context_dim"] = args.schema.encoded_dim
+    return {"params": ema.params, "ema_params": ema.params, "model_params": params, "opt_state": opt_state, "epoch": epoch, "step": step, "best_loss": best_loss, "ema_step": ema.step, "ema_initted": ema.initted, "hparams": hparams, "format_version": 2}
 
 
 def _assert_compatible_checkpoint(checkpoint: Dict[str, Any], params: Any) -> None:
@@ -550,9 +570,13 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
         model = CxrRaitPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
     elif args.dataset == "padchest":
         from data.padchest import padchest
-        from causal.cxr_rait_scm import PadChestPGM
         datasets = padchest(args)
-        model = PadChestPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
+        if getattr(args.schema, "version", "1") == "2":
+            from causal.generic_scm import SchemaDrivenSCM
+            model = SchemaDrivenSCM(args.schema, widths=args.widths, rngs=nnx.Rngs(args.seed))
+        else:
+            from causal.cxr_rait_scm import PadChestPGM
+            model = PadChestPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
     else:
         datasets = morphomnist(args)
         model = MorphoMNISTPGM(widths=args.widths, rngs=nnx.Rngs(args.seed))
