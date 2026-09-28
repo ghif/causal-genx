@@ -7,7 +7,75 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt, model_validator
+
+
+class CausalVariableConfig(BaseModel):
+    """Typed YAML declaration for one arbitrary causal variable."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    name: str
+    kind: Literal["continuous", "binary", "categorical", "ordinal"]
+    encoded_dim: PositiveInt = 1
+    categories: tuple[str, ...] = ()
+    normalization: str | None = None
+    source: str | None = None
+    observed: bool = True
+    intervenable: bool = True
+
+    @model_validator(mode="after")
+    def validate_encoding(self):
+        if self.kind in {"continuous", "binary"} and self.encoded_dim != 1:
+            raise ValueError(f"{self.name}: {self.kind} variables require encoded_dim=1")
+        if self.kind == "categorical" and self.encoded_dim < 2:
+            raise ValueError(f"{self.name}: categorical variables require encoded_dim>=2")
+        if self.categories and len(self.categories) != self.encoded_dim:
+            raise ValueError(f"{self.name}: categories must match encoded_dim")
+        if len(self.categories) != len(set(self.categories)):
+            raise ValueError(f"{self.name}: categories must be unique")
+        return self
+
+
+class CausalSchemaConfig(BaseModel):
+    """Typed, schema-driven causal graph section of an experiment YAML.
+
+    String variable entries are retained for the legacy MorphoMNIST,
+    CXR-RAIT, and PadChest configurations. New schemas should use the typed
+    object form so kind and encoding are explicit.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    version: str = "1"
+    variables: list[str | CausalVariableConfig] = Field(default_factory=list)
+    edges: list[tuple[str, str]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_graph(self):
+        names = [item if isinstance(item, str) else item.name for item in self.variables]
+        if len(names) != len(set(names)):
+            raise ValueError("causal_schema variables must have unique names")
+        known = set(names)
+        if any(parent not in known or child not in known for parent, child in self.edges):
+            raise ValueError("causal_schema edges must reference declared variables")
+        if any(parent == child for parent, child in self.edges):
+            raise ValueError("causal_schema edges cannot contain self-loops")
+        pending = {name: 0 for name in names}
+        children = {name: [] for name in names}
+        for parent, child in self.edges:
+            pending[child] += 1
+            children[parent].append(child)
+        ready = [name for name in names if pending[name] == 0]
+        visited = 0
+        while ready:
+            name = ready.pop()
+            visited += 1
+            for child in children[name]:
+                pending[child] -= 1
+                if pending[child] == 0:
+                    ready.append(child)
+        if visited != len(names):
+            raise ValueError("causal_schema edges must form a directed acyclic graph")
+        return self
 
 
 class DatasetConfig(BaseModel):
@@ -39,7 +107,7 @@ class RuntimeConfig(BaseModel):
 
 class ModelConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="allow")
-    name: Literal["hierarchical_vae", "simple_vae"] = "hierarchical_vae"
+    name: Literal["hierarchical_vae", "simple_vae", "padchest_scm"] = "hierarchical_vae"
     context_dim: PositiveInt = 12
     cond_prior: bool = False
     enc_arch: str = "32b3d2,16b3d2,8b3d2,4b3d4,1b4"
@@ -216,9 +284,21 @@ class ExperimentConfig(BaseModel):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     artifacts: ArtifactConfig = Field(default_factory=ArtifactConfig)
-    causal_schema: dict[str, Any] = Field(default_factory=dict)
+    causal_schema: CausalSchemaConfig | None = None
     optimizer: OptimizerConfig
     workflow: WorkflowConfig
+
+    @model_validator(mode="after")
+    def validate_typed_context(self):
+        if self.causal_schema and self.causal_schema.variables and all(
+            isinstance(item, CausalVariableConfig) for item in self.causal_schema.variables
+        ):
+            encoded_dim = sum(int(item.encoded_dim) for item in self.causal_schema.variables)
+            if self.model.context_dim != encoded_dim:
+                raise ValueError(
+                    f"model.context_dim={self.model.context_dim} does not match causal_schema encoded_dim={encoded_dim}"
+                )
+        return self
 
 
 def load_experiment(path: str | Path, overrides: list[str] | None = None) -> ExperimentConfig:
@@ -239,3 +319,63 @@ def load_experiment(path: str | Path, overrides: list[str] | None = None) -> Exp
                 raise ValueError(f"Cannot override non-object config path {path!r}")
         target[parts[-1]] = yaml.safe_load(value)
     return ExperimentConfig.model_validate(raw)
+
+
+def resolve_causal_schema(config: ExperimentConfig, fallback):
+    """Resolve a typed YAML schema, retaining legacy dataset defaults.
+
+    Existing configs list variable names only; their dataset providers remain
+    authoritative for kinds and encodings. A fully typed declaration may
+    describe any supported mixed schema and is converted to the shared
+    ``CausalGraphSpec`` contract.
+    """
+    from contracts import CausalGraphSpec, VariableKind, VariableSpec
+
+    declared = config.causal_schema
+    if declared is None or not declared.variables:
+        return fallback
+    if all(isinstance(item, str) for item in declared.variables):
+        names = tuple(declared.variables)
+        if names == fallback.variable_names:
+            return CausalGraphSpec(
+                dataset_id=fallback.dataset_id,
+                variables=fallback.variables,
+                edges=tuple(declared.edges) if declared.edges else fallback.edges,
+                version=declared.version,
+            )
+        # PadChest v2 has a stable shorthand because its six encodings are a
+        # published dataset contract. Other arbitrary schemas must be typed.
+        if config.dataset.name == "padchest":
+            from data.padchest import PAD_CHEST_V2_SCHEMA
+            if names == PAD_CHEST_V2_SCHEMA.variable_names:
+                return CausalGraphSpec(
+                    dataset_id=PAD_CHEST_V2_SCHEMA.dataset_id,
+                    variables=PAD_CHEST_V2_SCHEMA.variables,
+                    edges=tuple(declared.edges) if declared.edges else PAD_CHEST_V2_SCHEMA.edges,
+                    version=declared.version,
+                )
+        raise ValueError(
+            "String causal_schema variables are only supported for a legacy dataset schema or PadChest v2; "
+            "declare kind and encoded_dim for arbitrary variables"
+        )
+    if any(isinstance(item, str) for item in declared.variables):
+        raise ValueError("causal_schema.variables must use either all names or all typed objects")
+    variables = tuple(
+        VariableSpec(
+            item.name,
+            VariableKind(item.kind),
+            encoded_dim=int(item.encoded_dim),
+            categories=tuple(item.categories),
+            normalization=item.normalization,
+            source=item.source,
+            observed=item.observed,
+            intervenable=item.intervenable,
+        )
+        for item in declared.variables
+    )
+    return CausalGraphSpec(
+        dataset_id=config.dataset.name,
+        variables=variables,
+        edges=tuple(declared.edges),
+        version=declared.version,
+    )

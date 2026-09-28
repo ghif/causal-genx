@@ -9,18 +9,20 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any
 
-from config import CounterfactualTrainingConfig, ExperimentConfig, ImageModelTrainingConfig
+from config import CounterfactualTrainingConfig, ExperimentConfig, ImageModelTrainingConfig, resolve_causal_schema
 from data.morphomnist import MORPHOMNIST_SCHEMA
 from data.cxr_rait import CXR_RAIT_SCHEMA
 from data.padchest import PAD_CHEST_SCHEMA
 
 
-def _get_schema(dataset_name: str):
+def _get_schema(dataset_name: str, config: ExperimentConfig | None = None):
     if dataset_name == "cxr_rait":
-        return CXR_RAIT_SCHEMA
-    if dataset_name == "padchest":
-        return PAD_CHEST_SCHEMA
-    return MORPHOMNIST_SCHEMA
+        fallback = CXR_RAIT_SCHEMA
+    elif dataset_name == "padchest":
+        fallback = PAD_CHEST_SCHEMA
+    else:
+        fallback = MORPHOMNIST_SCHEMA
+    return resolve_causal_schema(config, fallback) if config is not None else fallback
 
 
 @dataclass
@@ -93,6 +95,7 @@ class ImageModelSettings:
     save_dir: str = ""
     checkpoint_dir: str = ""
     remote_save_dir: str = ""
+    schema: Any = None
 
     def update_from_checkpoint(self, values: dict[str, Any], *, exclude: set[str] = frozenset()) -> None:
         """Apply only known model settings from a resumed artifact's metadata."""
@@ -128,7 +131,7 @@ class CounterfactualSettings(ImageModelSettings):
 def image_model_settings(config: ExperimentConfig) -> ImageModelSettings:
     workflow = config.workflow
     assert isinstance(workflow, ImageModelTrainingConfig)
-    schema = _get_schema(config.dataset.name)
+    schema = _get_schema(config.dataset.name, config)
     return ImageModelSettings(
         accelerator=config.runtime.accelerator, precision=config.runtime.precision, dataset=config.dataset.name,
         data_dir=config.dataset.root, ckpt_dir=config.artifacts.root, remote_ckpt_dir=config.artifacts.remote_root,
@@ -153,6 +156,7 @@ def image_model_settings(config: ExperimentConfig) -> ImageModelSettings:
         metadata=config.dataset.metadata, image_prefix=config.dataset.image_prefix,
         tb_label_mode=config.dataset.tb_label_mode,
         excluded_sources=list(config.dataset.excluded_sources or []),
+        schema=schema,
         input_stage_mode=getattr(workflow, "input_stage_mode", "auto"),
         input_stage_dir=getattr(workflow, "input_stage_dir", ""),
         input_stage_manifest=getattr(workflow, "input_stage_manifest", ""),
@@ -193,7 +197,7 @@ def counterfactual_settings(config: ExperimentConfig) -> CounterfactualSettings:
 def image_model_settings_for_counterfactual(config: ExperimentConfig) -> dict[str, Any]:
     workflow = config.workflow
     assert isinstance(workflow, CounterfactualTrainingConfig)
-    schema = _get_schema(config.dataset.name)
+    schema = _get_schema(config.dataset.name, config)
     return dict(
         accelerator=config.runtime.accelerator, precision=config.runtime.precision, dataset=config.dataset.name,
         data_dir=config.dataset.root, ckpt_dir=config.artifacts.root, remote_ckpt_dir=config.artifacts.remote_root,
@@ -216,6 +220,7 @@ def image_model_settings_for_counterfactual(config: ExperimentConfig) -> dict[st
         metadata=config.dataset.metadata, image_prefix=config.dataset.image_prefix,
         tb_label_mode=config.dataset.tb_label_mode,
         excluded_sources=list(config.dataset.excluded_sources or []),
+        schema=schema,
         input_stage_mode=getattr(workflow, "input_stage_mode", "auto"),
         input_stage_dir=getattr(workflow, "input_stage_dir", ""),
         input_stage_manifest=getattr(workflow, "input_stage_manifest", ""),

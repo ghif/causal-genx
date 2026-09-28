@@ -22,6 +22,7 @@ import numpy as np
 from PIL import Image
 
 from contracts import Batch, CausalGraphSpec, DatasetSpec, ImageSpec, VariableKind, VariableSpec
+from data.metadata import MetadataEncoder
 from utils import normalize
 
 PAD_CHEST_SCHEMA = CausalGraphSpec(
@@ -37,6 +38,22 @@ PAD_CHEST_SCHEMA = CausalGraphSpec(
         VariableSpec("study_year", VariableKind.CONTINUOUS, normalization="[-1,1]"),
     ),
     edges=(("age_at_study", "tb_status"), ("sex", "tb_status"), ("pediatric", "tb_status")),
+)
+
+PAD_CHEST_V2_AGE_GROUPS = ("0-4", "5-17", "18-39", "40-64", "65+")
+PAD_CHEST_V2_SCANNERS = ("ImagingDynamicsCompanyLtd", "PhilipsMedicalSystems")
+PAD_CHEST_V2_SCHEMA = CausalGraphSpec(
+    dataset_id="padchest",
+    version="2",
+    variables=(
+        VariableSpec("age_group", VariableKind.CATEGORICAL, encoded_dim=5, categories=PAD_CHEST_V2_AGE_GROUPS),
+        VariableSpec("sex", VariableKind.CATEGORICAL, encoded_dim=2, categories=("non_m_or_unknown", "M")),
+        VariableSpec("tb_status", VariableKind.BINARY),
+        VariableSpec("projection", VariableKind.CATEGORICAL, encoded_dim=5, categories=("PA", "AP", "AP_horizontal", "L", "COSTAL")),
+        VariableSpec("view_position", VariableKind.CATEGORICAL, encoded_dim=6, categories=("POSTEROANTERIOR", "ANTEROPOSTERIOR", "LATERAL", "AP", "PA", "OTHER")),
+        VariableSpec("scanner", VariableKind.CATEGORICAL, encoded_dim=2, categories=PAD_CHEST_V2_SCANNERS),
+    ),
+    edges=(("age_group", "tb_status"), ("sex", "tb_status")),
 )
 
 AGE_AT_STUDY_MIN = 0.0
@@ -58,6 +75,7 @@ _VIEWS = VIEW_POSITIONS
 PAD_CHEST_SOURCE_CONTEXT_DIM = PAD_CHEST_SCHEMA.encoded_dim
 PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM = 5
 PAD_CHEST_HVAE_CONTEXT_DIM = PAD_CHEST_SOURCE_CONTEXT_DIM + PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM
+PAD_CHEST_V2_CONTEXT_DIM = PAD_CHEST_V2_SCHEMA.encoded_dim
 
 
 def adapt_padchest_hvae_context(pa: np.ndarray, *, target_dim: int) -> np.ndarray:
@@ -381,8 +399,12 @@ def _as_list(value: str) -> list[str]:
 
 
 def _category(value: str, choices: tuple[str, ...], fallback: str) -> int:
-    value = str(value or "").strip().upper()
-    return choices.index(value) if value in choices else choices.index(fallback)
+    normalized = str(value or "").strip().upper()
+    normalized_choices = {str(choice).upper(): index for index, choice in enumerate(choices)}
+    fallback_index = normalized_choices.get(str(fallback).upper())
+    if fallback_index is None:
+        raise ValueError(f"Fallback {fallback!r} is not present in category choices")
+    return normalized_choices.get(normalized, fallback_index)
 
 
 @functools.lru_cache(maxsize=4)
@@ -410,6 +432,108 @@ def _derive(row: Mapping[str, str], tb_label_mode: str) -> dict[str, Any]:
         "projection": np.eye(len(_PROJECTIONS), dtype=np.float32)[_category(row.get("Projection", ""), _PROJECTIONS, "PA")],
         "view_position": np.eye(len(_VIEWS), dtype=np.float32)[_category(row.get("ViewPosition_DICOM", ""), _VIEWS, "OTHER")],
         "study_year": normalize(np.asarray([year], dtype=np.float32), x_min=STUDY_YEAR_MIN, x_max=STUDY_YEAR_MAX)[0],
+    }
+
+
+def _padchest_age(study_date: str, patient_birth: Any) -> tuple[float, int]:
+    date = str(study_date or "")
+    year = int(date[:4]) if date[:4].isdigit() else 2014
+    try:
+        birth = float(str(patient_birth).strip())
+    except (TypeError, ValueError):
+        birth = float(year - 45)
+    return float(np.clip(year - birth, 0.0, 110.0)), year
+
+
+def derive_padchest_age_group(study_date: str, patient_birth: Any) -> str:
+    """Derive the v2 age group with explicit inclusive boundaries."""
+    age, _ = _padchest_age(study_date, patient_birth)
+    if age <= 4:
+        return PAD_CHEST_V2_AGE_GROUPS[0]
+    if age <= 17:
+        return PAD_CHEST_V2_AGE_GROUPS[1]
+    if age <= 39:
+        return PAD_CHEST_V2_AGE_GROUPS[2]
+    if age <= 64:
+        return PAD_CHEST_V2_AGE_GROUPS[3]
+    return PAD_CHEST_V2_AGE_GROUPS[4]
+
+
+def derive_padchest_v2_row(
+    row: Mapping[str, str], tb_label_mode: str = "tb_or_sequelae", *, strict_scanner: bool = True
+) -> dict[str, Any]:
+    """Derive the six encoded v2 variables without reading an image.
+
+    Scanner values are intentionally not collapsed into a majority class. A
+    missing or unsupported manufacturer raises in strict mode so an audit can
+    quantify the problem before training.
+    """
+    age, year = _padchest_age(row.get("StudyDate_DICOM", ""), row.get("PatientBirth", ""))
+    age_group = derive_padchest_age_group(row.get("StudyDate_DICOM", ""), row.get("PatientBirth", ""))
+    labels = set(_as_list(row.get("Labels", "")))
+    tb = "tuberculosis" in labels if tb_label_mode == "tb_only" else bool(labels.intersection({"tuberculosis", "tuberculosis sequelae"}))
+    sex = 1 if str(row.get("PatientSex_DICOM", "")).strip().upper() == "M" else 0
+    scanner = str(row.get("Manufacturer_DICOM", "")).strip()
+    if scanner not in PAD_CHEST_V2_SCANNERS:
+        if strict_scanner:
+            raise ValueError(f"Unknown PadChest v2 scanner manufacturer: {scanner!r}")
+        scanner = PAD_CHEST_V2_SCANNERS[0]
+    return {
+        "age_group": np.eye(5, dtype=np.float32)[PAD_CHEST_V2_AGE_GROUPS.index(age_group)],
+        "sex": np.eye(2, dtype=np.float32)[sex],
+        "tb_status": np.asarray([1.0 if tb else 0.0], dtype=np.float32),
+        "projection": np.eye(5, dtype=np.float32)[_category(row.get("Projection", ""), PROJECTIONS, "PA")],
+        "view_position": np.eye(6, dtype=np.float32)[_category(row.get("ViewPosition_DICOM", ""), VIEW_POSITIONS, "OTHER")],
+        "scanner": np.eye(2, dtype=np.float32)[PAD_CHEST_V2_SCANNERS.index(scanner)],
+        "_audit": {
+            "age": age,
+            "study_year": year,
+            "source_pediatric": str(row.get("Pediatric", "")).strip().upper() == "PED",
+            "derived_pediatric": age < 18.0,
+            "pediatric_disagreement": (str(row.get("Pediatric", "")).strip().upper() == "PED") != (age < 18.0),
+            "scanner_unknown": str(row.get("Manufacturer_DICOM", "")).strip() not in PAD_CHEST_V2_SCANNERS,
+        },
+    }
+
+
+# Public aliases make the derivation hook easy to use from audits and tests.
+derive_padchest_v2 = derive_padchest_v2_row
+# Short hook name used by generic metadata callers.
+derive_padchest_row = derive_padchest_v2_row
+
+
+def audit_padchest_v2_rows(rows: Sequence[Mapping[str, str]], tb_label_mode: str = "tb_or_sequelae") -> dict[str, Any]:
+    """Return support and pediatric/scanner disagreement diagnostics."""
+    counts = {name: {category: 0 for category in categories} for name, categories in {
+        "age_group": PAD_CHEST_V2_AGE_GROUPS,
+        "scanner": PAD_CHEST_V2_SCANNERS,
+    }.items()}
+    counts["sex"] = {"non_m_or_unknown": 0, "M": 0}
+    counts["tb_status"] = {"0": 0, "1": 0}
+    unknown_scanners = 0
+    unknown_scanner_values: dict[str, int] = {}
+    pediatric_disagreements = 0
+    for row in rows:
+        derived = derive_padchest_v2_row(row, tb_label_mode, strict_scanner=False)
+        audit = derived.pop("_audit")
+        counts["age_group"][PAD_CHEST_V2_AGE_GROUPS[int(np.argmax(derived["age_group"]))]] += 1
+        counts["scanner"][PAD_CHEST_V2_SCANNERS[int(np.argmax(derived["scanner"]))]] += 1
+        counts["sex"]["M" if int(np.argmax(derived["sex"])) else "non_m_or_unknown"] += 1
+        counts["tb_status"][str(int(derived["tb_status"][0]))] += 1
+        unknown_scanners += int(audit["scanner_unknown"])
+        if audit["scanner_unknown"]:
+            raw_scanner = str(row.get("Manufacturer_DICOM", "")).strip()
+            unknown_scanner_values[raw_scanner] = unknown_scanner_values.get(raw_scanner, 0) + 1
+        pediatric_disagreements += int(audit["pediatric_disagreement"])
+    return {
+        "rows": len(rows),
+        "counts": counts,
+        "age_group_counts": counts["age_group"],
+        "scanner_counts": counts["scanner"],
+        "unknown_scanner_count": unknown_scanners,
+        "unknown_scanners": unknown_scanner_values,
+        "pediatric_disagreement_count": pediatric_disagreements,
+        "pediatric": {"disagreements": pediatric_disagreements},
     }
 
 
@@ -476,6 +600,7 @@ class PadChestDataset:
         stage_mode: str = "auto",
         excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
         concat_pa: bool = True,
+        schema: CausalGraphSpec | None = None,
     ):
         rows = _read_rows(metadata)
         groups: dict[str, list[tuple[int, dict[str, str]]]] = {}
@@ -484,6 +609,7 @@ class PadChestDataset:
         selected = _split_patients(tuple(groups), seed)[split]
         selected_rows = [(row_index, row) for patient in selected for row_index, row in groups[patient] if row.get("ImageID")]
         self.root, self.image_prefix, self.input_res, self.tb_label_mode = root, image_prefix, input_res, tb_label_mode
+        self.schema = schema or PAD_CHEST_SCHEMA
         self.stage_dir = stage_dir
         self.stage_manifest = stage_manifest or (_default_stage_manifest(stage_dir) if stage_dir else "")
         self.stage_mode = stage_mode
@@ -525,14 +651,20 @@ class PadChestDataset:
                     raise RuntimeError(
                         f"input_stage_mode=require but staged image path {first_staged!r} is not a valid file on disk."
                     )
-        self._metadata = [_derive(row, tb_label_mode) for row in self.rows]
+        if self.schema.version == "2" and self.schema.variable_names == PAD_CHEST_V2_SCHEMA.variable_names:
+            derive = lambda row: derive_padchest_v2_row(row, tb_label_mode)
+        elif self.schema.version == "1" and self.schema.variable_names == PAD_CHEST_SCHEMA.variable_names:
+            derive = lambda row: _derive(row, tb_label_mode)
+        else:
+            derive = MetadataEncoder(self.schema)
+        self._metadata = [derive(row) for row in self.rows]
         self.samples = {
             spec.name: (
                 np.stack([np.asarray(metadata[spec.name]) for metadata in self._metadata]).astype(np.float32)
                 if self._metadata
                 else np.empty((0, spec.encoded_dim), dtype=np.float32)
             )
-            for spec in PAD_CHEST_SCHEMA.variables
+            for spec in self.schema.variables
         }
         self.min_max = {"age_at_study": (AGE_AT_STUDY_MIN, AGE_AT_STUDY_MAX), "study_year": (STUDY_YEAR_MIN, STUDY_YEAR_MAX)}
         self.cache_fingerprint = hashlib.sha256(
@@ -585,7 +717,7 @@ class PadChestDataset:
         sample = {"x": images, **variables}
         if self.concat_pa:
             parts = []
-            for spec in PAD_CHEST_SCHEMA.variables:
+            for spec in self.schema.variables:
                 v = variables[spec.name]
                 if v.ndim == 1:
                     v = v[:, None]
@@ -613,8 +745,10 @@ class PadChestProvider:
         stage_mode: str = "auto",
         excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
         concat_pa: bool = True,
+        schema: CausalGraphSpec | None = None,
     ):
         self.root, self.input_res, self.pad, self.context_norm = root, input_res, pad, context_norm
+        self.schema = schema or PAD_CHEST_SCHEMA
         self.metadata = metadata or f"{root.rstrip('/')}/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv"
         self.image_prefix = image_prefix or f"{root.rstrip('/')}/images-224"
         self.tb_label_mode, self.seed = tb_label_mode, seed
@@ -640,6 +774,7 @@ class PadChestProvider:
             stage_mode=self.stage_mode,
             excluded_sources=self.excluded_sources,
             concat_pa=self.concat_pa,
+            schema=self.schema,
         )
 
     def make_batch(self, split: str, indices: Sequence[int], *, rng=None, training: bool = False) -> Batch:
@@ -911,6 +1046,7 @@ def padchest(settings) -> dict[str, PadChestDataset]:
         getattr(settings, "tb_label_mode", "tb_or_sequelae"),
         settings.seed,
         concat_pa=getattr(settings, "concat_pa", True),
+        schema=getattr(settings, "schema", None),
         **_stage_settings(settings),
     )
     return {split: provider.load_split(split) for split in ("train", "valid", "test")}
