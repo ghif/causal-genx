@@ -30,6 +30,28 @@ python scripts/run.py train-image-model \
 All researcher-facing operations use one entrypoint, `scripts/run.py`. Configs
 are standalone YAML files; append `section.key=value` to override a setting.
 
+### PadChest image sampling
+
+The PadChest inference stage accepts named causal parents, categorical indices
+for `sex`, `projection`, and `view_position`, and emits multiple stochastic
+samples. The context-17 checkpoint can be sampled with:
+
+```bash
+PYTHONPATH=src python scripts/run.py infer \
+  --config configs/padchest_inference_context17.yaml
+```
+
+Override causal values or latent temperature without editing the config:
+
+```bash
+PYTHONPATH=src python scripts/run.py infer \
+  --config configs/padchest_inference_context17.yaml \
+  workflow.parents.tb_status=0 workflow.parents.sex=0 \
+  workflow.num_samples=8 workflow.latent_temperature=0.7
+```
+
+Samples are written under `checkpoints/padchest/padchest_context17_samples/inference`.
+
 ## Research workflow
 
 Run the stages in this order for a new MorphoMNIST experiment:

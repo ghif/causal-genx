@@ -21,6 +21,7 @@ from PIL import Image
 
 from config import ExperimentConfig, InferenceConfig
 from data.morphomnist import MORPHOMNIST_SCHEMA
+from data.padchest import adapt_padchest_hvae_context
 from models.image_vae import HVAE, SimpleVAE
 from utils import (
     checkpoint_root_dir,
@@ -35,6 +36,8 @@ from utils import (
 
 
 def output_dir(config: ExperimentConfig) -> str:
+    if isinstance(config.workflow, InferenceConfig) and config.workflow.output_dir:
+        return config.workflow.output_dir
     return os.path.join(experiment_run_dir(config.artifacts.root, config.dataset.name, config.artifacts.run_name, "inference"), "inference")
 
 
@@ -88,8 +91,32 @@ def _input_image(path: str, input_res: int, channels: int) -> jax.Array:
     return jnp.asarray((values - 127.5) / 127.5)
 
 
-def _parents(values: dict[str, Any], context_dim: int) -> jax.Array:
-    """Encode named MorphoMNIST values in the schema's stable parent order."""
+def _categorical(value: Any, size: int, name: str) -> jax.Array:
+    if isinstance(value, (list, tuple)):
+        vector = jnp.asarray(value, dtype=jnp.float32)
+        if vector.shape != (size,):
+            raise ValueError(f"{name} must be an index or a one-hot vector of length {size}")
+        return vector
+    index = int(value)
+    if index < 0 or index >= size:
+        raise ValueError(f"{name} index must be in [0, {size})")
+    return jax.nn.one_hot(index, size, dtype=jnp.float32)
+
+
+def _parents(values: dict[str, Any], context_dim: int, dataset: str = "morphomnist") -> jax.Array:
+    """Encode named dataset values in the schema's stable parent order."""
+    if dataset == "padchest":
+        parts = [
+            jnp.asarray([float(values.get("age_at_study", 0.0))], dtype=jnp.float32),
+            _categorical(values.get("sex", 0), 2, "sex"),
+            jnp.asarray([float(values.get("pediatric", 0.0))], dtype=jnp.float32),
+            jnp.asarray([float(values.get("tb_status", 0.0))], dtype=jnp.float32),
+            _categorical(values.get("projection", 0), 5, "projection"),
+            _categorical(values.get("view_position", 0), 6, "view_position"),
+            jnp.asarray([float(values.get("study_year", 0.0))], dtype=jnp.float32),
+        ]
+        result = adapt_padchest_hvae_context(jnp.concatenate(parts)[None, :], target_dim=context_dim)
+        return result
     encoded = []
     for variable in MORPHOMNIST_SCHEMA.variables:
         value = values.get(variable.name, 0)
@@ -124,19 +151,25 @@ def run(config: ExperimentConfig) -> str:
         raise ValueError(f"Image-model checkpoint at {resolved} has no EMA parameters")
     model = nnx.merge(graphdef, nnx.State(weights)); model.eval()
     x = _input_image(workflow.image_path, metadata["input_res"], metadata["input_channels"])
-    parents = _parents(workflow.parents, metadata["context_dim"])
+    parents = _parents(workflow.parents, metadata["context_dim"], config.dataset.name)
+    parents = jnp.repeat(parents, workflow.num_samples, axis=0)
     # ELBO diagnostics use the supplied image; the decoder mean is the preview.
-    output = model(x, parents, beta=workflow.beta, rng=jax.random.PRNGKey(config.seed), training=False)
-    reconstruction, _ = model.likelihood.sample(
-        model.decoder(parents=parents, rng=jax.random.PRNGKey(config.seed), training=False)[0], return_loc=True
+    output = model(x, parents[:1], beta=workflow.beta, rng=jax.random.PRNGKey(config.seed), training=False)
+    reconstruction, _ = model.sample(
+        parents, return_loc=False, t=workflow.latent_temperature,
+        rng=jax.random.PRNGKey(config.seed),
     )
     directory = output_dir(config); ensure_dir(directory)
-    preview = postprocess(np.asarray(reconstruction[0]));
-    if preview.ndim == 3 and preview.shape[-1] == 1: preview = preview[..., 0]
-    preview_path = os.path.join(directory, f"preview-step-{resolved.rsplit('/', 1)[-1]}.png")
-    imageio.imwrite(preview_path, preview)
-    summary = {"checkpoint": checkpoint_root, "resolved_checkpoint": resolved, "preview": preview_path,
+    preview_paths = []
+    for index, image in enumerate(np.asarray(reconstruction)):
+        rendered = postprocess(image)
+        if rendered.ndim == 3 and rendered.shape[-1] == 1: rendered = rendered[..., 0]
+        path = os.path.join(directory, f"sample-{index:03d}-step-{resolved.rsplit('/', 1)[-1]}.png")
+        imageio.imwrite(path, rendered)
+        preview_paths.append(path)
+    summary = {"checkpoint": checkpoint_root, "resolved_checkpoint": resolved, "previews": preview_paths,
                "input_shape": list(x.shape), "parents": workflow.parents,
+               "num_samples": workflow.num_samples, "latent_temperature": workflow.latent_temperature,
                "elbo": float(output["elbo"]), "nll": float(output["nll"]), "kl": float(output["kl"])}
     with open(os.path.join(directory, "inference.json"), "w", encoding="utf-8") as handle: json.dump(summary, handle, indent=2, sort_keys=True)
     print(json.dumps(summary, sort_keys=True))
