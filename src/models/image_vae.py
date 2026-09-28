@@ -564,7 +564,8 @@ class DGaussNet(nnx.Module):
             loc, logscale = self.__call__(h)
         else:
             loc, logscale = self.__call__(h, None, t=t)
-            rng = rng or jax.random.PRNGKey(0)
+            if rng is None:
+                rng = jax.random.PRNGKey(0)
             loc = loc + jnp.exp(logscale) * jax.random.normal(rng, loc.shape)
         return jnp.clip(loc, -1.0, 1.0), jnp.exp(logscale)
 

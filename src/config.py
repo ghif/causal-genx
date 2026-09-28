@@ -196,6 +196,9 @@ class InferenceConfig(BaseModel):
     image_path: str = ""
     parents: dict[str, Any] = Field(default_factory=lambda: {"thickness": 0.0, "intensity": 0.0, "digit": 0})
     beta: float = 1.0
+    num_samples: PositiveInt = 1
+    latent_temperature: float = 1.0
+    output_dir: str = ""
     trust_incomplete_checkpoint: bool = False
 
 
