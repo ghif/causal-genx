@@ -29,7 +29,13 @@ from config import CounterfactualTrainingConfig, ExperimentConfig
 from contracts import CausalGraphSpec, VariableKind
 from data.cxr_rait import CXR_RAIT_SCHEMA, cxr_rait
 from data.morphomnist import MORPHOMNIST_SCHEMA, morphomnist
-from data.padchest import PAD_CHEST_SCHEMA, padchest
+from data.padchest import (
+    PAD_CHEST_HVAE_CONTEXT_DIM,
+    PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM,
+    PAD_CHEST_SCHEMA,
+    PAD_CHEST_SOURCE_CONTEXT_DIM,
+    padchest,
+)
 from models.image_vae import HVAE
 from .counterfactual_support import (
     clip_counterfactual_grads,
@@ -185,6 +191,13 @@ def _parent_slices(args) -> dict[str, slice]:
 
 
 def _split_parent_vector(args, pa: jax.Array) -> dict[str, jax.Array]:
+    expected_dim = _schema_for_args(args).encoded_dim
+    actual_dim = int(pa.shape[-1])
+    if actual_dim != expected_dim:
+        raise ValueError(
+            f"{args.dataset} causal parent vector has dimension {actual_dim}, "
+            f"expected {expected_dim}; refusing implicit padding or truncation"
+        )
     return {name: pa[:, slc] for name, slc in _parent_slices(args).items()}
 
 
@@ -417,8 +430,49 @@ def _load_checkpoint_hparams(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def _expand_parents(pa: jax.Array, input_res: int) -> jax.Array:
+def _preprocess_counterfactual_batch(args, raw_batch):
+    """Keep SCM/predictor batches causal, adapting only at the HVAE boundary."""
+    source_args = copy.copy(args)
+    source_args.context_dim = _schema_for_args(args).encoded_dim
+    return preprocess_batch(source_args, raw_batch, compact_pa=True)
+
+
+def _hvae_context(args, pa: jax.Array, target_dim: int) -> jax.Array:
+    if args.dataset != "padchest":
+        if int(pa.shape[-1]) != int(target_dim):
+            raise ValueError(
+                "Parent encoding dimension does not match the HVAE context: "
+                f"expected {target_dim}, got {pa.shape[-1]}"
+            )
+        return pa
+    if int(pa.shape[-1]) != PAD_CHEST_SOURCE_CONTEXT_DIM:
+        raise ValueError(
+            f"PadChest causal context must have dimension {PAD_CHEST_SOURCE_CONTEXT_DIM}, got {pa.shape[-1]}"
+        )
+    if int(target_dim) == PAD_CHEST_SOURCE_CONTEXT_DIM:
+        return pa
+    if int(target_dim) != PAD_CHEST_HVAE_CONTEXT_DIM:
+        raise ValueError(
+            "Unsupported PadChest HVAE context dimension: "
+            f"expected {PAD_CHEST_SOURCE_CONTEXT_DIM} or {PAD_CHEST_HVAE_CONTEXT_DIM}, got {target_dim}"
+        )
+    extension = jnp.zeros(
+        pa.shape[:-1] + (PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM,), dtype=pa.dtype
+    )
+    return jnp.concatenate((pa, extension), axis=-1)
+
+
+def _expand_parents(pa: jax.Array, input_res: int, *, expected_dim: int | None = None) -> jax.Array:
+    if pa.ndim not in (2, 4):
+        raise ValueError(f"Parent encoding must be [N,C] or [N,H,W,C], got shape {pa.shape}")
+    if expected_dim is not None and int(pa.shape[-1]) != int(expected_dim):
+        raise ValueError(
+            "Parent encoding dimension does not match the HVAE context: "
+            f"expected {expected_dim}, got {pa.shape[-1]}"
+        )
     if pa.ndim == 4:
+        if pa.shape[1] != input_res or pa.shape[2] != input_res:
+            raise ValueError(f"Spatial parent encoding must be {input_res}x{input_res}, got {pa.shape[1:3]}")
         return pa
     return pa[:, None, None, :].repeat(input_res, axis=1).repeat(input_res, axis=2)
 
@@ -461,9 +515,31 @@ def _make_intervention(
     return {do_k: jnp.asarray(value)}
 
 
+def _validate_artifact_contract(args, name: str, hparams: Dict[str, Any], *, context_dim: int) -> None:
+    schema = _schema_for_args(args)
+    found_dataset = hparams.get("dataset", hparams.get("dataset_id"))
+    if found_dataset is not None and found_dataset != schema.dataset_id:
+        raise ValueError(f"{name} checkpoint dataset mismatch: expected {schema.dataset_id!r}, found {found_dataset!r}")
+    found_parents = hparams.get("parents_x")
+    if found_parents is not None and list(found_parents) != list(schema.variable_names):
+        raise ValueError(
+            f"{name} checkpoint parent schema mismatch: expected {list(schema.variable_names)!r}, found {list(found_parents)!r}"
+        )
+    found_context = hparams.get("context_dim")
+    if found_context is None or int(found_context) != int(context_dim):
+        raise ValueError(
+            f"{name} checkpoint context_dim mismatch: expected {context_dim}, found {found_context!r}; "
+            "checkpoint and context contract are incompatible"
+        )
+    found_res = hparams.get("input_res")
+    if found_res is not None and int(found_res) != int(args.input_res):
+        raise ValueError(f"{name} checkpoint input_res mismatch: expected {args.input_res}, found {found_res}")
+
+
 def _load_vae_bundle(args):
     """Restore the frozen pretrained image mechanism and its checkpoint metadata."""
     vae_hparams = _load_checkpoint_hparams(args.vae_path)
+    _validate_artifact_contract(args, "VAE", vae_hparams, context_dim=int(args.context_dim))
     inherit_image_training_config(args, vae_hparams)
     model_args = {
         key: vae_hparams.get(key, getattr(args, key))
@@ -512,6 +588,7 @@ def _load_vae_bundle(args):
 def _load_pgm_bundle(args):
     """Restore only the SCM EMA inference leaves onto the active device."""
     pgm_hparams = _load_checkpoint_hparams(args.pgm_path)
+    _validate_artifact_contract(args, "PGM", pgm_hparams, context_dim=_schema_for_args(args).encoded_dim)
     pgm = _build_pgm_model(args, pgm_hparams)
     params = nnx.state(pgm, nnx.Param).to_pure_dict()
     # The configured PGM can have been trained on a different accelerator.
@@ -537,6 +614,7 @@ def _load_pgm_bundle(args):
 def _load_predictor_bundle(args):
     """Restore predictor EMA parameters plus BatchNorm statistics for evaluation mode."""
     predictor_hparams = _load_checkpoint_hparams(args.predictor_path)
+    _validate_artifact_contract(args, "predictor", predictor_hparams, context_dim=_schema_for_args(args).encoded_dim)
     predictor = _build_predictor_model(args, predictor_hparams, load_pretrained_weights=False)
     graphdef, params_state, batch_stats_state = nnx.split(
         predictor, nnx.Param, nnx.BatchStat
@@ -653,7 +731,11 @@ def _cf_forward(
 
     x = batch["x"].astype(jnp.float32)
     pa = batch["pa"].astype(jnp.float32)
-    pa_maps = _expand_parents(pa, args.input_res)
+    schema_dim = _schema_for_args(args).encoded_dim
+    _split_parent_vector(args, pa)  # Validate the source representation before dispatch.
+    vae_context_dim = int(getattr(vae, "context_dim", schema_dim))
+    vae_pa = _hvae_context(args, pa, vae_context_dim)
+    pa_maps = _expand_parents(vae_pa, args.input_res, expected_dim=vae_context_dim)
     vae_rng, counterfactual_rng = jax.random.split(rng)
     vae_out = vae(x, pa_maps, beta=beta, rng=vae_rng, training=training)
 
@@ -666,7 +748,8 @@ def _cf_forward(
     for i in range(cf_particles):
         pgm_rng, abduct_rng, cf_rng, rec_rng = jax.random.split(particle_keys[i], 4)
         cf_pa = pgm.counterfactual(obs=obs_pgm, intervention=do, rng=pgm_rng)
-        cf_pa_maps = _expand_parents(cf_pa["pa"], args.input_res)
+        cf_vae_pa = _hvae_context(args, cf_pa["pa"], vae_context_dim)
+        cf_pa_maps = _expand_parents(cf_vae_pa, args.input_res, expected_dim=vae_context_dim)
         latents = vae.abduct(x, pa_maps, t=t_abduct, rng=abduct_rng)
         cf_loc, cf_scale = vae.forward_latents(latents, cf_pa_maps, rng=cf_rng)
         rec_loc, rec_scale = vae.forward_latents(latents, pa_maps, rng=rec_rng)
@@ -944,7 +1027,7 @@ def _eval_split(
     ):
         if max_batches is not None and i >= max_batches:
             break
-        batch = preprocess_batch(args, raw_batch, compact_pa=True)
+        batch = _preprocess_counterfactual_batch(args, raw_batch)
         do_k = _choose_intervention(args, dag_vars)
         do = _make_intervention(args, batch, do_k, train_samples, train=(split == "train"))
         out = eval_step(
@@ -1079,7 +1162,7 @@ def _model_validation_batches(args, dataset):
     ):
         if args.model_validation_batches > 0 and index >= args.model_validation_batches:
             break
-        yield preprocess_batch(args, raw_batch, compact_pa=True)
+        yield _preprocess_counterfactual_batch(args, raw_batch)
 
 
 def _full_model_validation_batches(args, dataset):
@@ -1092,7 +1175,7 @@ def _full_model_validation_batches(args, dataset):
         rng=rng,
         **_prefetch_kwargs(args),
     ):
-        yield preprocess_batch(args, raw_batch, compact_pa=True)
+        yield _preprocess_counterfactual_batch(args, raw_batch)
 
 
 def _validated_means(name: str, path: str, totals: Dict[str, float], count: int) -> Dict[str, float]:
@@ -1126,7 +1209,12 @@ def _validate_vae_checkpoint(args, bundle: Bundle, dataset) -> None:
     count = 0
     for index, batch in enumerate(_full_model_validation_batches(args, dataset)):
         x = batch["x"].astype(jnp.float32)
-        parents = _expand_parents(batch["pa"].astype(jnp.float32), args.input_res)
+        source_pa = batch["pa"].astype(jnp.float32)
+        parents = _expand_parents(
+            _hvae_context(args, source_pa, int(getattr(model, "context_dim", args.context_dim))),
+            args.input_res,
+            expected_dim=int(getattr(model, "context_dim", args.context_dim)),
+        )
         outputs = model(
             x,
             parents,
@@ -1615,7 +1703,7 @@ def main(args):
             start=1,
         ):
             fetch_t0 = time.perf_counter()
-            batch = preprocess_batch(args, raw_batch, compact_pa=True)
+            batch = _preprocess_counterfactual_batch(args, raw_batch)
             batch_ready_t0 = time.perf_counter()
             bs = int(batch["x"].shape[0])
             # Randomly intervene on one permitted causal variable each step.

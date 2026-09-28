@@ -49,10 +49,22 @@ def preprocess_batch(args, batch, expand_pa: bool = False, compact_pa: bool = Fa
         else:
             raise KeyError("Batch does not contain 'pa' and no causal schema variables are configured.")
 
-    if pa.shape[-1] < getattr(args, "context_dim", pa.shape[-1]):
-        target_dim = getattr(args, "context_dim", pa.shape[-1])
-        pad_width = [(0, 0)] * (pa.ndim - 1) + [(0, target_dim - pa.shape[-1])]
-        pa = np.pad(pa, pad_width, mode="constant")
+    expected_context_dim = getattr(args, "context_dim", pa.shape[-1])
+    if pa.ndim == 4 and pa.shape[-1] != expected_context_dim and pa.shape[1] != pa.shape[2]:
+        # ``expand_pa`` creates NCHW parent maps; adapters consume the model's
+        # final channel axis just like the compact representation.
+        pa = np.transpose(pa, (0, 2, 3, 1))
+    if pa.shape[-1] != expected_context_dim:
+        if getattr(args, "dataset_id", getattr(args, "dataset", "")) == "padchest":
+            from data.padchest import adapt_padchest_hvae_context
+            pa = adapt_padchest_hvae_context(pa, target_dim=expected_context_dim)
+        else:
+            raise ValueError(
+                "Parent encoding dimension does not match the configured model context: "
+                f"expected {expected_context_dim}, got {pa.shape[-1]}. "
+                "Use an explicit dataset adapter for a documented artifact contract; "
+                "implicit padding or truncation is not supported."
+            )
 
     if not compact_pa and (expand_pa or pa.ndim == 2):
         pa = pa[:, :, None, None]
