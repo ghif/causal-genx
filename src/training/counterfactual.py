@@ -14,9 +14,10 @@ import logging
 import os
 import random
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import jax
 import jax.numpy as jnp
@@ -350,6 +351,15 @@ def _restore_args(args, checkpoint):
         "vae_path": args.vae_path,
         "trust_incomplete_checkpoint": args.trust_incomplete_checkpoint,
         "model_validation_batches": args.model_validation_batches,
+        "input_prefetch_workers": args.input_prefetch_workers,
+        "input_prefetch_batches": args.input_prefetch_batches,
+        "input_stage_mode": args.input_stage_mode,
+        "input_stage_dir": args.input_stage_dir,
+        "input_stage_manifest": args.input_stage_manifest,
+        "input_stage_max_items": args.input_stage_max_items,
+        "input_stage_max_bytes": args.input_stage_max_bytes,
+        "input_stage_size_sample_items": args.input_stage_size_sample_items,
+        "input_stage_workers": args.input_stage_workers,
         "execution_mode": args.execution_mode,
         "drop_remainder": args.drop_remainder,
     }
@@ -893,6 +903,13 @@ def _make_optimizers(args):
     return optimizer, lambda_optimizer
 
 
+def _prefetch_kwargs(args) -> Dict[str, int]:
+    return {
+        "prefetch_batches": max(0, int(getattr(args, "input_prefetch_batches", 0) or 0)),
+        "prefetch_workers": max(1, int(getattr(args, "input_prefetch_workers", 1) or 1)),
+    }
+
+
 def _eval_split(
     args,
     split: str,
@@ -916,7 +933,14 @@ def _eval_split(
     predictor = predictor_bundle.materialize()
     predictor.eval()
     for i, raw_batch in enumerate(
-        _epoch_batches(dataset, args.bs, shuffle=(split == "train"), drop_last=(split == "train"), rng=rng)
+        _epoch_batches(
+            dataset,
+            args.bs,
+            shuffle=(split == "train"),
+            drop_last=(split == "train"),
+            rng=rng,
+            **_prefetch_kwargs(args),
+        )
     ):
         if max_batches is not None and i >= max_batches:
             break
@@ -956,30 +980,102 @@ def _eval_split(
     return mean_stats, _predictor_metrics(args, dataset, preds, targets)
 
 
-def _epoch_batches(dataset, batch_size: int, *, shuffle: bool, drop_last: bool, rng: np.random.Generator):
+def _batch_indices_for_epoch(
+    dataset,
+    batch_size: int,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
     indices = np.arange(len(dataset), dtype=np.int64)
     if shuffle:
         rng.shuffle(indices)
+    batches: list[np.ndarray] = []
     for start in range(0, len(indices), batch_size):
         batch_idx = indices[start : start + batch_size]
         if drop_last and batch_idx.size < batch_size:
             continue
-        if hasattr(dataset, "make_batch"):
-            yield dataset.make_batch(batch_idx, rng=rng, shuffle=shuffle)
-        else:
-            examples = [dataset[int(i)] for i in batch_idx]
-            keys = examples[0].keys()
-            batch = {}
-            for k in keys:
-                values = [np.asarray(item[k]) for item in examples]
-                batch[k] = np.stack(values, axis=0)
-            yield batch
+        batches.append(batch_idx)
+    return batches
+
+
+def _load_epoch_batch(dataset, batch_idx: np.ndarray, *, rng: np.random.Generator, shuffle: bool):
+    if hasattr(dataset, "make_batch"):
+        return dataset.make_batch(batch_idx, rng=rng, shuffle=shuffle)
+    examples = [dataset[int(i)] for i in batch_idx]
+    keys = examples[0].keys()
+    batch = {}
+    for k in keys:
+        values = [np.asarray(item[k]) for item in examples]
+        batch[k] = np.stack(values, axis=0)
+    return batch
+
+
+def _epoch_batches(
+    dataset,
+    batch_size: int,
+    *,
+    shuffle: bool,
+    drop_last: bool,
+    rng: np.random.Generator,
+    prefetch_batches: int = 0,
+    prefetch_workers: int = 1,
+) -> Iterator[Dict[str, np.ndarray]]:
+    prefetch = max(0, int(prefetch_batches))
+    workers = max(1, int(prefetch_workers))
+    batches = _batch_indices_for_epoch(
+        dataset,
+        batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        rng=rng,
+    )
+    if prefetch <= 0:
+        for batch_idx in batches:
+            yield _load_epoch_batch(dataset, batch_idx, rng=rng, shuffle=shuffle)
+        return
+
+    def submit(executor: ThreadPoolExecutor, batch_idx: np.ndarray) -> Future:
+        # Derive per-batch seeds before asynchronous loading to keep any dataset
+        # augmentation deterministic despite bounded host-side prefetch.
+        seed = int(rng.integers(0, np.iinfo(np.uint32).max))
+        return executor.submit(
+            _load_epoch_batch,
+            dataset,
+            batch_idx,
+            rng=np.random.default_rng(seed),
+            shuffle=shuffle,
+        )
+
+    with ThreadPoolExecutor(max_workers=min(workers, prefetch)) as executor:
+        in_flight: list[Future] = []
+        iterator = iter(batches)
+        for _ in range(prefetch):
+            try:
+                in_flight.append(submit(executor, next(iterator)))
+            except StopIteration:
+                break
+        while in_flight:
+            future = in_flight.pop(0)
+            try:
+                in_flight.append(submit(executor, next(iterator)))
+            except StopIteration:
+                pass
+            yield future.result()
 
 
 def _model_validation_batches(args, dataset):
     rng = np.random.default_rng(args.seed)
     for index, raw_batch in enumerate(
-        _epoch_batches(dataset, args.bs, shuffle=False, drop_last=False, rng=rng)
+        _epoch_batches(
+            dataset,
+            args.bs,
+            shuffle=False,
+            drop_last=False,
+            rng=rng,
+            **_prefetch_kwargs(args),
+        )
     ):
         if args.model_validation_batches > 0 and index >= args.model_validation_batches:
             break
@@ -988,7 +1084,14 @@ def _model_validation_batches(args, dataset):
 
 def _full_model_validation_batches(args, dataset):
     rng = np.random.default_rng(args.seed)
-    for raw_batch in _epoch_batches(dataset, args.bs, shuffle=False, drop_last=False, rng=rng):
+    for raw_batch in _epoch_batches(
+        dataset,
+        args.bs,
+        shuffle=False,
+        drop_last=False,
+        rng=rng,
+        **_prefetch_kwargs(args),
+    ):
         yield preprocess_batch(args, raw_batch, compact_pa=True)
 
 
@@ -1501,7 +1604,15 @@ def main(args):
         speed_window_samples = 0
 
         for batch_index, raw_batch in enumerate(
-            _epoch_batches(datasets["train"], args.bs, shuffle=True, drop_last=drop_remainder, rng=rng), start=1
+            _epoch_batches(
+                datasets["train"],
+                args.bs,
+                shuffle=True,
+                drop_last=drop_remainder,
+                rng=rng,
+                **_prefetch_kwargs(args),
+            ),
+            start=1,
         ):
             fetch_t0 = time.perf_counter()
             batch = preprocess_batch(args, raw_batch, compact_pa=True)
@@ -1673,11 +1784,23 @@ def run(config: ExperimentConfig) -> str:
     """Run counterfactual fine-tuning directly from a standalone config."""
     workflow = config.workflow
     assert isinstance(workflow, CounterfactualTrainingConfig)
+    schema = _schema_for_dataset(config.dataset.name)
     scm_checkpoint, predictor_checkpoint, image_model_checkpoint = validate_stage_artifacts(
         workflow.scm_checkpoint,
         workflow.predictor_checkpoint,
         workflow.image_model_checkpoint,
         remote_root=config.artifacts.remote_root,
+        dataset_name=config.dataset.name,
+        expected_variables=list(schema.variable_names),
+        expected_context_dim=schema.encoded_dim,
+        expected_image_context_dim=config.model.context_dim or schema.encoded_dim,
+        expected_input_res=config.dataset.input_res,
+        prefer_remote=config.dataset.name == "padchest",
+        require_remote=config.dataset.name == "padchest",
+        resolve_steps=config.dataset.name == "padchest",
+        require_complete=config.dataset.name == "padchest",
+        allow_incomplete=workflow.trust_incomplete_checkpoint,
+        strict_schema=config.dataset.name == "padchest",
     )
     args = _run_arguments(config)
     args.pgm_path = scm_checkpoint

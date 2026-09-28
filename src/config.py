@@ -178,6 +178,8 @@ class CounterfactualTrainingConfig(BaseModel):
     resume_checkpoint: str = ""
     testing: bool = False
     benchmark_steps: int = 0
+    input_prefetch_workers: int = 1
+    input_prefetch_batches: int = 0
     input_stage_mode: Literal["auto", "off", "require"] = "auto"
     input_stage_dir: str = ""
     input_stage_manifest: str = ""

@@ -423,6 +423,17 @@ def test_counterfactual_stage_runs_native_implementation(monkeypatch):
     )
     assert captured["validation_kwargs"] == {
         "remote_root": config.artifacts.remote_root,
+        "dataset_name": "morphomnist",
+        "expected_variables": ["thickness", "intensity", "digit"],
+        "expected_context_dim": 12,
+        "expected_image_context_dim": 12,
+        "expected_input_res": 32,
+        "prefer_remote": False,
+        "require_remote": False,
+        "resolve_steps": False,
+        "require_complete": False,
+        "allow_incomplete": True,
+        "strict_schema": False,
     }
     assert captured["args"].wd == 0.1
     assert output.endswith(f"{config.artifacts.run_name}/cf")
