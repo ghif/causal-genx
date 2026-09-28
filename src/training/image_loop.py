@@ -379,6 +379,17 @@ def _write_best_artifacts(
     )
 
 
+def _append_epoch_trainlog(args, text: str) -> None:
+    remote_trainlog = (
+        os.path.join(args.remote_save_dir, "trainlog.txt")
+        if getattr(args, "remote_save_dir", "")
+        else None
+    )
+    append_text_file(
+        os.path.join(args.save_dir, "trainlog.txt"), text, remote_path=remote_trainlog
+    )
+
+
 def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
     """Run epochs and emit only artifacts tied to a completed validation interval.
 
@@ -682,6 +693,23 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     state.step,
                     extra={"eval_log": True},
                 )
+            epoch_trainlog = (
+                f"epoch={epoch + 1} train nelbo={train_stats_sum['elbo'] / max(1, steps_per_epoch):.4f} "
+                f"nll={train_stats_sum['nll'] / max(1, steps_per_epoch):.4f} "
+                f"kl={train_stats_sum['kl'] / max(1, steps_per_epoch):.4f} steps={state.step} "
+                f"it_s={epoch_iter_per_sec:.3f} sample_s={epoch_sample_per_sec:.3f}"
+            )
+            if validation_due:
+                epoch_trainlog += (
+                    f" valid nelbo={valid_nelbo:.4f} valid_nll={valid_nll:.4f} "
+                    f"valid_kl={valid_kl:.4f}"
+                )
+            artifact_writer.submit(
+                _append_epoch_trainlog,
+                args,
+                epoch_trainlog + "\n",
+            )
+            if validation_due:
                 if best_checkpoint_due:
                     trainlog_lines = [
                         f"best_checkpoint_step={state.step}",

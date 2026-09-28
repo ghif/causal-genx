@@ -105,8 +105,11 @@ def _run(args: ImageModelSettings) -> None:
         has_resume_checkpoint = True
         saved = _resume_hparams(args.resume)
         if saved:
-            # Preserve the Torch resume contract: checkpoint hparams recreate
-            # the trained model, while the active runtime stays explicit.
+            # Resume from the checkpoint's model/optimizer state without
+            # reusing its artifact identity; each resumed run owns a new root.
+            requested_ckpt_dir = args.ckpt_dir
+            requested_remote_ckpt_dir = args.remote_ckpt_dir
+            requested_exp_name = args.exp_name
             saved = {
                 key: value
                 for key, value in saved.items()
@@ -114,6 +117,9 @@ def _run(args: ImageModelSettings) -> None:
             }
             data_dir, requested_lr, resume_path = args.data_dir, args.lr, args.resume
             args.update_from_checkpoint(saved, exclude={"resume", "accelerator", "data_dir"})
+            args.ckpt_dir = requested_ckpt_dir
+            args.remote_ckpt_dir = requested_remote_ckpt_dir
+            args.exp_name = requested_exp_name
             if data_dir:
                 args.data_dir = data_dir
             if requested_lr < args.lr:
