@@ -631,7 +631,6 @@ class PadChestDataset:
         stage_mode: str = "auto",
         excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
         concat_pa: bool = True,
-        schema: CausalGraphSpec | None = None,
     ):
         rows = _read_rows(metadata)
         groups: dict[str, list[tuple[int, dict[str, str]]]] = {}

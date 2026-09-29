@@ -338,7 +338,7 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
 
 
 def _schema_for_dataset(dataset: str, configured: CausalGraphSpec | None = None) -> CausalGraphSpec:
-    if configured is not None:
+    if isinstance(configured, CausalGraphSpec):
         return configured
     if dataset == "morphomnist":
         from data.morphomnist import MORPHOMNIST_SCHEMA
