@@ -98,8 +98,8 @@ def setup_logging(args):
 
 
 def _validate_runtime_device(args) -> None:
-    devices = jax.devices()
     if args.accelerator == "gpu":
+        devices = jax.devices()
         gpu_devices = [device for device in devices if device.platform in {"gpu", "cuda"}]
         if not gpu_devices:
             raise RuntimeError(
@@ -113,11 +113,19 @@ def _validate_runtime_device(args) -> None:
             )
         device = gpu_devices[0]
     elif args.accelerator == "cpu":
+        try:
+            devices = jax.devices("cpu")
+        except Exception:
+            devices = jax.devices()
         cpu_devices = [device for device in devices if device.platform == "cpu"]
         if not cpu_devices:
             raise RuntimeError("--accelerator cpu requested, but JAX found no CPU device")
         device = cpu_devices[0]
     else:
+        try:
+            devices = jax.devices(args.accelerator)
+        except Exception:
+            devices = jax.devices()
         matching_devices = [device for device in devices if device.platform == args.accelerator]
         if not matching_devices:
             raise RuntimeError(

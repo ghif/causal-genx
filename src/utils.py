@@ -9,8 +9,9 @@ import shutil
 import tempfile
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
+from dataclasses import asdict, dataclass, is_dataclass
+from enum import Enum
+from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 import time
 
@@ -415,6 +416,33 @@ def _load_hparams_if_present(root_dir: str, restored: Dict[str, Any]) -> None:
             restored["hparams"] = json.load(f)
 
 
+def to_json_serializable(obj: Any) -> Any:
+    """Recursively convert dataclasses, enums, numpy scalars/arrays, and mappings to JSON-safe primitives."""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, Enum):
+        return obj.value
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return to_json_serializable(asdict(obj))
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return to_json_serializable(obj.tolist())
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [to_json_serializable(item) for item in obj]
+    if isinstance(obj, Mapping):
+        return {str(k): to_json_serializable(v) for k, v in obj.items()}
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return to_json_serializable(obj.to_dict())
+    if hasattr(obj, "__dict__"):
+        return to_json_serializable(vars(obj))
+    return str(obj)
+
+
 def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None, custom_metadata: Optional[Dict[str, Any]] = None) -> None:
     _reject_non_orbax_checkpoint(path)
 
@@ -424,16 +452,18 @@ def save_checkpoint(data: Dict[str, Any], path: str, step: Optional[int] = None,
     metadata = dict(custom_metadata or {})
     hparams = item.pop("hparams", None)
     if hparams is not None:
-        metadata.setdefault("hparams", hparams)
+        serializable_hparams = to_json_serializable(hparams)
+        metadata.setdefault("hparams", serializable_hparams)
         with open(os.path.join(path, "hparams.json"), "w", encoding="utf-8") as f:
-            json.dump(hparams, f, indent=2, sort_keys=True)
+            json.dump(serializable_hparams, f, indent=2, sort_keys=True)
+    serializable_metadata = to_json_serializable(metadata) if metadata else None
     with _orbax_warning_filter(True):
         manager = _checkpoint_manager(path, create=True)
         try:
             save_step = int(step if step is not None else data.get("step", 0))
             manager.save(
                 save_step,
-                args=ocp.args.StandardSave(item=item, custom_metadata=metadata),
+                args=ocp.args.StandardSave(item=item, custom_metadata=serializable_metadata),
             )
             manager.wait_until_finished()
         finally:

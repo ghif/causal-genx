@@ -396,14 +396,18 @@ def _materialize_pretrained_weights(weights_path: str) -> str:
 
 def _validate_runtime_device(args: PredictorRunArguments) -> jax.Device:
     """Keep the legacy accelerator preflight before allocating the predictor."""
-    devices = jax.devices()
     if args.accelerator == "gpu":
+        devices = jax.devices()
         matching = [device for device in devices if device.platform in {"gpu", "cuda"}]
         if not matching:
             raise RuntimeError("accelerator=gpu requested, but JAX found no CUDA GPU")
         if len(matching) != 1:
             raise RuntimeError(f"Predictor training requires one visible GPU, found {len(matching)}")
     else:
+        try:
+            devices = jax.devices(args.accelerator)
+        except Exception:
+            devices = jax.devices()
         matching = [device for device in devices if device.platform == args.accelerator]
         if not matching:
             raise RuntimeError(f"accelerator={args.accelerator} requested, but JAX devices are {devices}")

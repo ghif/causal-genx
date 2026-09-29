@@ -1,0 +1,54 @@
+version: "2"
+seed: 7
+dataset:
+  name: padchest
+  root: gs://external-cxr-dataset/padchest/unpacked/images-224
+  metadata: /mnt/data/dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv
+  image_prefix: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224
+  excluded_sources:
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012558082906712009300162151055_00-078-079.png
+      reason: confirmed absent source object; gcloud storage ls matches no objects
+  input_res: 128
+  pad: 0
+  context_norm: "[-1,1]"
+  tb_label_mode: tb_or_sequelae
+causal_schema:
+  version: "2"
+  variables: [age_group, sex, tb_status, projection, view_position, scanner]
+  edges: [[age_group, tb_status], [sex, tb_status]]
+model:
+  name: hierarchical_vae
+  context_dim: 21
+  cond_prior: true
+  enc_arch: 128b3d2,64b3d4,16b3d4,4b3d4,1b4
+  dec_arch: 1b4,4b4,16b4,64b4,128b4
+optimizer:
+  lr: 0.0005
+  weight_decay: 0.01
+  batch_size: 32
+runtime:
+  accelerator: tpu
+  precision: bf16
+  expected_local_device_count: 1
+  expected_global_device_count: 1
+artifacts:
+  root: checkpoints
+  run_name: image_model_padchest_v2_tpu_v6e1
+  remote_root: gs://external-cxr-dataset/padchest/checkpoints_v2
+workflow:
+  type: train-image-model
+  epochs: 100
+  speed_log_freq: 10
+  viz_batch_size: 8
+  eval_freq: 1
+  checkpoint_freq: 5
+  benchmark_steps: 0
+  benchmark_warmup_steps: 10
+  execution_mode: single_device
+  drop_remainder: true
+  input_stage_mode: require
+  input_stage_dir: /mnt/data/dataset/padchest/input-stage/images-224
+  input_stage_manifest: /mnt/data/dataset/padchest/input-stage/images-224/padchest-stage-manifest.jsonl
+  input_stage_max_items: 200000
+  input_stage_max_bytes: 120000000000
+  input_stage_workers: 32

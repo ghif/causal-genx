@@ -1,7 +1,9 @@
 import io
+import pytest
 
-import numpy as np
+fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
+import numpy as np
 from PIL import Image
 
 from backend.app.main import ClientRateLimiter, create_app

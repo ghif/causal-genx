@@ -55,6 +55,7 @@ PAD_CHEST_V2_SCHEMA = CausalGraphSpec(
     ),
     edges=(("age_group", "tb_status"), ("sex", "tb_status")),
 )
+PAD_CHEST_SCHEMA_V2 = PAD_CHEST_V2_SCHEMA
 
 AGE_AT_STUDY_MIN = 0.0
 AGE_AT_STUDY_MAX = 110.0
@@ -62,6 +63,29 @@ STUDY_YEAR_MIN = 2007.0
 STUDY_YEAR_MAX = 2017.0
 PROJECTIONS = ("PA", "AP", "AP_horizontal", "L", "COSTAL")
 VIEW_POSITIONS = ("POSTEROANTERIOR", "ANTEROPOSTERIOR", "LATERAL", "AP", "PA", "OTHER")
+AGE_GROUPS = ("0-4", "5-17", "18-39", "40-64", "65+")
+SCANNERS = ("ImagingDynamicsCompanyLtd", "PhilipsMedicalSystems")
+
+def _derive_age_group(age: float) -> int:
+    if age <= 4.0:
+        return 0
+    if age <= 17.0:
+        return 1
+    if age <= 39.0:
+        return 2
+    if age <= 64.0:
+        return 3
+    return 4
+
+
+def _scanner_category(value: str) -> int:
+    val = str(value or "").strip()
+    if val in SCANNERS:
+        return SCANNERS.index(val)
+    for i, s in enumerate(SCANNERS):
+        if s.lower() in val.lower():
+            return i
+    return 0
 
 # Backwards-compatible private aliases used by existing derivation code.
 _PROJECTIONS = PROJECTIONS
@@ -424,14 +448,19 @@ def _derive(row: Mapping[str, str], tb_label_mode: str) -> dict[str, Any]:
     else:
         tb = bool(labels.intersection({"tuberculosis", "tuberculosis sequelae"}))
     sex = 1 if str(row.get("PatientSex_DICOM", "")).upper() == "M" else 0
+    age_group_idx = _derive_age_group(age)
+    scanner_val = row.get("Manufacturer_DICOM", "") or row.get("Manufacturer", "")
+    scanner_idx = _scanner_category(scanner_val)
     return {
         "age_at_study": normalize(np.asarray([age], dtype=np.float32), x_min=AGE_AT_STUDY_MIN, x_max=AGE_AT_STUDY_MAX)[0],
+        "age_group": np.eye(len(AGE_GROUPS), dtype=np.float32)[age_group_idx],
         "sex": np.eye(2, dtype=np.float32)[sex],
         "pediatric": np.asarray([1.0 if str(row.get("Pediatric", "")).lower() == "yes" else 0.0], dtype=np.float32),
         "tb_status": np.asarray([1.0 if tb else 0.0], dtype=np.float32),
         "projection": np.eye(len(_PROJECTIONS), dtype=np.float32)[_category(row.get("Projection", ""), _PROJECTIONS, "PA")],
         "view_position": np.eye(len(_VIEWS), dtype=np.float32)[_category(row.get("ViewPosition_DICOM", ""), _VIEWS, "OTHER")],
         "study_year": normalize(np.asarray([year], dtype=np.float32), x_min=STUDY_YEAR_MIN, x_max=STUDY_YEAR_MAX)[0],
+        "scanner": np.eye(len(SCANNERS), dtype=np.float32)[scanner_idx],
     }
 
 
@@ -595,6 +624,8 @@ class PadChestDataset:
         tb_label_mode: str,
         seed: int = 7,
         *,
+        schema: CausalGraphSpec | None = None,
+        schema_version: str = "1",
         stage_dir: str = "",
         stage_manifest: str = "",
         stage_mode: str = "auto",
@@ -609,7 +640,7 @@ class PadChestDataset:
         selected = _split_patients(tuple(groups), seed)[split]
         selected_rows = [(row_index, row) for patient in selected for row_index, row in groups[patient] if row.get("ImageID")]
         self.root, self.image_prefix, self.input_res, self.tb_label_mode = root, image_prefix, input_res, tb_label_mode
-        self.schema = schema or PAD_CHEST_SCHEMA
+        self.schema = schema or (PAD_CHEST_V2_SCHEMA if str(schema_version) == "2" else PAD_CHEST_SCHEMA)
         self.stage_dir = stage_dir
         self.stage_manifest = stage_manifest or (_default_stage_manifest(stage_dir) if stage_dir else "")
         self.stage_mode = stage_mode
@@ -740,15 +771,17 @@ class PadChestProvider:
         tb_label_mode: str = "tb_or_sequelae",
         seed: int = 7,
         *,
+        schema: CausalGraphSpec | None = None,
+        schema_version: str = "1",
         stage_dir: str = "",
         stage_manifest: str = "",
         stage_mode: str = "auto",
         excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
         concat_pa: bool = True,
-        schema: CausalGraphSpec | None = None,
     ):
+        self.schema = schema or (PAD_CHEST_V2_SCHEMA if str(schema_version) == "2" else PAD_CHEST_SCHEMA)
+        self.schema_version = schema_version
         self.root, self.input_res, self.pad, self.context_norm = root, input_res, pad, context_norm
-        self.schema = schema or PAD_CHEST_SCHEMA
         self.metadata = metadata or f"{root.rstrip('/')}/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv"
         self.image_prefix = image_prefix or f"{root.rstrip('/')}/images-224"
         self.tb_label_mode, self.seed = tb_label_mode, seed
@@ -769,12 +802,13 @@ class PadChestProvider:
             self.input_res,
             self.tb_label_mode,
             self.seed,
+            schema=self.schema,
+            schema_version=self.schema_version,
             stage_dir=self.stage_dir,
             stage_manifest=self.stage_manifest,
             stage_mode=self.stage_mode,
             excluded_sources=self.excluded_sources,
             concat_pa=self.concat_pa,
-            schema=self.schema,
         )
 
     def make_batch(self, split: str, indices: Sequence[int], *, rng=None, training: bool = False) -> Batch:
@@ -1036,6 +1070,13 @@ def _stage_settings(settings: Any) -> dict[str, Any]:
 
 
 def padchest(settings) -> dict[str, PadChestDataset]:
+    schema_version = str(getattr(settings, "schema_version", "") or getattr(settings, "version", "1"))
+    causal_schema = getattr(settings, "causal_schema", None)
+    if isinstance(causal_schema, dict) and "version" in causal_schema:
+        schema_version = str(causal_schema["version"])
+    schema = getattr(settings, "schema", None)
+    if not isinstance(schema, CausalGraphSpec):
+        schema = PAD_CHEST_SCHEMA_V2 if str(schema_version) == "2" else PAD_CHEST_SCHEMA
     provider = PadChestProvider(
         settings.data_dir,
         settings.input_res,
@@ -1045,8 +1086,9 @@ def padchest(settings) -> dict[str, PadChestDataset]:
         getattr(settings, "image_prefix", ""),
         getattr(settings, "tb_label_mode", "tb_or_sequelae"),
         settings.seed,
+        schema=schema,
+        schema_version=schema_version,
         concat_pa=getattr(settings, "concat_pa", True),
-        schema=getattr(settings, "schema", None),
         **_stage_settings(settings),
     )
     return {split: provider.load_split(split) for split in ("train", "valid", "test")}

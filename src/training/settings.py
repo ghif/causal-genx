@@ -12,7 +12,7 @@ from typing import Any
 from config import CounterfactualTrainingConfig, ExperimentConfig, ImageModelTrainingConfig, resolve_causal_schema
 from data.morphomnist import MORPHOMNIST_SCHEMA
 from data.cxr_rait import CXR_RAIT_SCHEMA
-from data.padchest import PAD_CHEST_SCHEMA
+from data.padchest import PAD_CHEST_SCHEMA, PAD_CHEST_SCHEMA_V2
 
 
 def _get_schema(dataset_name: str, config: ExperimentConfig | None = None):
@@ -92,6 +92,8 @@ class ImageModelSettings:
     input_stage_max_bytes: int = 0
     input_stage_size_sample_items: int = 256
     input_stage_workers: int = 16
+    schema_version: str = "1"
+    causal_schema: dict[str, Any] | None = None
     save_dir: str = ""
     checkpoint_dir: str = ""
     remote_save_dir: str = ""
@@ -164,6 +166,8 @@ def image_model_settings(config: ExperimentConfig) -> ImageModelSettings:
         input_stage_max_bytes=getattr(workflow, "input_stage_max_bytes", 0),
         input_stage_size_sample_items=getattr(workflow, "input_stage_size_sample_items", 256),
         input_stage_workers=getattr(workflow, "input_stage_workers", 16),
+        schema_version=str(config.version),
+        causal_schema=dict(config.causal_schema) if config.causal_schema else None,
     )
 
 
@@ -228,5 +232,7 @@ def image_model_settings_for_counterfactual(config: ExperimentConfig) -> dict[st
         input_stage_max_bytes=getattr(workflow, "input_stage_max_bytes", 0),
         input_stage_size_sample_items=getattr(workflow, "input_stage_size_sample_items", 256),
         input_stage_workers=getattr(workflow, "input_stage_workers", 16),
+        schema_version=str(config.version),
+        causal_schema=dict(config.causal_schema) if config.causal_schema else None,
     )
 
