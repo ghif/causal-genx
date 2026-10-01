@@ -650,21 +650,65 @@ def _portable_training_state(
     )
 
 
-def _eval_epoch(graphdef: Any, params: Any, batch_stats: Any, rng_state: Any, dataset: Any | None = None, batch_size: int | None = None, rng: np.random.Generator | None = None) -> Dict[str, float]:
+def _make_eval_step(graphdef: Any):
+    """Compile one evaluation step without gradient computation."""
+    @jax.jit
+    def eval_step(params, batch_stats, *step_args):
+        legacy_call = len(step_args) == 1
+        if legacy_call:
+            rng_state = None
+            batch = step_args[0]
+        else:
+            rng_state, batch = step_args
+        if rng_state is None:
+            _, metrics, _, _ = _loss_and_state(
+                graphdef, params, batch_stats, batch, training=False
+            )
+        else:
+            _, metrics, _, _, _ = _loss_and_state(
+                graphdef, params, batch_stats, rng_state, batch, training=False
+            )
+        return metrics
+    return eval_step
+
+
+def _make_predict_step(graphdef: Any):
+    """Compile a batched prediction step for computing prediction metrics on TPU/GPU."""
+    @jax.jit
+    def predict_step(params, batch_stats, batch):
+        model = _merge(graphdef, params, batch_stats, None)
+        model.eval()
+        return model.predict(**_batch_for_model(model, batch))
+    return predict_step
+
+
+def _eval_epoch(
+    graphdef: Any,
+    params: Any,
+    batch_stats: Any,
+    rng_state: Any,
+    dataset: Any | None = None,
+    batch_size: int | None = None,
+    rng: np.random.Generator | None = None,
+    eval_step: Any | None = None,
+) -> Dict[str, float]:
     if rng is None:
         rng = batch_size
         batch_size = dataset
         dataset = rng_state
         rng_state = None
-    totals: Dict[str, float] = {}; count = 0
+    if eval_step is None:
+        eval_step = _make_eval_step(graphdef)
+    totals: Dict[str, float] = {}
+    count = 0
     for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
         if rng_state is None:
-            _, metrics, _, _ = _loss_and_state(graphdef, params, batch_stats, batch, training=False)
+            metrics = eval_step(params, batch_stats, batch)
         else:
-            _, metrics, _, _, _ = _loss_and_state(graphdef, params, batch_stats, rng_state, batch, training=False)
+            metrics = eval_step(params, batch_stats, rng_state, batch)
         size = int(next(iter(batch.values())).shape[0])
-
-        for key, value in metrics.items(): totals[key] = totals.get(key, 0.0) + float(value) * size
+        for key, value in metrics.items():
+            totals[key] = totals.get(key, 0.0) + float(value) * size
         count += size
     return {key: value / max(1, count) for key, value in totals.items()}
 
@@ -810,16 +854,35 @@ def _log_epoch_summary(
     )
 
 
-def _prediction_metrics(args: PredictorRunArguments, model: Any, dataset: Any, batch_size: int, rng: np.random.Generator) -> Dict[str, float]:
-    model.eval(); predictions = {key: [] for key in model.variables}; targets = {key: [] for key in model.variables}
+def _prediction_metrics(
+    args: PredictorRunArguments,
+    model: Any,
+    dataset: Any,
+    batch_size: int,
+    rng: np.random.Generator,
+    predict_fn: Any | None = None,
+    params: Any | None = None,
+    batch_stats: Any | None = None,
+) -> Dict[str, float]:
+    model.eval()
+    predictions = {key: [] for key in model.variables}
+    targets = {key: [] for key in model.variables}
     for batch in epoch_batches(dataset, batch_size, shuffle=False, drop_last=False, rng=rng):
         model_batch = _batch_for_model(model, batch)
-        for key in targets: targets[key].extend(np.asarray(model_batch[key]))
-        for key, value in model.predict(**model_batch).items(): predictions[key].extend(np.asarray(value))
+        for key in targets:
+            targets[key].append(np.asarray(model_batch[key]))
+        if predict_fn is not None and params is not None:
+            batch_preds = predict_fn(params, batch_stats, batch)
+        else:
+            batch_preds = model.predict(**model_batch)
+        for key, value in batch_preds.items():
+            predictions[key].append(np.asarray(value))
     stats: Dict[str, float] = {}
     for key, var_kind in getattr(model, "variables", {}).items():
-        target_arr = np.asarray(targets[key])
-        prediction_arr = np.asarray(predictions[key])
+        if not targets[key] or not predictions[key]:
+            continue
+        target_arr = np.concatenate(targets[key], axis=0)
+        prediction_arr = np.concatenate(predictions[key], axis=0)
         if var_kind == "categorical" or key == "digit":
             stats[f"{key}_acc"] = float((target_arr.argmax(-1) == prediction_arr.argmax(-1)).mean())
         elif var_kind == "binary":
@@ -895,7 +958,7 @@ def _build_predictor_model(args: PredictorRunArguments, dtype: jnp.dtype, logger
     use_pretrained = args.type == "finetune-predictor" or getattr(args, "pretrained", False)
     legacy_cxr_rait = args.dataset == "cxr_rait" and tuple(schema.variable_names) == ("age", "gender", "tb_status")
     if use_pretrained:
-        from causal.cxr_rait_predictor import CxrPretrainedImageParentPredictor, CxrRaitPretrainedPredictor
+        from causal.cxr_predictor import CxrPretrainedImageParentPredictor, CxrRaitPretrainedPredictor
         local_weights_path = _materialize_pretrained_weights(args.pretrained_weights_path)
         if logger is not None:
             logger.info(
@@ -919,7 +982,7 @@ def _build_predictor_model(args: PredictorRunArguments, dtype: jnp.dtype, logger
             rngs=nnx.Rngs(args.seed),
         )
 
-    from causal.cxr_rait_predictor import CxrImageParentPredictor, CxrRaitSupAuxPredictor
+    from causal.cxr_predictor import CxrImageParentPredictor, CxrRaitSupAuxPredictor
     if legacy_cxr_rait:
         return CxrRaitSupAuxPredictor(
             input_channels=args.input_channels,
@@ -1149,9 +1212,11 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     rng = np.random.default_rng(args.seed)
     if args.testing:
         if checkpoint is None: raise ValueError("testing requires load_path")
+        predict_step = _make_predict_step(graphdef)
         stats = _prediction_metrics(
             args, _merge(graphdef, ema.params, ema.batch_stats, model_rng_state),
             datasets["test"], args.bs, rng,
+            predict_fn=predict_step, params=ema.params, batch_stats=ema.batch_stats,
         ); logger.info("test | %s", _prediction_description(stats)); writer.close(); return stats
     for key in sorted(vars(args)):
         logger.info("--%s=%s", key, getattr(args, key))
@@ -1190,6 +1255,8 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
         )
         backbone_lr_scale = float(getattr(args, "backbone_lr_scale", 1.0))
         train_step = _make_train_step(graphdef, optimizer, backbone_lr_scale=backbone_lr_scale)
+    eval_step = _make_eval_step(graphdef)
+    predict_step = _make_predict_step(graphdef)
     final_stats: Dict[str, float] = {}
     benchmark_steps = max(0, int(getattr(args, "benchmark_steps", 0)))
     benchmark_start_step = step
@@ -1274,12 +1341,18 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
             )
             valid_stats = _eval_epoch(
                 graphdef, portable_ema.params, portable_ema.batch_stats, portable_rng_state,
-                valid_dataset, args.bs, rng,
+                valid_dataset, args.bs, rng, eval_step=eval_step,
             ); final_stats = valid_stats
             train_time = time.perf_counter() - epoch_step_t0
             eval_model = _merge(graphdef, portable_ema.params, portable_ema.batch_stats, portable_rng_state)
-            train_prediction_stats = _prediction_metrics(args, eval_model, train_dataset, args.bs, rng)
-            prediction_stats = _prediction_metrics(args, eval_model, valid_dataset, args.bs, rng)
+            train_prediction_stats = _prediction_metrics(
+                args, eval_model, train_dataset, args.bs, rng,
+                predict_fn=predict_step, params=portable_ema.params, batch_stats=portable_ema.batch_stats,
+            )
+            prediction_stats = _prediction_metrics(
+                args, eval_model, valid_dataset, args.bs, rng,
+                predict_fn=predict_step, params=portable_ema.params, batch_stats=portable_ema.batch_stats,
+            )
             epoch_iter_per_sec = total_batches / max(train_time, 1e-12)
             epoch_sample_per_sec = seen / max(train_time, 1e-12)
             total_time = time.perf_counter() - epoch_t0

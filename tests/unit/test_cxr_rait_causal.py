@@ -5,7 +5,7 @@ import pytest
 from flax import nnx
 
 from causal.cxr_rait_scm import CxrRaitPGM, PadChestPGM
-from causal.cxr_rait_predictor import CxrRaitSupAuxPredictor, TorchXRayVisionDenseNet121
+from causal.cxr_predictor import CxrRaitSupAuxPredictor, TorchXRayVisionDenseNet121
 from training.predictor import _merge
 
 

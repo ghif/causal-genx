@@ -9,7 +9,7 @@ import numpy as np
 import optax
 from flax import nnx
 
-from causal.cxr_rait_predictor import CxrImageParentPredictor, CxrPretrainedImageParentPredictor
+from causal.cxr_predictor import CxrImageParentPredictor, CxrPretrainedImageParentPredictor
 from models.image_vae import HVAE
 from causal.cxr_rait_scm import PadChestPGM
 from config import CounterfactualTrainingConfig, ExperimentConfig

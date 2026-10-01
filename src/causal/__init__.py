@@ -5,7 +5,7 @@ from .flow_scm import MorphoMNISTPGM
 from .image_parent_predictor import MorphoMNISTSupAuxPredictor
 from .cxr_rait_scm import CxrRaitPGM, PadChestPGM
 from .generic_scm import GenericCausalModel, GenericSCM, SchemaDrivenSCM, SchemaSCM, validate_encoded_values
-from .cxr_rait_predictor import CxrImageParentPredictor, CxrPretrainedImageParentPredictor, CxrRaitSupAuxPredictor
+from .cxr_predictor import CxrImageParentPredictor, CxrPretrainedImageParentPredictor, CxrRaitSupAuxPredictor
 
 __all__ = [
     "DeepStructuralCausalModel",

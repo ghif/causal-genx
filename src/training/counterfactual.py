@@ -46,7 +46,7 @@ from .counterfactual_support import (
     inherit_image_training_config,
     set_module_training_mode,
 )
-from causal.cxr_rait_predictor import (
+from causal.cxr_predictor import (
     CxrImageParentPredictor,
     CxrPretrainedImageParentPredictor,
     CxrRaitPretrainedPredictor,
