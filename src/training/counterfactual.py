@@ -33,6 +33,7 @@ from data.padchest import (
     PAD_CHEST_HVAE_CONTEXT_DIM,
     PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM,
     PAD_CHEST_SCHEMA,
+    PAD_CHEST_SCHEMA_V2,
     PAD_CHEST_SOURCE_CONTEXT_DIM,
     padchest,
 )
@@ -53,6 +54,7 @@ from causal.cxr_predictor import (
     CxrRaitSupAuxPredictor,
 )
 from causal.cxr_rait_scm import CxrRaitPGM, PadChestPGM
+from causal.generic_scm import SchemaDrivenSCM
 from causal.flow_scm import MorphoMNISTPGM
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
 from training.image_loop import _first_local_replica, _replicate, _shard_batch, _unreplicate, init_state, preprocess_batch
@@ -175,7 +177,11 @@ _SCHEMAS: dict[str, CausalGraphSpec] = {
 }
 
 
-def _schema_for_dataset(dataset: str) -> CausalGraphSpec:
+def _schema_for_dataset(dataset: str, configured: CausalGraphSpec | None = None, schema_version: str | int | None = None) -> CausalGraphSpec:
+    if isinstance(configured, CausalGraphSpec):
+        return configured
+    if dataset == "padchest" and (str(schema_version) == "2" or (configured is not None and getattr(configured, "version", "") == "2")):
+        return PAD_CHEST_SCHEMA_V2
     try:
         return _SCHEMAS[dataset]
     except KeyError as exc:
@@ -183,7 +189,13 @@ def _schema_for_dataset(dataset: str) -> CausalGraphSpec:
 
 
 def _schema_for_args(args) -> CausalGraphSpec:
-    return _schema_for_dataset(getattr(args, "dataset", getattr(args, "dataset_id", "morphomnist")))
+    if isinstance(getattr(args, "schema", None), CausalGraphSpec):
+        return args.schema
+    return _schema_for_dataset(
+        getattr(args, "dataset", getattr(args, "dataset_id", "morphomnist")),
+        configured=getattr(args, "schema", None),
+        schema_version=getattr(args, "schema_version", getattr(args, "causal_schema_version", None)),
+    )
 
 
 def _parent_slices(args) -> dict[str, slice]:
@@ -229,6 +241,9 @@ def _build_pgm_model(args, hparams: Dict[str, Any]):
     if args.dataset == "cxr_rait":
         return CxrRaitPGM(widths=widths, rngs=rngs)
     if args.dataset == "padchest":
+        if hparams.get("causal_schema_version") == "2" or str(getattr(args, "schema_version", "")) == "2":
+            schema = _schema_for_args(args)
+            return SchemaDrivenSCM(schema=schema, widths=widths, rngs=rngs)
         return PadChestPGM(widths=widths, rngs=rngs)
     if args.dataset == "morphomnist":
         return MorphoMNISTPGM(widths=widths, rngs=rngs)
@@ -269,9 +284,10 @@ def _build_predictor_model(args, hparams: Dict[str, Any], *, load_pretrained_wei
             or hparams.get("type") == "finetune-predictor"
             or hparams.get("pretrained", False)
         )
+        schema = _schema_for_args(args)
         if uses_pretrained_backbone:
             return CxrPretrainedImageParentPredictor(
-                variable_specs=PAD_CHEST_SCHEMA.variables,
+                variable_specs=schema.variables,
                 input_channels=hparams.get("input_channels", args.input_channels),
                 input_res=hparams.get("input_res", args.input_res),
                 width=hparams.get("width", 32),
@@ -284,7 +300,7 @@ def _build_predictor_model(args, hparams: Dict[str, Any], *, load_pretrained_wei
                 rngs=rngs,
             )
         return CxrImageParentPredictor(
-            variable_specs=PAD_CHEST_SCHEMA.variables,
+            variable_specs=schema.variables,
             input_channels=hparams.get("input_channels", args.input_channels),
             input_res=hparams.get("input_res", args.input_res),
             width=hparams.get("width", 16),
@@ -446,7 +462,8 @@ def _preprocess_counterfactual_batch(args, raw_batch):
 
 
 def _hvae_context(args, pa: jax.Array, target_dim: int) -> jax.Array:
-    if args.dataset != "padchest":
+    schema = _schema_for_args(args)
+    if args.dataset != "padchest" or str(getattr(args, "schema_version", "")) == "2" or getattr(schema, "version", "") == "2":
         if int(pa.shape[-1]) != int(target_dim):
             raise ValueError(
                 "Parent encoding dimension does not match the HVAE context: "
@@ -1880,7 +1897,8 @@ def run(config: ExperimentConfig) -> str:
     """Run counterfactual fine-tuning directly from a standalone config."""
     workflow = config.workflow
     assert isinstance(workflow, CounterfactualTrainingConfig)
-    schema = _schema_for_dataset(config.dataset.name)
+    from training.settings import _get_schema
+    schema = _get_schema(config.dataset.name, config)
     scm_checkpoint, predictor_checkpoint, image_model_checkpoint = validate_stage_artifacts(
         workflow.scm_checkpoint,
         workflow.predictor_checkpoint,
