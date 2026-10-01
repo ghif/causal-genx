@@ -1,0 +1,33 @@
+{
+  "checkpoint": "/private/tmp/padchest_eval_v2/image_model_padchest_v2_tpu_v6e1/checkpoints",
+  "elbo": 0.48288455605506897,
+  "input_shape": [
+    1,
+    128,
+    128,
+    1
+  ],
+  "kl": 0.22662395238876343,
+  "latent_temperature": 1.0,
+  "nll": 0.25626060366630554,
+  "num_samples": 8,
+  "parents": {
+    "age_group": 2,
+    "projection": 0,
+    "scanner": 0,
+    "sex": 1,
+    "tb_status": 0,
+    "view_position": 0
+  },
+  "previews": [
+    "/Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/male/sample-000-step-380950.png",
+    "/Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/male/sample-001-step-380950.png",
+    "/Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/male/sample-002-step-380950.png",
+    "/Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/male/sample-003-step-380950.png",
+    "/Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/male/sample-004-step-380950.png",
+    "/Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/male/sample-005-step-380950.png",
+    "/Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/male/sample-006-step-380950.png",
+    "/Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/male/sample-007-step-380950.png"
+  ],
+  "resolved_checkpoint": "/private/tmp/padchest_eval_v2/image_model_padchest_v2_tpu_v6e1/checkpoints/380950"
+}

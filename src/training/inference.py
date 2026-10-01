@@ -106,6 +106,24 @@ def _categorical(value: Any, size: int, name: str) -> jax.Array:
 def _parents(values: dict[str, Any], context_dim: int, dataset: str = "morphomnist") -> jax.Array:
     """Encode named dataset values in the schema's stable parent order."""
     if dataset == "padchest":
+        # PadChest v2 uses the six categorical variables declared by
+        # PAD_CHEST_V2_SCHEMA (5 + 2 + 1 + 5 + 6 + 2 = 21 channels).  Keep
+        # this branch separate from the historical context-17 encoder below;
+        # silently interpreting v2 values as v1 parents would produce invalid
+        # counterfactual interventions while still returning plausible arrays.
+        if context_dim == 21:
+            parts = [
+                _categorical(values.get("age_group", 0), 5, "age_group"),
+                _categorical(values.get("sex", 0), 2, "sex"),
+                jnp.asarray([float(values.get("tb_status", 0.0))], dtype=jnp.float32),
+                _categorical(values.get("projection", 0), 5, "projection"),
+                _categorical(values.get("view_position", 0), 6, "view_position"),
+                _categorical(values.get("scanner", 0), 2, "scanner"),
+            ]
+            result = jnp.concatenate(parts)[None, :]
+            if result.shape[-1] != context_dim:
+                raise ValueError(f"PadChest v2 parent encoding has dimension {result.shape[-1]}, checkpoint expects {context_dim}")
+            return result
         parts = [
             jnp.asarray([float(values.get("age_at_study", 0.0))], dtype=jnp.float32),
             _categorical(values.get("sex", 0), 2, "sex"),

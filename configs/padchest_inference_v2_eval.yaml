@@ -1,0 +1,38 @@
+version: "1"
+seed: 20260930
+dataset:
+  name: padchest
+  root: /private/tmp/padchest_eval_v2
+  input_res: 128
+  pad: 0
+causal_schema:
+  version: "2"
+  variables: [age_group, sex, tb_status, projection, view_position, scanner]
+  edges: [[age_group, tb_status], [sex, tb_status]]
+model:
+  name: hierarchical_vae
+  context_dim: 21
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.01
+  batch_size: 1
+runtime:
+  accelerator: cpu
+  precision: fp32
+artifacts:
+  root: /Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/evaluation_artifacts
+  run_name: padchest_v2_eval
+workflow:
+  type: infer
+  checkpoint: /private/tmp/padchest_eval_v2/image_model_padchest_v2_tpu_v6e1
+  parents:
+    age_group: 2
+    sex: 0
+    tb_status: 0
+    projection: 0
+    view_position: 0
+    scanner: 0
+  num_samples: 8
+  latent_temperature: 1.0
+  output_dir: /Users/mghifary/Work/Code/AI/medical-tpu/causal-genx/journal/artifacts/padchest_v2_eval/baseline
+  trust_incomplete_checkpoint: false
