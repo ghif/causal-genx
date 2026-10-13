@@ -594,19 +594,23 @@ def _load_vae_bundle(args):
     graphdef, _ = nnx.split(vae, nnx.Param)
     params = nnx.state(vae, nnx.Param).to_pure_dict()
     _, tx = init_state(vae, args, None, jax.random.PRNGKey(args.seed))
-    template = {
-        "epoch": 0,
-        "step": 0,
-        "best_loss": float("inf"),
-        "params": params,
-        "ema_params": params,
-        "opt_state": tx.init(params),
-    }
-    checkpoint = _load_runtime_checkpoint(args, args.vae_path, "vae", template=template)
+    # Keep the restore template to the shared inference leaf.  A CF checkpoint
+    # has a different optimizer tree from a standalone VAE checkpoint.
+    template = {"ema_params": params}
+    # Counterfactual checkpoints extend the standalone VAE state with
+    # ``vae_params``, ``lmbda``, and a second optimizer.  Restore only the
+    # compatible parameter leaves so a finetuned CF checkpoint can also be
+    # used by the inference/evaluation loader.
+    checkpoint = _load_runtime_checkpoint(
+        args, args.vae_path, "vae", template=template, partial_restore=True
+    )
     params = checkpoint.get("ema_params", checkpoint.get("params"))
     if params is None:
         raise ValueError(f"VAE checkpoint at {args.vae_path} is missing params")
-    _assert_tree_compatible("VAE", checkpoint, nnx.state(vae, nnx.Param).to_pure_dict(), "params")
+    _assert_tree_compatible(
+        "VAE", checkpoint, nnx.state(vae, nnx.Param).to_pure_dict(),
+        "ema_params" if "ema_params" in checkpoint else "params",
+    )
     return checkpoint, Bundle(graphdef, params)
 
 
