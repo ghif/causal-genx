@@ -88,6 +88,7 @@ class DatasetConfig(BaseModel):
     tb_label_mode: Literal["any_tb", "tb_only", "tb_or_sequelae"] = "tb_or_sequelae"
     min_category_count: PositiveInt = 1
     excluded_sources: list[dict[str, str] | str] = Field(default_factory=list)
+    metadata_rules: dict[str, dict[str, Any]] = Field(default_factory=dict)
     input_res: PositiveInt = 32
     pad: int = 4
     hflip: float = 0.5
@@ -343,19 +344,19 @@ def resolve_causal_schema(config: ExperimentConfig, fallback):
                 edges=tuple(declared.edges) if declared.edges else fallback.edges,
                 version=declared.version,
             )
-        # PadChest v2 has a stable shorthand because its six encodings are a
-        # published dataset contract. Other arbitrary schemas must be typed.
+        # PadChest v2/v3 have stable encodings. Canonical v3 configs are typed.
         if config.dataset.name == "padchest":
-            from data.padchest import PAD_CHEST_V2_SCHEMA
-            if names == PAD_CHEST_V2_SCHEMA.variable_names:
+            from data.padchest import PAD_CHEST_V2_SCHEMA, PAD_CHEST_V3_SCHEMA
+            known_schema = next((item for item in (PAD_CHEST_V2_SCHEMA, PAD_CHEST_V3_SCHEMA) if names == item.variable_names), None)
+            if known_schema is not None:
                 return CausalGraphSpec(
-                    dataset_id=PAD_CHEST_V2_SCHEMA.dataset_id,
-                    variables=PAD_CHEST_V2_SCHEMA.variables,
-                    edges=tuple(declared.edges) if declared.edges else PAD_CHEST_V2_SCHEMA.edges,
+                    dataset_id=known_schema.dataset_id,
+                    variables=known_schema.variables,
+                    edges=tuple(declared.edges) if declared.edges else known_schema.edges,
                     version=declared.version,
                 )
         raise ValueError(
-            "String causal_schema variables are only supported for a legacy dataset schema or PadChest v2; "
+            "String causal_schema variables are only supported for a legacy dataset schema or a known PadChest schema; "
             "declare kind and encoded_dim for arbitrary variables"
         )
     if any(isinstance(item, str) for item in declared.variables):
@@ -373,9 +374,10 @@ def resolve_causal_schema(config: ExperimentConfig, fallback):
         )
         for item in declared.variables
     )
-    return CausalGraphSpec(
+    schema = CausalGraphSpec(
         dataset_id=config.dataset.name,
         variables=variables,
         edges=tuple(declared.edges),
         version=declared.version,
     )
+    return schema

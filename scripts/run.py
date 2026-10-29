@@ -34,6 +34,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--dry-run-image is only supported for train-image-model")
     configure_backend(config.runtime.accelerator, config.runtime.gpu_id)
     if args.dry_run:
+        from runtime import validate_backend
+        summary = validate_backend(
+            config.runtime.accelerator,
+            expected_local_device_count=config.runtime.expected_local_device_count,
+            expected_global_device_count=config.runtime.expected_global_device_count,
+            expected_process_count=config.runtime.expected_process_count,
+        )
+        print(
+            "runtime_preflight "
+            f"backend={summary.backend} device_kind={summary.device_kind} "
+            f"local_devices={summary.local_device_count} global_devices={summary.global_device_count} "
+            f"processes={summary.process_count} process_index={summary.process_index} jax={summary.jax_version}",
+            flush=True,
+        )
         if args.command in {"train-scm", "train-predictor", "finetune-predictor", "train-image-model"}:
             output = ROOT / config.artifacts.root / config.dataset.name / config.artifacts.run_name
         elif args.command == "finetune-counterfactual":

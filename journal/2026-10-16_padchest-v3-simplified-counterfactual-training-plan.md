@@ -1,13 +1,14 @@
 # PadChest v3 simplified counterfactual model: training and configuration plan
 
-**Status:** Proposed training plan  
-**Date:** 2026-10-16  
+**Status:** GPU execution configs and v3 data path prepared; training not started
+**Date:** 2026-10-16
+**Last updated:** 2026-10-29
 **Purpose:** Train a new, compact PadChest counterfactual image-generation pipeline for TB-related downstream evaluation.
 
 ## 1. Summary
 
 This plan reduces the PadChest v2 image-conditioning schema from six variables and
-21 channels to five variables and 11 channels. It uses three age groups,
+21 channels to five variables and 9 channels. It uses continuous age,
 sex, TB status, scanner manufacturer, and a normalized projection category. TB
 status remains explicit because the downstream use is TB-related and requires
 controlled TB-positive/TB-negative image generation.
@@ -22,12 +23,15 @@ patient-level split and one v3 schema fingerprint.
 
 | Variable | Encoding | Channels | Source / derivation | Role |
 |---|---|---:|---|---|
-| `age_group` | `<18`, `18-64`, `65+` | 3 | Age from `StudyDate_DICOM` and `PatientBirth` | Demographic; parent of TB in the assumed graph; image condition |
+| `age_at_study` | Continuous age in years, normalized from `[0, 110]` to `[-1, 1]` | 1 | Difference between `StudyDate_DICOM` year and `PatientBirth` year | Demographic; parent of TB in the assumed graph; image condition |
 | `sex` | `F`, `M` | 2 | `PatientSex_DICOM` | Demographic; parent of TB in the assumed graph; image condition |
 | `tb_status` | negative, positive | 1 | `Labels`, with `tb_or_sequelae` | Clinical outcome and intervention target |
 | `scanner` | Imaging Dynamics, Philips | 2 | `Manufacturer_DICOM` | Acquisition domain; image condition |
 | `projection` | PA, AP-family, lateral | 3 | `Projection` | Acquisition geometry; image condition |
-| **Total** |  | **11** |  |  |
+| **Total** |  | **9** |  |  |
+
+The `<18`, `18-64`, and `65+` ranges remain evaluation strata only. They are not
+encoded as model variables and do not add context channels.
 
 Projection mapping is `PA → PA`, `AP` and `AP_horizontal → AP-family`, and
 `L → lateral`. Exclude `COSTAL`, `EXCLUDE`, `UNK`, and missing/unrecognized
@@ -35,17 +39,15 @@ projection values from the primary cohort. The source metadata has sufficient
 support for the three common categories; the small nonstandard groups should not
 be represented as if they had equally reliable image mechanisms.
 
-The v2 metadata maps every non-`M` sex value to one class. V3 should map `F` and
-`M` separately and exclude `O`, missing, or unrecognized sex values from the
-primary cohort. The inspected CSV contained 18 `O` and 4 missing sex entries;
-record the actual counts from the final input manifest rather than relying on
-these preliminary counts.
+V3 maps `F` and `M` separately and excludes `O`, missing, or unrecognized sex
+values from the primary cohort. Record actual exclusion counts from the final
+staging audit rather than relying on preliminary CSV counts.
 
 ## 2. Causal assumptions and scope
 
 ```mermaid
 graph LR
-  A[age_group] --> T[tb_status]
+  A[age_at_study] --> T[tb_status]
   S[sex] --> T
   A --> X[image]
   S --> X
@@ -56,18 +58,18 @@ graph LR
 
 The edges from age and sex to TB encode the observed conditional relationship
 used by the SCM. PadChest is observational: these edges do not establish that
-changing a person's age group or sex causes TB. Scanner and projection affect
+changing a person's age or sex causes TB. Scanner and projection affect
 the recorded image domain and geometry; they are not modeled as causes of TB.
 
 The plan distinguishes two types of age/sex intervention during evaluation:
 
-1. **Total SCM effect:** intervene on age or sex and let the SCM update
+1. **Total SCM effect:** intervene on age in years or sex and let the SCM update
    downstream TB according to its learned mechanism.
-2. **Controlled image effect:** intervene on age or sex while explicitly fixing
+2. **Controlled image effect:** intervene on age in years or sex while explicitly fixing
    TB to its factual value. This isolates the image model's direct response from
    changes mediated through TB.
 
-TB interventions must hold age group, sex, scanner, and projection fixed. Scanner
+TB interventions must hold age, sex, scanner, and projection fixed. Scanner
 and projection interventions must hold TB and the other non-target factors fixed.
 All counterfactual interpretations remain limited to observed support.
 
@@ -75,7 +77,8 @@ All counterfactual interpretations remain limited to observed support.
 
 ### Metadata derivation
 
-- Derive age from study date and birth year, then map to `<18`, `18-64`, or `65+`.
+- Derive age in years from the study date and birth year. Encode the scalar using
+  the fixed `[0, 110] → [-1, 1]` mapping; do not discretize it for model input.
 - Do not use the current fallback that assigns age 45 when birth year is
   missing or invalid. For v3, count invalid age records and exclude them from the
   primary causal cohort unless a documented, valid source can recover age.
@@ -97,14 +100,14 @@ All counterfactual interpretations remain limited to observed support.
 - Store schema version, categories, derivation code version, source CSV hash,
   image manifest hash, split seed, patient counts, and record-level exclusion
   reasons with the run artifacts.
-- Report counts and TB-positive rates by age group, sex, scanner, and projection,
-  plus selected intersections such as age × TB and scanner × projection. Recompute
-  every count after applying the full combined validity policy.
+- Report counts and TB-positive rates by the evaluation strata `<18`, `18-64`,
+  and `65+`, sex, scanner, and projection, plus selected intersections such as
+  age stratum × TB and scanner × projection. Recompute every count after applying
+  the full combined validity policy.
 - Existing v2 support estimates imply approximately 7,186 pediatric records
   across the former two pediatric bins, with only about 24 TB-positive cases.
-  Pooling into `<18` improves the age-group sample count but does not make
-  pediatric TB counterfactuals statistically well supported. Mark those outputs
-  exploratory and report uncertainty.
+  Continuous age preserves the observed ages but does not add pediatric TB
+  support. Mark pediatric TB counterfactuals exploratory and report uncertainty.
 
 ### Image preprocessing
 
@@ -114,35 +117,58 @@ All counterfactual interpretations remain limited to observed support.
 - Resize to grayscale `128 × 128` and normalize pixel intensities to `[-1, 1]`.
 - Keep preprocessing identical across all four model stages and the test audit.
 
-## 4. Required v3 implementation and configuration work
+## 4. V3 implementation and GPU configuration
 
-The current code has explicit v1/v2 schema selection in the PadChest provider,
-settings, context adaptation, and counterfactual restore path. A config-only
-change is insufficient. Add a v3 schema and derivation path and thread its version
-through provider construction, SCM and predictor metrics, image context creation,
-counterfactual training, checkpoint metadata validation, inference, and evaluation.
+The PadChest provider retains its legacy v1/v2 encoders, while other typed
+schemas use the shared `MetadataEncoder`. Per-variable metadata rules in the
+config define derivation and strict source mappings; v3 uses a year-difference
+rule, schema-declared linear normalization, exact sex/scanner mappings,
+projection aliases, and label membership. Invalid metadata is recorded before
+stage-manifest validation, so staging and each training split use one cohort.
+Dataset fingerprints include the full schema and metadata-rule contract. SCM
+selection depends on the schema, and inference walks declared variables to
+encode categories and normalize continuous values instead of switching on
+PadChest context dimensions. SCM, predictor, and image-model checkpoints record
+the complete variable/category/edge contract; counterfactual restore rejects a
+schema or metadata-rule mismatch before loading parameters.
 
-Create a v3 family of fully resolved configs:
+The reusable metadata-rule operations are `column`, `year_difference`,
+`category_map`, and `contains_any`. A variable's `normalization` can declare a
+source and target interval, for example `linear(0,110)->(-1,1)`. Unknown fields,
+categories, or binary values are rejected and captured as row exclusion reasons.
 
-- `configs/padchest_scm_v3_tpu_v6e1.yaml`
-- `configs/padchest_predictor_v3_tpu_v6e1.yaml`
-- `configs/padchest_image_model_v3_tpu_v6e1.yaml`
-- `configs/padchest_counterfactual_v3_tpu_v6e1.yaml`
+The GPU-ready configs are:
 
-Every config must declare the same ordered five-variable schema and edges,
-`causal_schema.version: "3"`, and `model.context_dim: 11`. Preserve typed category
-names and source mapping in the configs. Make the v3 cohort and exclusion policy
-explicit rather than relying on silent defaults.
+- `configs/padchest_scm_v3_gpu.yaml`
+- `configs/padchest_predictor_v3_gpu.yaml`
+- `configs/padchest_image_model_v3_gpu.yaml`
+- `configs/padchest_counterfactual_v3_gpu.yaml`
 
-Use separate artifact paths, for example:
+Every config declares the same ordered schema and edges, schema version 3, and
+`model.context_dim: 9`. The age variable is continuous and normalized by the
+schema transform `linear(0,110)->(-1,1)`. The shared context order is age, sex, TB, scanner,
+projection. V3 excludes invalid/missing age, non-F/M sex, unrecognized scanner,
+and projections outside PA/AP/AP_horizontal/L; AP and AP_horizontal are merged.
 
-- Local: `checkpoints/padchest/<stage>_padchest_v3_tpu_v6e1/`
-- Remote: `gs://external-cxr-dataset/padchest/checkpoints_v3/padchest/<stage>_padchest_v3_tpu_v6e1/`
+The configs target one GPU (`gpu_id: "0"`, one local/global device and process,
+`execution_mode: single_device`). SCM uses fp32 as required by the current SCM
+training scope. Predictor, HVAE, and counterfactual training use bf16 to reduce
+memory; change those configs to fp32 if the selected GPU/runtime does not support
+bf16 reliably. The v3 local image stage is separate from v2 at
+`/mnt/data/dataset/padchest/input-stage/v3-images`.
 
-Use complete, exact step checkpoints in downstream configs. Validate all
-checkpoint schema versions, ordered variable names, category definitions, and
-context dimensions before training or restoring. Never point a v3 stage at a v2
-checkpoint.
+Artifact namespace:
+
+- Local: `checkpoints/padchest/<stage>_padchest_v3_gpu/`
+- Remote: `gs://external-cxr-dataset/padchest/checkpoints_v3/padchest/<stage>_padchest_v3_gpu/`
+
+The counterfactual config points to the upstream `checkpoints/` roots; the loader
+resolves the latest complete Orbax checkpoint beneath each root after those
+stages finish. Select and record the actual steps before launch. Set
+`workflow.elbo_constraint` using the measured v3 base-HVAE validation ELBO; the
+checked-in `1.0` is a placeholder and must be replaced before counterfactual
+training. The metadata CSV remains a VM-local configured path, so mount/copy it
+to `/mnt/data/dataset/padchest/metadata/` before staging.
 
 ## 5. Training sequence and initial settings
 
@@ -152,10 +178,10 @@ epoch is best.
 
 | Stage | Initial settings | Artifact selection |
 |---|---|---|
-| SCM | TPU, fp32, seed 7, widths `[64, 64]`, batch 64, learning rate `1e-4`, weight decay `0.1`, 100 epochs, checkpoint each epoch | Lowest validation likelihood/loss subject to calibrated marginals and subgroup support |
-| Predictor | TPU, bf16, batch 64, learning rate `1e-4`, weight decay `0.1`, up to 100 epochs, checkpoint each epoch | Best validation loss with per-variable age, sex, TB, scanner, and projection metrics |
-| Base HVAE | TPU, bf16, `128 × 128`, batch 32, conditional prior, learning rate `5e-4`, weight decay `0.01`, up to 100 epochs, checkpoint every 5 epochs | Best validation ELBO/NLL that also produces acceptable image panels and subgroup metrics |
-| Counterfactual HVAE | Initialize from the v3 base HVAE, SCM, and predictor; TPU, bf16, batch 32, one particle, `alpha=0.1`, `lambda_init=0`, `lr_lagrange=0.01`, damping 100, 100 epochs, checkpoint/evaluate every 5 epochs | Best checkpoint satisfying the validation ELBO constraint while improving target agreement without harming reconstruction |
+| SCM | Single GPU, fp32, seed 7, widths `[64, 64]`, batch 64, LR `1e-4`, weight decay `0.1`, 100 epochs, checkpoint each epoch | Lowest validation likelihood/loss subject to calibrated marginals and subgroup support |
+| Predictor | Single GPU, bf16, batch 32, LR `1e-4`, weight decay `0.1`, 100 epochs, checkpoint each epoch | Best validation loss with age MAE/calibration and per-variable sex, TB, scanner, and projection metrics |
+| Base HVAE | Single GPU, bf16, `128 × 128`, batch 32, conditional prior, LR `5e-4`, weight decay `0.01`, up to 100 epochs, checkpoint every 5 epochs | Best validation ELBO/NLL that also produces acceptable image panels and subgroup metrics |
+| Counterfactual HVAE | v3 base HVAE, SCM, and predictor; single GPU, bf16, batch 32, one particle, `alpha=0.1`, `lambda_init=0`, `lr_lagrange=0.01`, damping 100, 100 epochs, checkpoint/evaluate every 5 epochs | Best checkpoint satisfying validation ELBO constraint while improving target agreement without harming reconstruction |
 
 For the first counterfactual run, set the ELBO constraint from the measured v3
 base-HVAE validation ELBO, not the v2 value `1.9730`. The v3 context and filtered
@@ -164,56 +190,75 @@ automatically transferable.
 
 ### Run order
 
-1. Validate all four configs and their shared schema with `--dry-run`.
-2. Audit data derivation, patient-level splits, source availability, staged
-   images, and category support before accelerator training.
+1. On the GPU VM, verify config/GPU discovery with `--dry-run`.
+2. Audit data derivation, patient-level splits, source availability, and category
+   support. Inspect and execute bounded image staging before long training runs.
 3. Train the v3 SCM and select/validate its best checkpoint.
-4. Train the v3 predictor and inspect category-level confusion matrices and
-   calibration. Fix metadata or class imbalance issues before proceeding.
+4. Train the v3 predictor and inspect category metrics.
 5. Train the v3 base HVAE and inspect reconstructions and conditional prior
-   samples by age group, sex, TB status, scanner, and projection.
-6. Measure the base HVAE validation ELBO and configure the v3 counterfactual
-   constraint from that result.
-7. Fine-tune the counterfactual HVAE using exact SCM and predictor checkpoints.
-8. Run the fixed patient-disjoint evaluation, generate qualitative panels and
-   difference maps, and write training outcomes to a separate dated report.
+   samples across supported ages, sex, TB status, scanner, and projection.
+6. Measure the base HVAE validation ELBO and set the v3 counterfactual constraint.
+7. Fine-tune the counterfactual HVAE using the completed v3 artifacts.
+8. Run fixed patient-disjoint evaluation and qualitative panels.
 
-Example config validation and training commands from `causal-genx/`:
+### GPU VM runbook
+
+Run from `causal-genx/` after installing the repository's CUDA-enabled JAX
+environment and mounting the metadata CSV at its configured local path:
 
 ```bash
 PYTHONPATH=src python scripts/run.py train-scm \
-  --config configs/padchest_scm_v3_tpu_v6e1.yaml --dry-run
-PYTHONPATH=src python scripts/run.py train-scm \
-  --config configs/padchest_scm_v3_tpu_v6e1.yaml
-
+  --config configs/padchest_scm_v3_gpu.yaml --dry-run
 PYTHONPATH=src python scripts/run.py train-predictor \
-  --config configs/padchest_predictor_v3_tpu_v6e1.yaml
+  --config configs/padchest_predictor_v3_gpu.yaml --dry-run
 PYTHONPATH=src python scripts/run.py train-image-model \
-  --config configs/padchest_image_model_v3_tpu_v6e1.yaml
+  --config configs/padchest_image_model_v3_gpu.yaml --dry-run
 PYTHONPATH=src python scripts/run.py finetune-counterfactual \
-  --config configs/padchest_counterfactual_v3_tpu_v6e1.yaml
+  --config configs/padchest_counterfactual_v3_gpu.yaml --dry-run
+PYTHONPATH=src python scripts/stage_padchest_inputs.py \
+  --config configs/padchest_predictor_v3_gpu.yaml
+PYTHONPATH=src python scripts/stage_padchest_inputs.py \
+  --config configs/padchest_predictor_v3_gpu.yaml --execute
+PYTHONPATH=src python scripts/run.py train-scm \
+  --config configs/padchest_scm_v3_gpu.yaml
+PYTHONPATH=src python scripts/run.py train-predictor \
+  --config configs/padchest_predictor_v3_gpu.yaml
+PYTHONPATH=src python scripts/run.py train-image-model \
+  --config configs/padchest_image_model_v3_gpu.yaml
+# First set workflow.elbo_constraint from the measured v3 base-HVAE validation ELBO.
+PYTHONPATH=src python scripts/run.py finetune-counterfactual \
+  --config configs/padchest_counterfactual_v3_gpu.yaml
 ```
 
-Run each command in the configured TPU environment after staging the matching
-image manifest. The commands are illustrative runbook entries; each config must
-contain completed checkpoint paths before dependent stages are launched.
+The VM identity needs read access to the configured image/metadata sources and
+write access to the `checkpoints_v3` bucket prefix. A GPU VM does not imply GCS
+permissions: the prior compute service account received a 403, so verify
+`gcloud auth list` and read-only `gcloud storage ls` on the exact prefixes before
+staging. Use authorized VM ADC or an approved user credential; never place keys
+in YAML. The stage plan is bounded by configured item/byte limits; inspect its
+estimated size and adjust if the complete valid cohort exceeds them.
 
 ## 6. Evaluation and acceptance criteria
 
 ### SCM
 
-- Verify generated category frequencies against the held-out distribution with
-  marginal and conditional plots/tables.
-- Check `P(tb_status | age_group, sex)` by observed support, calibration, and
-  uncertainty. Avoid claims for cells with very few positive observations.
+- Compare the generated age distribution with the held-out age distribution;
+  report continuous calibration and summary plots, plus subgroup results by the
+  three age strata.
+- Check `P(tb_status | age_at_study, sex)` across observed age support. Report
+  calibration and uncertainty both overall and by age strata; avoid claims for
+  regions with very few positive observations.
+- Keep SCM age samples within the observed training range. Evaluate intervention
+  targets at empirical age quantiles and report the corresponding ages in years.
 - Confirm all sampled categorical values are valid, no non-finite values occur,
   and interventions preserve non-descendants according to the graph.
 
 ### Predictor
 
-- Report confusion matrices, accuracy, macro-F1, per-class recall, and calibration
-  for all categorical variables; report TB sensitivity/specificity and AUROC.
-- Evaluate by age, sex, scanner, and projection strata to expose shortcut reliance
+- Report age MAE in years and calibration. Report confusion matrices, accuracy,
+  macro-F1, per-class recall, and calibration for categorical variables; report
+  TB sensitivity/specificity and AUROC.
+- Evaluate by age strata, sex, scanner, and projection to expose shortcut reliance
   and weakly supported classes.
 - Treat low performance in the `<18` TB-positive subset as a support limitation,
   not a reason to claim or tune toward unsupported realism.
@@ -228,6 +273,7 @@ contain completed checkpoint paths before dependent stages are launched.
   classifier and verify that age, sex, scanner, and projection predictions remain
   stable where the intervention semantics require them to.
 - For age and sex, report both total and TB-held-fixed effects as defined above.
+  For age, state the target ages in years and keep them within observed support.
 - Generate paired image panels and absolute difference heatmaps with consistent
   scales. Captions must say heatmaps show pixel changes, not saliency or clinical
   explanations.
@@ -247,7 +293,10 @@ failure and revise training before generating augmentation data for the TB task.
 ## 7. Main limitations and risks
 
 - `<18` contains far fewer images and TB-positive labels than adult groups; its
-  counterfactuals will have high uncertainty even after pooling pediatric ages.
+  counterfactuals will have high uncertainty even with continuous age input.
+- PadChest age is derived from year-level metadata, so continuous encoding does
+  not imply exact age-of-study measurement. Smooth age responses between sparse
+  observations may be model assumptions rather than learned clinical changes.
 - The scanner categories represent only two manufacturers from this dataset and
   do not guarantee generalization to other institutions or devices.
 - Projection categories have been normalized for support and simplicity. The

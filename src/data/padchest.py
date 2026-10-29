@@ -56,6 +56,20 @@ PAD_CHEST_V2_SCHEMA = CausalGraphSpec(
     edges=(("age_group", "tb_status"), ("sex", "tb_status")),
 )
 PAD_CHEST_SCHEMA_V2 = PAD_CHEST_V2_SCHEMA
+PAD_CHEST_V3_SCANNERS = ("ImagingDynamicsCompanyLtd", "PhilipsMedicalSystems")
+PAD_CHEST_V3_PROJECTIONS = ("PA", "AP-family", "lateral")
+PAD_CHEST_V3_SCHEMA = CausalGraphSpec(
+    dataset_id="padchest",
+    version="3",
+    variables=(
+        VariableSpec("age_at_study", VariableKind.CONTINUOUS, normalization="linear(0,110)->(-1,1)", source="derived_age_at_study"),
+        VariableSpec("sex", VariableKind.CATEGORICAL, encoded_dim=2, categories=("F", "M"), source="PatientSex_DICOM"),
+        VariableSpec("tb_status", VariableKind.BINARY, source="Labels"),
+        VariableSpec("scanner", VariableKind.CATEGORICAL, encoded_dim=2, categories=PAD_CHEST_V3_SCANNERS, source="Manufacturer_DICOM"),
+        VariableSpec("projection", VariableKind.CATEGORICAL, encoded_dim=3, categories=PAD_CHEST_V3_PROJECTIONS, source="Projection"),
+    ),
+    edges=(("age_at_study", "tb_status"), ("sex", "tb_status")),
+)
 
 AGE_AT_STUDY_MIN = 0.0
 AGE_AT_STUDY_MAX = 110.0
@@ -630,6 +644,7 @@ class PadChestDataset:
         stage_manifest: str = "",
         stage_mode: str = "auto",
         excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
+        metadata_rules: Mapping[str, Mapping[str, Any]] | None = None,
         concat_pa: bool = True,
     ):
         rows = _read_rows(metadata)
@@ -639,11 +654,20 @@ class PadChestDataset:
         selected = _split_patients(tuple(groups), seed)[split]
         selected_rows = [(row_index, row) for patient in selected for row_index, row in groups[patient] if row.get("ImageID")]
         self.root, self.image_prefix, self.input_res, self.tb_label_mode = root, image_prefix, input_res, tb_label_mode
-        self.schema = schema or (PAD_CHEST_V2_SCHEMA if str(schema_version) == "2" else PAD_CHEST_SCHEMA)
+        self.schema = schema or (PAD_CHEST_V3_SCHEMA if str(schema_version) == "3" else PAD_CHEST_V2_SCHEMA if str(schema_version) == "2" else PAD_CHEST_SCHEMA)
         self.stage_dir = stage_dir
         self.stage_manifest = stage_manifest or (_default_stage_manifest(stage_dir) if stage_dir else "")
         self.stage_mode = stage_mode
         self.concat_pa = concat_pa
+        legacy_v1 = self.schema == PAD_CHEST_SCHEMA and not metadata_rules
+        legacy_v2 = self.schema == PAD_CHEST_V2_SCHEMA and not metadata_rules
+        if legacy_v1:
+            derive = lambda row: _derive(row, tb_label_mode)
+        elif legacy_v2:
+            derive = lambda row: derive_padchest_v2_row(row, tb_label_mode)
+        else:
+            derive = MetadataEncoder(self.schema, rules=metadata_rules, label_mode=tb_label_mode)
+        derived_by_id: dict[str, dict[str, Any]] = {}
         exclusions = _configured_exclusions(excluded_sources)
         if self.stage_manifest and self.stage_mode != "off":
             manifest_exclusions = _load_manifest_exclusions(self.stage_manifest)
@@ -663,6 +687,12 @@ class PadChestDataset:
                     "row_index": row_index,
                 })
                 continue
+            if not (legacy_v1 or legacy_v2):
+                try:
+                    derived_by_id[row["ImageID"]] = derive(row)
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.excluded_records.append({"kind": "metadata_excluded", "image_id": row["ImageID"], "source": source, "reason": str(exc), "split": split, "row_index": row_index})
+                    continue
             self.rows.append(row)
         expected_sources = {row["ImageID"]: self._source_image_path(row) for row in self.rows}
         self._staged_images = _load_stage_manifest(self.stage_manifest, stage_dir, expected_sources) if stage_dir and stage_mode != "off" else {}
@@ -681,13 +711,7 @@ class PadChestDataset:
                     raise RuntimeError(
                         f"input_stage_mode=require but staged image path {first_staged!r} is not a valid file on disk."
                     )
-        if self.schema.version == "2" and self.schema.variable_names == PAD_CHEST_V2_SCHEMA.variable_names:
-            derive = lambda row: derive_padchest_v2_row(row, tb_label_mode)
-        elif self.schema.version == "1" and self.schema.variable_names == PAD_CHEST_SCHEMA.variable_names:
-            derive = lambda row: _derive(row, tb_label_mode)
-        else:
-            derive = MetadataEncoder(self.schema)
-        self._metadata = [derive(row) for row in self.rows]
+        self._metadata = [derived_by_id[row["ImageID"]] if row["ImageID"] in derived_by_id else derive(row) for row in self.rows]
         self.samples = {
             spec.name: (
                 np.stack([np.asarray(metadata[spec.name]) for metadata in self._metadata]).astype(np.float32)
@@ -698,7 +722,7 @@ class PadChestDataset:
         }
         self.min_max = {"age_at_study": (AGE_AT_STUDY_MIN, AGE_AT_STUDY_MAX), "study_year": (STUDY_YEAR_MIN, STUDY_YEAR_MAX)}
         self.cache_fingerprint = hashlib.sha256(
-            f"padchest|{root}|{metadata}|{image_prefix}|{split}|{input_res}|{tb_label_mode}|{seed}|{json.dumps(exclusions, sort_keys=True)}".encode()
+            f"padchest|{root}|{metadata}|{image_prefix}|{split}|{input_res}|{tb_label_mode}|{seed}|{self.schema.version}|{json.dumps(self.schema, default=str, sort_keys=True)}|{json.dumps(metadata_rules or {}, sort_keys=True)}|{json.dumps(exclusions, sort_keys=True)}".encode()
         ).hexdigest()[:16]
 
     def __len__(self):
@@ -776,9 +800,10 @@ class PadChestProvider:
         stage_manifest: str = "",
         stage_mode: str = "auto",
         excluded_sources: Sequence[Mapping[str, str] | str] | None = None,
+        metadata_rules: Mapping[str, Mapping[str, Any]] | None = None,
         concat_pa: bool = True,
     ):
-        self.schema = schema or (PAD_CHEST_V2_SCHEMA if str(schema_version) == "2" else PAD_CHEST_SCHEMA)
+        self.schema = schema or (PAD_CHEST_V3_SCHEMA if str(schema_version) == "3" else PAD_CHEST_V2_SCHEMA if str(schema_version) == "2" else PAD_CHEST_SCHEMA)
         self.schema_version = schema_version
         self.root, self.input_res, self.pad, self.context_norm = root, input_res, pad, context_norm
         self.metadata = metadata or f"{root.rstrip('/')}/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv"
@@ -786,6 +811,7 @@ class PadChestProvider:
         self.tb_label_mode, self.seed = tb_label_mode, seed
         self.stage_dir, self.stage_manifest, self.stage_mode = stage_dir, stage_manifest, stage_mode
         self.excluded_sources = excluded_sources or []
+        self.metadata_rules = metadata_rules or {}
         self.concat_pa = concat_pa
 
     @property
@@ -807,6 +833,7 @@ class PadChestProvider:
             stage_manifest=self.stage_manifest,
             stage_mode=self.stage_mode,
             excluded_sources=self.excluded_sources,
+            metadata_rules=self.metadata_rules,
             concat_pa=self.concat_pa,
         )
 
@@ -816,7 +843,7 @@ class PadChestProvider:
 
     def fingerprint(self) -> str:
         exclusions = _configured_exclusions(self.excluded_sources)
-        value = f"{self.root}|{self.metadata}|{self.image_prefix}|{self.input_res}|{self.tb_label_mode}|{self.schema.version}|{json.dumps(exclusions, sort_keys=True)}"
+        value = f"{self.root}|{self.metadata}|{self.image_prefix}|{self.input_res}|{self.tb_label_mode}|{self.schema.version}|{json.dumps(self.schema, default=str, sort_keys=True)}|{json.dumps(self.metadata_rules, sort_keys=True)}|{json.dumps(exclusions, sort_keys=True)}"
         return hashlib.sha256(value.encode()).hexdigest()[:16]
 
 
@@ -851,8 +878,11 @@ def stage_padchest_images(
         getattr(settings, "image_prefix", ""),
         getattr(settings, "tb_label_mode", "tb_or_sequelae"),
         settings.seed,
+        schema=getattr(settings, "schema", None),
+        schema_version=str(getattr(getattr(settings, "schema", None), "version", getattr(settings, "schema_version", "1"))),
         stage_mode="off",
         excluded_sources=getattr(settings, "excluded_sources", None) or getattr(settings, "input_stage_exclusions", None) or [],
+        metadata_rules=getattr(settings, "metadata_rules", None) or {},
     )
     unique: dict[str, dict[str, Any]] = {}
     split_counts: dict[str, int] = {}
@@ -1075,7 +1105,7 @@ def padchest(settings) -> dict[str, PadChestDataset]:
         schema_version = str(causal_schema["version"])
     schema = getattr(settings, "schema", None)
     if not isinstance(schema, CausalGraphSpec):
-        schema = PAD_CHEST_SCHEMA_V2 if str(schema_version) == "2" else PAD_CHEST_SCHEMA
+        schema = PAD_CHEST_V3_SCHEMA if str(schema_version) == "3" else PAD_CHEST_SCHEMA_V2 if str(schema_version) == "2" else PAD_CHEST_SCHEMA
     provider = PadChestProvider(
         settings.data_dir,
         settings.input_res,
@@ -1087,6 +1117,7 @@ def padchest(settings) -> dict[str, PadChestDataset]:
         settings.seed,
         schema=schema,
         schema_version=schema_version,
+        metadata_rules=getattr(settings, "metadata_rules", None) or {},
         concat_pa=getattr(settings, "concat_pa", True),
         **_stage_settings(settings),
     )

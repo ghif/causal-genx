@@ -85,6 +85,7 @@ class ImageModelSettings:
     image_prefix: str = ""
     tb_label_mode: str = "tb_or_sequelae"
     excluded_sources: list[dict[str, str]] | None = None
+    metadata_rules: dict[str, dict[str, Any]] | None = None
     input_stage_mode: str = "auto"
     input_stage_dir: str = ""
     input_stage_manifest: str = ""
@@ -158,6 +159,7 @@ def image_model_settings(config: ExperimentConfig) -> ImageModelSettings:
         metadata=config.dataset.metadata, image_prefix=config.dataset.image_prefix,
         tb_label_mode=config.dataset.tb_label_mode,
         excluded_sources=list(config.dataset.excluded_sources or []),
+        metadata_rules=dict(config.dataset.metadata_rules),
         schema=schema,
         input_stage_mode=getattr(workflow, "input_stage_mode", "auto"),
         input_stage_dir=getattr(workflow, "input_stage_dir", ""),
@@ -224,6 +226,7 @@ def image_model_settings_for_counterfactual(config: ExperimentConfig) -> dict[st
         metadata=config.dataset.metadata, image_prefix=config.dataset.image_prefix,
         tb_label_mode=config.dataset.tb_label_mode,
         excluded_sources=list(config.dataset.excluded_sources or []),
+        metadata_rules=dict(config.dataset.metadata_rules),
         schema=schema,
         input_stage_mode=getattr(workflow, "input_stage_mode", "auto"),
         input_stage_dir=getattr(workflow, "input_stage_dir", ""),

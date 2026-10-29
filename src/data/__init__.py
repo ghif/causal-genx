@@ -7,6 +7,7 @@ from .cxr_rait import CXR_RAIT_SCHEMA, CxrRaitDataset, CxrRaitProvider, cxr_rait
 from .padchest import (
     PAD_CHEST_SCHEMA,
     PAD_CHEST_V2_SCHEMA,
+    PAD_CHEST_V3_SCHEMA,
     PadChestDataset,
     PadChestProvider,
     audit_padchest_v2_rows,
@@ -28,6 +29,7 @@ __all__ = [
     "CxrRaitProvider",
     "PAD_CHEST_SCHEMA",
     "PAD_CHEST_V2_SCHEMA",
+    "PAD_CHEST_V3_SCHEMA",
     "audit_padchest_v2_rows",
     "derive_padchest_v2_row",
     "PadChestDataset",

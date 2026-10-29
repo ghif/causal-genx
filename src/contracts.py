@@ -133,6 +133,28 @@ class CausalGraphSpec:
             raise ValueError(f"Invalid intervention; unknown={sorted(unknown)}, forbidden={forbidden}")
 
 
+def causal_schema_contract(schema: CausalGraphSpec) -> dict[str, Any]:
+    """Return a stable, JSON-safe representation of the complete encoding/DAG contract."""
+    return {
+        "dataset_id": schema.dataset_id,
+        "version": str(schema.version),
+        "variables": [
+            {
+                "name": item.name,
+                "kind": item.kind.value,
+                "encoded_dim": int(item.encoded_dim),
+                "categories": list(item.categories),
+                "normalization": item.normalization,
+                "source": item.source,
+                "observed": bool(item.observed),
+                "intervenable": bool(item.intervenable),
+            }
+            for item in schema.variables
+        ],
+        "edges": [list(edge) for edge in schema.edges],
+    }
+
+
 @dataclass(frozen=True)
 class ImageSpec:
     channels: int

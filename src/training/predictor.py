@@ -24,7 +24,7 @@ import numpy as np
 import optax
 from flax import nnx
 
-from contracts import CausalGraphSpec
+from contracts import CausalGraphSpec, causal_schema_contract
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
 from config import ExperimentConfig, PredictorTrainingConfig, resolve_causal_schema
 from data.morphomnist import morphomnist
@@ -101,6 +101,7 @@ class PredictorRunArguments:
     input_stage_size_sample_items: int = 256
     input_stage_workers: int = 16
     excluded_sources: list[dict[str, str]] | None = None
+    metadata_rules: dict[str, dict[str, Any]] | None = None
     augment: bool = True
     type: str = "train-predictor"
     save_dir: str = ""
@@ -330,6 +331,7 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         input_stage_size_sample_items=getattr(workflow, "input_stage_size_sample_items", 256),
         input_stage_workers=getattr(workflow, "input_stage_workers", 16),
         excluded_sources=list(getattr(config.dataset, "excluded_sources", []) or []),
+        metadata_rules=dict(config.dataset.metadata_rules),
         augment=augment,
         type=workflow.type,
         predictor_model=workflow.predictor_model,
@@ -900,7 +902,11 @@ def _prediction_metrics(
 
 
 def _checkpoint_payload(args: PredictorRunArguments, model_params: Any, batch_stats: Any, ema: WarmupEMA, opt_state: Any, epoch: int, step: int, best_loss: float) -> Dict[str, Any]:
-    return {"params": ema.params, "ema_params": ema.params, "model_params": model_params, "batch_stats": batch_stats, "ema_batch_stats": ema.batch_stats, "opt_state": opt_state, "epoch": epoch, "step": step, "best_loss": best_loss, "ema_step": ema.step, "ema_initted": ema.initted, "hparams": vars(args), "format_version": 3}
+    hparams = dict(vars(args))
+    if isinstance(getattr(args, "schema", None), CausalGraphSpec):
+        hparams["causal_schema_contract"] = causal_schema_contract(args.schema)
+        hparams["causal_schema_version"] = str(args.schema.version)
+    return {"params": ema.params, "ema_params": ema.params, "model_params": model_params, "batch_stats": batch_stats, "ema_batch_stats": ema.batch_stats, "opt_state": opt_state, "epoch": epoch, "step": step, "best_loss": best_loss, "ema_step": ema.step, "ema_initted": ema.initted, "hparams": hparams, "format_version": 3}
 
 
 def _restore_args(args: PredictorRunArguments, checkpoint: Dict[str, Any]) -> None:

@@ -10,6 +10,20 @@ import numpy as np
 from contracts import CausalGraphSpec
 
 
+def adapt_parent_context(dataset_id: str, values: np.ndarray, target_dim: int) -> np.ndarray:
+    """Apply a registered legacy context adaptation or reject a dimension mismatch."""
+    array = np.asarray(values)
+    source_dim = int(array.shape[-1])
+    if source_dim == int(target_dim):
+        return array
+    if dataset_id == "padchest":
+        from data.padchest import adapt_padchest_hvae_context
+        return adapt_padchest_hvae_context(array, target_dim=target_dim)
+    raise ValueError(
+        f"{dataset_id} parent context has {source_dim} channels; model expects {target_dim}"
+    )
+
+
 @dataclass(frozen=True)
 class ParentEncoder:
     schema: CausalGraphSpec

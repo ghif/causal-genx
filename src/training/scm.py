@@ -27,6 +27,7 @@ import numpy as np
 import optax
 from flax import nnx
 
+from contracts import causal_schema_contract
 from causal.flow_scm import MorphoMNISTPGM
 from config import ExperimentConfig, ScmTrainingConfig, resolve_causal_schema
 from data.morphomnist import morphomnist
@@ -86,6 +87,7 @@ class ScmRunArguments:
     context_norm: str = ""
     context_dim: int = 0
     concat_pa: bool = False
+    metadata_rules: dict[str, dict[str, Any]] | None = None
     save_dir: str = ""
     checkpoint_dir: str = ""
     remote_save_dir: str = ""
@@ -148,6 +150,7 @@ def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
         widths=list(workflow.widths),
         benchmark_steps=workflow.benchmark_steps,
         schema=schema,
+        metadata_rules=dict(config.dataset.metadata_rules),
     )
 
 
@@ -530,6 +533,7 @@ def _checkpoint_payload(args: ScmRunArguments, params: Any, ema: PGMEMA, opt_sta
     if getattr(args, "schema", None) is not None:
         hparams["causal_schema_version"] = args.schema.version
         hparams["causal_schema_variables"] = list(args.schema.variable_names)
+        hparams["causal_schema_contract"] = causal_schema_contract(args.schema)
         hparams["context_dim"] = args.schema.encoded_dim
     return {"params": ema.params, "ema_params": ema.params, "model_params": params, "opt_state": opt_state, "epoch": epoch, "step": step, "best_loss": best_loss, "ema_step": ema.step, "ema_initted": ema.initted, "hparams": hparams, "format_version": 2}
 
@@ -571,7 +575,8 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
     elif args.dataset == "padchest":
         from data.padchest import padchest
         datasets = padchest(args)
-        if getattr(args.schema, "version", "1") == "2":
+        from data.padchest import PAD_CHEST_SCHEMA
+        if args.schema != PAD_CHEST_SCHEMA:
             from causal.generic_scm import SchemaDrivenSCM
             model = SchemaDrivenSCM(args.schema, widths=args.widths, rngs=nnx.Rngs(args.seed))
         else:

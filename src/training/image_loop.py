@@ -19,6 +19,7 @@ import numpy as np
 import optax
 from flax import nnx
 
+from contracts import causal_schema_contract
 from utils import BackgroundArtifactWriter, EMA, append_text_file, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, sync_file, sync_tree, write_images
 
 
@@ -55,16 +56,12 @@ def preprocess_batch(args, batch, expand_pa: bool = False, compact_pa: bool = Fa
         # final channel axis just like the compact representation.
         pa = np.transpose(pa, (0, 2, 3, 1))
     if pa.shape[-1] != expected_context_dim:
-        if getattr(args, "dataset_id", getattr(args, "dataset", "")) == "padchest":
-            from data.padchest import adapt_padchest_hvae_context
-            pa = adapt_padchest_hvae_context(pa, target_dim=expected_context_dim)
-        else:
-            raise ValueError(
-                "Parent encoding dimension does not match the configured model context: "
-                f"expected {expected_context_dim}, got {pa.shape[-1]}. "
-                "Use an explicit dataset adapter for a documented artifact contract; "
-                "implicit padding or truncation is not supported."
-            )
+        from data.conditioning import adapt_parent_context
+        pa = adapt_parent_context(
+            getattr(args, "dataset_id", getattr(args, "dataset", "")),
+            pa,
+            expected_context_dim,
+        )
 
     if not compact_pa and (expand_pa or pa.ndim == 2):
         pa = pa[:, :, None, None]
@@ -316,6 +313,11 @@ def save_state(
     wait: bool = False,
 ):
     state = _portable_state(state)
+    hparams = dict(vars(args))
+    schema = getattr(args, "schema", None)
+    if schema is not None:
+        hparams["causal_schema_contract"] = causal_schema_contract(schema)
+        hparams["causal_schema_version"] = str(schema.version)
     ckpt = {
         "epoch": epoch,
         "step": state.step,
@@ -323,7 +325,7 @@ def save_state(
         "params": state.params,
         "ema_params": state.ema.params,
         "opt_state": state.opt_state,
-        "hparams": vars(args),
+        "hparams": hparams,
     }
     path = args.checkpoint_dir
     metadata = {"epoch": epoch, "best_loss": float(state.best_loss)}

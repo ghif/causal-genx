@@ -26,15 +26,14 @@ import optax
 from flax import nnx
 
 from config import CounterfactualTrainingConfig, ExperimentConfig
-from contracts import CausalGraphSpec, VariableKind
+from contracts import CausalGraphSpec, VariableKind, causal_schema_contract
+from data.conditioning import adapt_parent_context
 from data.cxr_rait import CXR_RAIT_SCHEMA, cxr_rait
 from data.morphomnist import MORPHOMNIST_SCHEMA, morphomnist
 from data.padchest import (
-    PAD_CHEST_HVAE_CONTEXT_DIM,
-    PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM,
     PAD_CHEST_SCHEMA,
     PAD_CHEST_SCHEMA_V2,
-    PAD_CHEST_SOURCE_CONTEXT_DIM,
+    PAD_CHEST_V3_SCHEMA,
     padchest,
 )
 from models.image_vae import HVAE
@@ -180,8 +179,12 @@ _SCHEMAS: dict[str, CausalGraphSpec] = {
 def _schema_for_dataset(dataset: str, configured: CausalGraphSpec | None = None, schema_version: str | int | None = None) -> CausalGraphSpec:
     if isinstance(configured, CausalGraphSpec):
         return configured
-    if dataset == "padchest" and (str(schema_version) == "2" or (configured is not None and getattr(configured, "version", "") == "2")):
-        return PAD_CHEST_SCHEMA_V2
+    if dataset == "padchest":
+        version = str(schema_version or getattr(configured, "version", "1"))
+        if version == "3":
+            return PAD_CHEST_V3_SCHEMA
+        if version == "2":
+            return PAD_CHEST_SCHEMA_V2
     try:
         return _SCHEMAS[dataset]
     except KeyError as exc:
@@ -241,7 +244,7 @@ def _build_pgm_model(args, hparams: Dict[str, Any]):
     if args.dataset == "cxr_rait":
         return CxrRaitPGM(widths=widths, rngs=rngs)
     if args.dataset == "padchest":
-        if hparams.get("causal_schema_version") == "2" or str(getattr(args, "schema_version", "")) == "2":
+        if _schema_for_args(args) != PAD_CHEST_SCHEMA:
             schema = _schema_for_args(args)
             return SchemaDrivenSCM(schema=schema, widths=widths, rngs=rngs)
         return PadChestPGM(widths=widths, rngs=rngs)
@@ -462,29 +465,8 @@ def _preprocess_counterfactual_batch(args, raw_batch):
 
 
 def _hvae_context(args, pa: jax.Array, target_dim: int) -> jax.Array:
-    schema = _schema_for_args(args)
-    if args.dataset != "padchest" or str(getattr(args, "schema_version", "")) == "2" or getattr(schema, "version", "") == "2":
-        if int(pa.shape[-1]) != int(target_dim):
-            raise ValueError(
-                "Parent encoding dimension does not match the HVAE context: "
-                f"expected {target_dim}, got {pa.shape[-1]}"
-            )
-        return pa
-    if int(pa.shape[-1]) != PAD_CHEST_SOURCE_CONTEXT_DIM:
-        raise ValueError(
-            f"PadChest causal context must have dimension {PAD_CHEST_SOURCE_CONTEXT_DIM}, got {pa.shape[-1]}"
-        )
-    if int(target_dim) == PAD_CHEST_SOURCE_CONTEXT_DIM:
-        return pa
-    if int(target_dim) != PAD_CHEST_HVAE_CONTEXT_DIM:
-        raise ValueError(
-            "Unsupported PadChest HVAE context dimension: "
-            f"expected {PAD_CHEST_SOURCE_CONTEXT_DIM} or {PAD_CHEST_HVAE_CONTEXT_DIM}, got {target_dim}"
-        )
-    extension = jnp.zeros(
-        pa.shape[:-1] + (PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM,), dtype=pa.dtype
-    )
-    return jnp.concatenate((pa, extension), axis=-1)
+    adapted = adapt_parent_context(args.dataset, np.asarray(pa), target_dim)
+    return jnp.asarray(adapted, dtype=pa.dtype)
 
 
 def _expand_parents(pa: jax.Array, input_res: int, *, expected_dim: int | None = None) -> jax.Array:
@@ -542,6 +524,18 @@ def _make_intervention(
 
 def _validate_artifact_contract(args, name: str, hparams: Dict[str, Any], *, context_dim: int) -> None:
     schema = _schema_for_args(args)
+    found_contract = hparams.get("causal_schema_contract")
+    expected_contract = causal_schema_contract(schema)
+    if found_contract is not None and found_contract != expected_contract:
+        raise ValueError(f"{name} checkpoint causal schema, category order, or edges do not match the configured schema")
+    if found_contract is None and str(schema.version) not in {"1", "2"}:
+        raise ValueError(f"{name} checkpoint is missing causal_schema_contract for schema v{schema.version}")
+    expected_rules = getattr(args, "metadata_rules", None) or {}
+    found_rules = hparams.get("metadata_rules")
+    if found_rules is not None and found_rules != expected_rules:
+        raise ValueError(f"{name} checkpoint metadata derivation rules do not match the configured dataset adapter")
+    if found_rules is None and str(schema.version) not in {"1", "2"} and expected_rules:
+        raise ValueError(f"{name} checkpoint is missing metadata_rules for schema v{schema.version}")
     found_dataset = hparams.get("dataset", hparams.get("dataset_id"))
     if found_dataset is not None and found_dataset != schema.dataset_id:
         raise ValueError(f"{name} checkpoint dataset mismatch: expected {schema.dataset_id!r}, found {found_dataset!r}")

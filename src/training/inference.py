@@ -19,9 +19,10 @@ import numpy as np
 from flax import nnx
 from PIL import Image
 
-from config import ExperimentConfig, InferenceConfig
+from config import ExperimentConfig, InferenceConfig, resolve_causal_schema
+from contracts import CausalGraphSpec, VariableKind
+from data.metadata import encode_binary_value, encode_continuous_value
 from data.morphomnist import MORPHOMNIST_SCHEMA
-from data.padchest import adapt_padchest_hvae_context
 from models.image_vae import HVAE, SimpleVAE
 from utils import (
     checkpoint_root_dir,
@@ -91,7 +92,11 @@ def _input_image(path: str, input_res: int, channels: int) -> jax.Array:
     return jnp.asarray((values - 127.5) / 127.5)
 
 
-def _categorical(value: Any, size: int, name: str) -> jax.Array:
+def _categorical(value: Any, size: int, name: str, categories: tuple[str, ...] = ()) -> jax.Array:
+    if isinstance(value, str):
+        if value not in categories:
+            raise ValueError(f"{name} must be one of {categories}, got {value!r}")
+        value = categories.index(value)
     if isinstance(value, (list, tuple)):
         vector = jnp.asarray(value, dtype=jnp.float32)
         if vector.shape != (size,):
@@ -103,46 +108,29 @@ def _categorical(value: Any, size: int, name: str) -> jax.Array:
     return jax.nn.one_hot(index, size, dtype=jnp.float32)
 
 
-def _parents(values: dict[str, Any], context_dim: int, dataset: str = "morphomnist") -> jax.Array:
+def _parents(
+    values: dict[str, Any],
+    context_dim: int,
+    schema: CausalGraphSpec,
+) -> jax.Array:
     """Encode named dataset values in the schema's stable parent order."""
-    if dataset == "padchest":
-        # PadChest v2 uses the six categorical variables declared by
-        # PAD_CHEST_V2_SCHEMA (5 + 2 + 1 + 5 + 6 + 2 = 21 channels).  Keep
-        # this branch separate from the historical context-17 encoder below;
-        # silently interpreting v2 values as v1 parents would produce invalid
-        # counterfactual interventions while still returning plausible arrays.
-        if context_dim == 21:
-            parts = [
-                _categorical(values.get("age_group", 0), 5, "age_group"),
-                _categorical(values.get("sex", 0), 2, "sex"),
-                jnp.asarray([float(values.get("tb_status", 0.0))], dtype=jnp.float32),
-                _categorical(values.get("projection", 0), 5, "projection"),
-                _categorical(values.get("view_position", 0), 6, "view_position"),
-                _categorical(values.get("scanner", 0), 2, "scanner"),
-            ]
-            result = jnp.concatenate(parts)[None, :]
-            if result.shape[-1] != context_dim:
-                raise ValueError(f"PadChest v2 parent encoding has dimension {result.shape[-1]}, checkpoint expects {context_dim}")
-            return result
-        parts = [
-            jnp.asarray([float(values.get("age_at_study", 0.0))], dtype=jnp.float32),
-            _categorical(values.get("sex", 0), 2, "sex"),
-            jnp.asarray([float(values.get("pediatric", 0.0))], dtype=jnp.float32),
-            jnp.asarray([float(values.get("tb_status", 0.0))], dtype=jnp.float32),
-            _categorical(values.get("projection", 0), 5, "projection"),
-            _categorical(values.get("view_position", 0), 6, "view_position"),
-            jnp.asarray([float(values.get("study_year", 0.0))], dtype=jnp.float32),
-        ]
-        result = adapt_padchest_hvae_context(jnp.concatenate(parts)[None, :], target_dim=context_dim)
-        return result
-    encoded = []
-    for variable in MORPHOMNIST_SCHEMA.variables:
-        value = values.get(variable.name, 0)
-        if variable.name == "digit":
-            encoded.append(jax.nn.one_hot(jnp.asarray([int(value)]), variable.encoded_dim, dtype=jnp.float32))
+    parts = []
+    for variable in schema.variables:
+        if variable.name not in values:
+            raise ValueError(f"Inference requires a value for causal variable {variable.name!r}")
+        value = values[variable.name]
+        if variable.kind is VariableKind.CONTINUOUS:
+            encoded = encode_continuous_value(value, variable.normalization, name=variable.name)
+        elif variable.kind is VariableKind.CATEGORICAL or variable.kind is VariableKind.ORDINAL and variable.encoded_dim > 1:
+            encoded = np.asarray(_categorical(value, variable.encoded_dim, variable.name, variable.categories), dtype=np.float32)
+        elif variable.kind is VariableKind.BINARY:
+            encoded = encode_binary_value(value, name=variable.name)
+        elif variable.kind is VariableKind.ORDINAL:
+            encoded = encode_continuous_value(value, None, name=variable.name)
         else:
-            encoded.append(jnp.asarray([[float(value)]], dtype=jnp.float32))
-    result = jnp.concatenate(encoded, axis=-1)
+            raise ValueError(f"Inference encoding for {variable.kind.value} variables is not implemented")
+        parts.append(encoded.reshape(-1))
+    result = jnp.asarray(np.concatenate(parts)[None, :], dtype=jnp.float32)
     if result.shape[-1] != context_dim:
         raise ValueError(f"Parent encoding has dimension {result.shape[-1]}, checkpoint expects {context_dim}")
     return result
@@ -169,7 +157,16 @@ def run(config: ExperimentConfig) -> str:
         raise ValueError(f"Image-model checkpoint at {resolved} has no EMA parameters")
     model = nnx.merge(graphdef, nnx.State(weights)); model.eval()
     x = _input_image(workflow.image_path, metadata["input_res"], metadata["input_channels"])
-    parents = _parents(workflow.parents, metadata["context_dim"], config.dataset.name)
+    if config.dataset.name == "padchest":
+        from data.padchest import PAD_CHEST_SCHEMA
+        fallback_schema = PAD_CHEST_SCHEMA
+    elif config.dataset.name == "cxr_rait":
+        from data.cxr_rait import CXR_RAIT_SCHEMA
+        fallback_schema = CXR_RAIT_SCHEMA
+    else:
+        fallback_schema = MORPHOMNIST_SCHEMA
+    schema = resolve_causal_schema(config, fallback_schema)
+    parents = _parents(workflow.parents, metadata["context_dim"], schema)
     parents = jnp.repeat(parents, workflow.num_samples, axis=0)
     # ELBO diagnostics use the supplied image; the decoder mean is the preview.
     output = model(x, parents[:1], beta=workflow.beta, rng=jax.random.PRNGKey(config.seed), training=False)

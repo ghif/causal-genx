@@ -1,0 +1,67 @@
+version: "3"
+seed: 7
+dataset:
+  name: padchest
+  root: gs://external-cxr-dataset/padchest/unpacked/images-224
+  metadata: /mnt/data/dataset/padchest/metadata/PADCHEST_chest_x_ray_images_labels_160K_01.02.19.csv
+  image_prefix: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224
+  input_res: 128
+  pad: 0
+  context_norm: "[-1,1]"
+  tb_label_mode: tb_or_sequelae
+  excluded_sources:
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012558082906712009300162151055_00-078-079.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+  metadata_rules:
+    age_at_study: {operation: year_difference, date_source: StudyDate_DICOM, birth_source: PatientBirth, valid_range: [0, 110]}
+    sex: {operation: category_map, source: PatientSex_DICOM, mapping: {F: F, M: M}}
+    tb_status: {operation: contains_any, source: Labels, values: [tuberculosis], additional_values_by_mode: {tb_or_sequelae: [tuberculosis sequelae]}}
+    scanner: {operation: category_map, source: Manufacturer_DICOM, mapping: {ImagingDynamicsCompanyLtd: ImagingDynamicsCompanyLtd, PhilipsMedicalSystems: PhilipsMedicalSystems}}
+    projection: {operation: category_map, source: Projection, mapping: {PA: PA, AP: AP-family, AP_horizontal: AP-family, L: lateral}}
+causal_schema:
+  version: "3"
+  variables:
+    - {name: age_at_study, kind: continuous, encoded_dim: 1, normalization: "linear(0,110)->(-1,1)", source: derived_age_at_study}
+    - {name: sex, kind: categorical, encoded_dim: 2, categories: [F, M], source: PatientSex_DICOM}
+    - {name: tb_status, kind: binary, encoded_dim: 1, source: Labels}
+    - {name: scanner, kind: categorical, encoded_dim: 2, categories: [ImagingDynamicsCompanyLtd, PhilipsMedicalSystems], source: Manufacturer_DICOM}
+    - {name: projection, kind: categorical, encoded_dim: 3, categories: [PA, AP-family, lateral], source: Projection}
+  edges: [[age_at_study, tb_status], [sex, tb_status]]
+model:
+  name: hierarchical_vae
+  context_dim: 9
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.1
+  batch_size: 32
+runtime:
+  accelerator: gpu
+  gpu_id: "0"
+  precision: bf16
+  expected_local_device_count: 1
+  expected_global_device_count: 1
+  expected_process_count: 1
+artifacts:
+  root: checkpoints
+  run_name: predictor_padchest_v3_gpu
+  remote_root: gs://external-cxr-dataset/padchest/checkpoints_v3
+workflow:
+  type: train-predictor
+  predictor_model: cxr_image_parent_predictor
+  epochs: 100
+  speed_log_freq: 10
+  execution_mode: single_device
+  drop_remainder: true
+  checkpoint_freq: 1
+  benchmark_steps: 0
+  freeze_backbone: false
+  input_cache: "off"
+  input_prefetch_workers: 8
+  input_prefetch_batches: 4
+  input_stage_mode: require
+  input_stage_dir: /mnt/data/dataset/padchest/input-stage/v3-images
+  input_stage_manifest: /mnt/data/dataset/padchest/input-stage/v3-images/padchest-stage-manifest.jsonl
+  input_stage_max_items: 200000
+  input_stage_max_bytes: 120000000000
+  input_stage_size_sample_items: 256
+  input_stage_workers: 32
