@@ -31,6 +31,7 @@ from contracts import causal_schema_contract
 from causal.flow_scm import MorphoMNISTPGM
 from config import ExperimentConfig, ScmTrainingConfig, resolve_causal_schema
 from data.morphomnist import morphomnist
+from training.early_stopping import EarlyStopping
 from utils import (
     BackgroundArtifactWriter,
     SummaryWriter,
@@ -74,6 +75,8 @@ class ScmRunArguments:
     plot_samples: int
     widths: list[int]
     benchmark_steps: int = 0
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
     input_channels: int = 1
     load_path: str = ""
     deterministic: bool = False
@@ -149,6 +152,8 @@ def _run_arguments(config: ExperimentConfig) -> ScmRunArguments:
         plot_samples=workflow.plot_samples,
         widths=list(workflow.widths),
         benchmark_steps=workflow.benchmark_steps,
+        early_stopping_patience=getattr(workflow, "early_stopping_patience", 0),
+        early_stopping_min_delta=getattr(workflow, "early_stopping_min_delta", 0.0),
         schema=schema,
         metadata_rules=dict(config.dataset.metadata_rules),
     )
@@ -606,6 +611,11 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
     train_step = _make_train_step(graphdef, optimizer); final_stats: Dict[str, float] = {}
     artifact_writer = BackgroundArtifactWriter()
     metric_artifact_writer = BackgroundArtifactWriter()
+    early_stopper = EarlyStopping(
+        patience=getattr(args, "early_stopping_patience", 0),
+        min_delta=getattr(args, "early_stopping_min_delta", 0.0),
+        mode="min",
+    )
     total_batches = len(datasets["train"]) // args.bs
     total_train_steps = max(1, total_batches) * max(1, args.epochs - start_epoch)
     try:
@@ -693,6 +703,13 @@ def _run(args: ScmRunArguments) -> Dict[str, float]:
                     "metric_artifacts_enqueued epoch=%d step=%d queue=%s",
                     epoch + 1, step, metric_artifact_writer.stats,
                 )
+            if checkpoint_due and valid_stats is not None:
+                if early_stopper.step(valid_stats["loss"], epoch + 1):
+                    logger.info(
+                        "Early stopping triggered at epoch %d (patience=%d, best_loss=%.6f)",
+                        epoch + 1, early_stopper.patience, early_stopper.best_score,
+                    )
+                    break
             if args.benchmark_steps and step >= args.benchmark_steps:
                 break
     finally:

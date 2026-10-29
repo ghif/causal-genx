@@ -151,6 +151,8 @@ class ScmTrainingConfig(BaseModel):
     plot_samples: PositiveInt = 10000
     widths: list[PositiveInt] = [32, 32]
     benchmark_steps: int = 0
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
 
 
 class PredictorTrainingConfig(BaseModel):
@@ -185,6 +187,8 @@ class PredictorTrainingConfig(BaseModel):
     input_stage_max_bytes: int = 0
     input_stage_size_sample_items: int = 256
     input_stage_workers: int = 16
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
 
 
 class ImageModelTrainingConfig(BaseModel):
@@ -215,6 +219,8 @@ class ImageModelTrainingConfig(BaseModel):
     input_stage_max_bytes: int = 0
     input_stage_size_sample_items: int = 256
     input_stage_workers: int = 16
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
 
 
 class CounterfactualTrainingConfig(BaseModel):
@@ -256,6 +262,8 @@ class CounterfactualTrainingConfig(BaseModel):
     input_stage_max_bytes: int = 0
     input_stage_size_sample_items: int = 256
     input_stage_workers: int = 16
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
 
 
 class InferenceConfig(BaseModel):

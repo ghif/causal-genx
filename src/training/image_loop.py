@@ -22,6 +22,8 @@ from flax import nnx
 from contracts import causal_schema_contract
 from utils import BackgroundArtifactWriter, EMA, append_text_file, batch_iterator, ensure_dir, linear_warmup, load_checkpoint, materialize_nnx, save_checkpoint, sync_file, sync_tree, write_images
 
+from .early_stopping import EarlyStopping
+
 
 def preprocess_batch(args, batch, expand_pa: bool = False, compact_pa: bool = False):
     """Normalize images and convert parent vectors to the model's NHWC contract."""
@@ -481,6 +483,11 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
         return {k: v / sample_count for k, v in stats_sum.items()}
 
     artifact_writer = BackgroundArtifactWriter()
+    early_stopper = EarlyStopping(
+        patience=getattr(args, "early_stopping_patience", 0),
+        min_delta=getattr(args, "early_stopping_min_delta", 0.0),
+        mode="min",
+    )
     benchmark_steps = int(getattr(args, "benchmark_steps", 0))
     benchmark_warmup = int(getattr(args, "benchmark_warmup_steps", 20))
     benchmark_t0 = None
@@ -755,6 +762,13 @@ def trainer(args, graphdef, state: TrainState, tx, datasets, writer, logger):
                     epoch_iter_per_sec,
                     epoch_sample_per_sec,
                 )
+            if validation_due and not np.isnan(valid_nelbo):
+                if early_stopper.step(valid_nelbo, epoch + 1):
+                    logger.info(
+                        "Early stopping triggered at epoch %d (patience=%d, best_nelbo=%.6f)",
+                        epoch + 1, early_stopper.patience, early_stopper.best_score,
+                    )
+                    break
             if getattr(args, "checkpoint_smoke_test", False) and state.step >= max(1, args.checkpoint_smoke_steps):
                 checkpoint_smoke_test(args, state, tx, logger)
                 return

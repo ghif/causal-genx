@@ -93,6 +93,8 @@ class ImageModelSettings:
     input_stage_max_bytes: int = 0
     input_stage_size_sample_items: int = 256
     input_stage_workers: int = 16
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
     schema_version: str = "1"
     causal_schema: dict[str, Any] | None = None
     save_dir: str = ""
@@ -168,6 +170,8 @@ def image_model_settings(config: ExperimentConfig) -> ImageModelSettings:
         input_stage_max_bytes=getattr(workflow, "input_stage_max_bytes", 0),
         input_stage_size_sample_items=getattr(workflow, "input_stage_size_sample_items", 256),
         input_stage_workers=getattr(workflow, "input_stage_workers", 16),
+        early_stopping_patience=getattr(workflow, "early_stopping_patience", 0),
+        early_stopping_min_delta=getattr(workflow, "early_stopping_min_delta", 0.0),
         schema_version=str(config.version),
         causal_schema=dict(config.causal_schema) if config.causal_schema else None,
     )
@@ -235,6 +239,8 @@ def image_model_settings_for_counterfactual(config: ExperimentConfig) -> dict[st
         input_stage_max_bytes=getattr(workflow, "input_stage_max_bytes", 0),
         input_stage_size_sample_items=getattr(workflow, "input_stage_size_sample_items", 256),
         input_stage_workers=getattr(workflow, "input_stage_workers", 16),
+        early_stopping_patience=getattr(workflow, "early_stopping_patience", 0),
+        early_stopping_min_delta=getattr(workflow, "early_stopping_min_delta", 0.0),
         schema_version=str(config.version),
         causal_schema=dict(config.causal_schema) if config.causal_schema else None,
     )

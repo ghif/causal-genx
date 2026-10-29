@@ -56,6 +56,7 @@ from causal.cxr_rait_scm import CxrRaitPGM, PadChestPGM
 from causal.generic_scm import SchemaDrivenSCM
 from causal.flow_scm import MorphoMNISTPGM
 from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
+from training.early_stopping import EarlyStopping
 from training.image_loop import _first_local_replica, _replicate, _shard_batch, _unreplicate, init_state, preprocess_batch
 from utils import (
     BackgroundArtifactWriter,
@@ -465,6 +466,19 @@ def _preprocess_counterfactual_batch(args, raw_batch):
 
 
 def _hvae_context(args, pa: jax.Array, target_dim: int) -> jax.Array:
+    source_dim = int(pa.shape[-1])
+    target_dim = int(target_dim)
+    if source_dim == target_dim:
+        return pa
+    if args.dataset == "padchest":
+        from data.padchest import (
+            PAD_CHEST_HVAE_CONTEXT_DIM,
+            PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM,
+            PAD_CHEST_SOURCE_CONTEXT_DIM,
+        )
+        if source_dim == PAD_CHEST_SOURCE_CONTEXT_DIM and target_dim == PAD_CHEST_HVAE_CONTEXT_DIM:
+            extension = jnp.zeros(pa.shape[:-1] + (PAD_CHEST_HVAE_CONTEXT_EXTENSION_DIM,), dtype=pa.dtype)
+            return jnp.concatenate((pa, extension), axis=-1)
     adapted = adapt_parent_context(args.dataset, np.asarray(pa), target_dim)
     return jnp.asarray(adapted, dtype=pa.dtype)
 
@@ -1702,6 +1716,11 @@ def main(args):
     benchmark_done = False
     artifact_writer = BackgroundArtifactWriter()
     metric_artifact_writer = BackgroundArtifactWriter()
+    early_stopper = EarlyStopping(
+        patience=getattr(args, "early_stopping_patience", 0),
+        min_delta=getattr(args, "early_stopping_min_delta", 0.0),
+        mode="min",
+    )
     steps_per_epoch = max(1, len(datasets["train"]) // args.bs) if drop_remainder else max(1, (len(datasets["train"]) + args.bs - 1) // args.bs)
     total_train_steps = steps_per_epoch * max(1, args.epochs - state["epoch"])
     try:
@@ -1857,6 +1876,12 @@ def main(args):
                     _portable_cf_state(state, replicated=use_tpu_pmap), epoch + 1,
                 )
                 logger.info("Model checkpoint enqueued: %s queue=%s", args.checkpoint_dir, artifact_writer.stats)
+            if early_stopper.step(observational_stats["loss"], epoch + 1):
+                logger.info(
+                    "Early stopping triggered at epoch %d (patience=%d, best_loss=%.6f)",
+                    epoch + 1, early_stopper.patience, early_stopper.best_score,
+                )
+                break
         writer.flush()
         if checkpoint_due and getattr(args, "remote_save_dir", ""):
             metric_artifact_writer.submit(_sync_metric_artifacts, args)

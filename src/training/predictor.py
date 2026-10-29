@@ -29,6 +29,7 @@ from causal.image_parent_predictor import MorphoMNISTSupAuxPredictor
 from config import ExperimentConfig, PredictorTrainingConfig, resolve_causal_schema
 from data.morphomnist import morphomnist
 from data.padchest import padchest
+from training.early_stopping import EarlyStopping
 from utils import (
     BackgroundArtifactWriter, SummaryWriter, checkpoint_root_dir, ensure_dir,
     ensure_parent_dir, experiment_run_dir, load_checkpoint, local_staging_path,
@@ -70,6 +71,8 @@ class PredictorRunArguments:
     widths: list[int] | None = None
     plot_samples: int = 10000
     benchmark_steps: int = 0
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
     load_path: str = ""
     deterministic: bool = False
     testing: bool = False
@@ -330,6 +333,8 @@ def _run_arguments(config: ExperimentConfig) -> PredictorRunArguments:
         input_stage_max_bytes=getattr(workflow, "input_stage_max_bytes", 0),
         input_stage_size_sample_items=getattr(workflow, "input_stage_size_sample_items", 256),
         input_stage_workers=getattr(workflow, "input_stage_workers", 16),
+        early_stopping_patience=getattr(workflow, "early_stopping_patience", 0),
+        early_stopping_min_delta=getattr(workflow, "early_stopping_min_delta", 0.0),
         excluded_sources=list(getattr(config.dataset, "excluded_sources", []) or []),
         metadata_rules=dict(config.dataset.metadata_rules),
         augment=augment,
@@ -1270,6 +1275,11 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
     benchmark_t0 = time.perf_counter()
     artifact_writer = BackgroundArtifactWriter()
     metric_artifact_writer = BackgroundArtifactWriter()
+    early_stopper = EarlyStopping(
+        patience=getattr(args, "early_stopping_patience", 0),
+        min_delta=getattr(args, "early_stopping_min_delta", 0.0),
+        mode="min",
+    )
     try:
         for epoch in range(start_epoch, args.epochs):
             logger.info("Epoch %d:", epoch + 1)
@@ -1392,6 +1402,13 @@ def _run(args: PredictorRunArguments) -> Dict[str, float]:
                     "metric_artifacts_enqueued epoch=%d step=%d queue=%s",
                     epoch + 1, step, metric_artifact_writer.stats,
                 )
+            if checkpoint_due and valid_stats is not None:
+                if early_stopper.step(valid_stats["loss"], epoch + 1):
+                    logger.info(
+                        "Early stopping triggered at epoch %d (patience=%d, best_loss=%.6f)",
+                        epoch + 1, early_stopper.patience, early_stopper.best_score,
+                    )
+                    break
     finally:
         try:
             artifact_writer.close()

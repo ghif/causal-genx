@@ -12,6 +12,36 @@ dataset:
   excluded_sources:
     - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012558082906712009300162151055_00-078-079.png
       reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012373310883942009170084120009_00-097-074.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012959786098432011033083840143_00-176-115.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012819207061112010307142602253_04-014-084.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012989926673512011101154138555_00-191-086.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012989926673512011074122523403_00-163-058.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012989926673512011132200139442_00-157-099.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012819207061112010306085429121_04-020-102.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964013076187734852011291090445391_00-196-188.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012373310883942009117084022290_00-064-025.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012339356563862009068084200743_00-045-105.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012283393834152009033102258826_00-059-087.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012558082906712009327122220177_00-102-064.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964013076187734852011178154626671_00-145-086.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012819207061112010315104455352_04-024-184.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
+    - source: gs://external-cxr-dataset/padchest/unpacked/images-224/images-224/216840111366964012339356563862009072111404053_00-043-192.png
+      reason: confirmed absent source object; exclude consistently across all v3 stages
   metadata_rules:
     age_at_study: {operation: year_difference, date_source: StudyDate_DICOM, birth_source: PatientBirth, valid_range: [0, 110]}
     sex: {operation: category_map, source: PatientSex_DICOM, mapping: {F: F, M: M}}
